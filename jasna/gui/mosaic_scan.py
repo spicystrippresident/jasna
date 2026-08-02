@@ -20,7 +20,7 @@ from pathlib import Path
 
 from jasna.gui.models import AppSettings
 from jasna.media import VideoMetadata
-from jasna.segments import SegmentRange, normalize_segments
+from jasna.segments import segments_from_scores
 
 SCAN_SCORE_FLOOR = 0.05
 SCAN_MASK_HW = (90, 160)
@@ -103,35 +103,6 @@ def segment_sample_indices(
     return [i for i, t in enumerate(times) if t >= start and (is_last or t < end)]
 
 
-def segments_from_scores(
-    times: tuple[float, ...] | list[float],
-    scores: tuple[float, ...] | list[float],
-    *,
-    threshold: float,
-    stride: float,
-    duration: float,
-    pad: float | None = None,
-) -> tuple[SegmentRange, ...]:
-    """Merge above-threshold samples into padded, normalized time ranges."""
-
-    if len(times) != len(scores):
-        raise ValueError("times and scores must have the same length")
-    stride = float(stride)
-    if stride <= 0:
-        raise ValueError("stride must be greater than zero")
-    if pad is None:
-        pad = stride / 2
-    hits = []
-    for seconds, score in zip(times, scores):
-        if score < threshold:
-            continue
-        start = max(0.0, float(seconds) - pad)
-        end = min(float(duration), float(seconds) + stride + pad)
-        if end > start:
-            hits.append(SegmentRange(start, end))
-    return normalize_segments(hits, duration=duration)
-
-
 @dataclass(frozen=True)
 class ScanStatus:
     message: str
@@ -170,6 +141,28 @@ class ScanMaskFailed:
 
 
 @dataclass(frozen=True)
+class ScanProjectionScore:
+    seconds: float
+    bbox_xyxy: tuple[float, float, float, float]
+    source_score: float
+    raw_score: float
+    fisheye_score: float
+    gnomonic_score: float
+
+
+@dataclass(frozen=True)
+class ScanProjectionReady:
+    samples: tuple[ScanProjectionScore, ...]
+    generation: int
+
+
+@dataclass(frozen=True)
+class ScanProjectionFailed:
+    message: str
+    generation: int
+
+
+@dataclass(frozen=True)
 class ScanStorageSpilled:
     pass
 
@@ -177,6 +170,14 @@ class ScanStorageSpilled:
 @dataclass(frozen=True)
 class _MaskRequest:
     seconds: float
+    generation: int
+
+
+@dataclass(frozen=True)
+class _ProjectionRequest:
+    candidates: tuple[
+        tuple[float, tuple[float, float, float, float], float], ...
+    ]
     generation: int
 
 
@@ -192,6 +193,8 @@ ScanEvent = (
     | ScanFailed
     | ScanMaskReady
     | ScanMaskFailed
+    | ScanProjectionReady
+    | ScanProjectionFailed
     | ScanStorageSpilled
 )
 
@@ -367,7 +370,9 @@ class MosaicScanWorker:
         self.events: queue.Queue[ScanEvent] = queue.Queue()
         self._stop_scan = threading.Event()
         self._closed = threading.Event()
-        self._commands: queue.Queue[_MaskRequest | _Close] = queue.Queue(maxsize=1)
+        self._commands: queue.Queue[
+            _MaskRequest | _ProjectionRequest | _Close
+        ] = queue.Queue(maxsize=1)
         self._mask_generation = 0
         self._thread = threading.Thread(
             target=self._run,
@@ -391,14 +396,37 @@ class MosaicScanWorker:
     def join(self, timeout: float | None = None) -> None:
         self._thread.join(timeout=timeout)
 
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
+
     def request_mask(self, seconds: float) -> int:
         self._mask_generation += 1
         self._replace_command(_MaskRequest(max(0.0, float(seconds)), self._mask_generation))
         return self._mask_generation
 
+    def request_projection_comparison(
+        self,
+        candidates: tuple[
+            tuple[float, tuple[float, float, float, float], float], ...
+        ],
+    ) -> int:
+        self._mask_generation += 1
+        normalized = tuple(
+            (
+                max(0.0, float(seconds)),
+                tuple(float(value) for value in bbox),
+                float(source_score),
+            )
+            for seconds, bbox, source_score in candidates
+        )
+        self._replace_command(
+            _ProjectionRequest(normalized, self._mask_generation)
+        )
+        return self._mask_generation
+
     def _replace_command(
         self,
-        command: _MaskRequest | _Close,
+        command: _MaskRequest | _ProjectionRequest | _Close,
         *,
         allow_closed: bool = False,
     ) -> None:
@@ -427,7 +455,7 @@ class MosaicScanWorker:
             self._scan(detector)
             if self._on_stopped is not None:
                 self._on_stopped()
-            self._serve_mask_requests(detector)
+            self._serve_requests(detector)
         except Exception as exc:
             if not self._closed.is_set():
                 self.events.put(ScanFailed(str(exc)))
@@ -674,7 +702,7 @@ class MosaicScanWorker:
         )
         self.events.put(ScanCompleted(result, stopped))
 
-    def _serve_mask_requests(self, detector) -> None:
+    def _serve_requests(self, detector) -> None:
         while not self._closed.is_set():
             try:
                 command = self._commands.get(timeout=0.1)
@@ -683,9 +711,15 @@ class MosaicScanWorker:
             if isinstance(command, _Close):
                 return
             try:
-                event = self._detect_mask(detector, command)
+                if isinstance(command, _ProjectionRequest):
+                    event = self._compare_projections(detector, command)
+                else:
+                    event = self._detect_mask(detector, command)
             except Exception as exc:
-                event = ScanMaskFailed(str(exc), command.generation)
+                if isinstance(command, _ProjectionRequest):
+                    event = ScanProjectionFailed(str(exc), command.generation)
+                else:
+                    event = ScanMaskFailed(str(exc), command.generation)
             if not self._closed.is_set():
                 self.events.put(event)
 
@@ -728,3 +762,99 @@ class MosaicScanWorker:
                 mask=masks[0].to(torch.uint8).cpu(),
                 generation=command.generation,
             )
+
+    def _compare_projections(
+        self,
+        detector,
+        command: _ProjectionRequest,
+    ) -> ScanProjectionReady:
+        import numpy as np
+        import torch
+
+        from jasna.crop_buffer import extract_crop
+        from jasna.media.video_decoder import NvidiaVideoReader
+        from jasna.vr_projection import build_vr_projector
+
+        metadata = self.metadata
+        frame_width = int(metadata.video_width)
+        frame_height = int(metadata.video_height)
+        if frame_width <= 0 or frame_height <= 0 or frame_width % 2:
+            raise ValueError("Projection comparison requires an even-width SBS video")
+        if not getattr(self, "_vr_resolution", None) or not self._vr_resolution.is_sbs:
+            raise ValueError("Projection comparison requires resolved SBS VR mode")
+
+        device = torch.device("cuda:0")
+        eye_width = frame_width // 2
+        batch_size = int(self.settings.batch_size)
+        base_detector = getattr(detector, "detector", detector)
+        projectors = {
+            projection: build_vr_projector(
+                projection,
+                eye_width=eye_width,
+                height=frame_height,
+                device=device,
+            )
+            for projection in ("fisheye", "gnomonic")
+        }
+
+        def score_crop(crop) -> float:
+            frames = crop.unsqueeze(0).expand(batch_size, -1, -1, -1).contiguous()
+            scores, _masks = base_detector.scan_scores_masks(
+                frames,
+                mask_hw=SCAN_MASK_HW,
+            )
+            return float(scores[0].float().cpu())
+
+        samples: list[ScanProjectionScore] = []
+        for seconds, bbox_values, source_score in command.candidates:
+            if self._closed.is_set():
+                break
+            reader = NvidiaVideoReader(
+                str(self.path),
+                batch_size,
+                device,
+                metadata,
+            )
+            with reader:
+                batch_and_pts = next(reader.frames(seek_ts=seconds), None)
+                if batch_and_pts is None:
+                    raise RuntimeError(
+                        f"Could not decode projection comparison frame at {seconds:.3f}s"
+                    )
+                batch, pts_list = batch_and_pts
+                frame = batch[0]
+                actual_seconds = max(
+                    0.0,
+                    (pts_list[0] - reader.start_pts) * float(metadata.time_base),
+                )
+            bbox = np.asarray(bbox_values, dtype=np.float32)
+            center_x = float(bbox[0] + bbox[2]) * 0.5
+            eye_bounds = (0, eye_width) if center_x < eye_width else (eye_width, frame_width)
+            raw_crop = extract_crop(
+                frame,
+                bbox,
+                frame_height,
+                frame_width,
+                x_bounds=eye_bounds,
+            ).crop
+            projected = {
+                projection: projector.extract_region_crop(
+                    frame,
+                    bbox,
+                    frame_height,
+                    frame_width,
+                    x_bounds=eye_bounds,
+                ).crop
+                for projection, projector in projectors.items()
+            }
+            samples.append(
+                ScanProjectionScore(
+                    seconds=actual_seconds,
+                    bbox_xyxy=tuple(float(value) for value in bbox_values),
+                    source_score=source_score,
+                    raw_score=score_crop(raw_crop),
+                    fisheye_score=score_crop(projected["fisheye"]),
+                    gnomonic_score=score_crop(projected["gnomonic"]),
+                )
+            )
+        return ScanProjectionReady(tuple(samples), command.generation)

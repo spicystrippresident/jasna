@@ -19,6 +19,7 @@ VrProjectionName = Literal["auto", "raw", "fisheye", "gnomonic"]
 RtxQualityName = Literal["low", "medium", "high", "ultra"]
 RtxLevelName = Literal["none", "low", "medium", "high", "ultra"]
 CodecName = Literal["hevc", "h264", "av1"]
+EncoderBackendName = Literal["auto", "software-reference"]
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,7 @@ class SessionConfig:
     disable_progress: bool
     working_dir: Path | None
     vr_projection: VrProjectionName = "auto"
+    encoder_backend: EncoderBackendName = "auto"
     fmp4: bool = False
     sharpen_strength: float = 0.0
     tvai_denoise: bool = False

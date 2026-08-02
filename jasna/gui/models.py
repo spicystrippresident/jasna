@@ -123,6 +123,10 @@ class ProcessingState:
 
 @dataclass
 class AppSettings:
+    # Processing mode
+    processing_mode: str = "standard"  # standard, one_click_vr
+    one_click_scan_interval: float = 1.0
+
     # Basic processing
     batch_size: int = 4
     max_clip_size: int = 90

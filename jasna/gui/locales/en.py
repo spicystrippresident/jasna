@@ -215,6 +215,11 @@ EN = {
         "btn_reset": "↺",
         
         # Sections
+        "section_processing_mode": "Processing Mode",
+        "processing_mode_standard": "Standard",
+        "processing_mode_one_click_vr": "One-click VR",
+        "one_click_scan_interval": "Scan frequency",
+        "tip_one_click_scan_interval": "How often Jasna samples the video before restoring only detected mosaic ranges.",
         "section_basic": "Basic Processing",
         "section_advanced": "Advanced Processing",
         "section_secondary": "Secondary Restoration",

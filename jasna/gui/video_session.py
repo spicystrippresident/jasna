@@ -91,6 +91,7 @@ def video_session_config(
         vr_mode=settings.vr_mode,
         vr_projection=settings.vr_projection,
         codec=codec,
+        encoder_backend="auto",
         encoder_settings=dict(encoder_settings),
         lut_path=(settings.lut_path or "").strip() or None,
         sharpen_strength=float(settings.sharpen_strength),

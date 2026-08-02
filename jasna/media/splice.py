@@ -249,6 +249,7 @@ def resolve_smart_encoder_settings(
 def probe_keyframes(path: str | Path, metadata: VideoMetadata) -> KeyframeIndex:
     keyframes: list[int] = []
     packet_pts: list[int] = []
+    packet_end_pts: int | None = None
     with av.open(str(path)) as container:
         stream = container.streams.video[0]
         codec = _canonical_codec(metadata.codec_name)
@@ -262,9 +263,20 @@ def probe_keyframes(path: str | Path, metadata: VideoMetadata) -> KeyframeIndex:
             length_size = (extradata[21] & 0x03) + 1
         time_base = Fraction(stream.time_base)
         start_pts = resolve_video_start_pts(stream.start_time, metadata.start_pts)
+        nominal_frame_duration = max(
+            1,
+            round(1 / (metadata.video_fps * time_base)),
+        )
         for packet in container.demux(stream):
             if packet.pts is not None:
-                packet_pts.append(int(packet.pts))
+                pts = int(packet.pts)
+                packet_pts.append(pts)
+                packet_duration = int(packet.duration or 0)
+                packet_end = pts + (
+                    packet_duration if packet_duration > 0 else nominal_frame_duration
+                )
+                if packet_end_pts is None or packet_end > packet_end_pts:
+                    packet_end_pts = packet_end
             if (
                 packet.pts is not None
                 and packet.is_keyframe
@@ -285,8 +297,10 @@ def probe_keyframes(path: str | Path, metadata: VideoMetadata) -> KeyframeIndex:
         end_pts = start_pts + int(stream_duration)
     else:
         end_pts = start_pts + round(float(metadata.duration) / time_base)
+    if packet_end_pts is not None:
+        end_pts = max(end_pts, packet_end_pts)
     if end_pts <= keyframes[-1]:
-        end_pts = keyframes[-1] + max(1, round(1 / (metadata.video_fps * time_base)))
+        end_pts = keyframes[-1] + nominal_frame_duration
     max_b_frames, uses_b_references = _analyze_packet_reordering(packet_pts)
     return KeyframeIndex(
         tuple(keyframes),

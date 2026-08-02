@@ -554,6 +554,18 @@ class NvidiaVideoReader:
         if decoder_name is None:
             source_ctx.thread_type = "AUTO"
             return
+        if sys.platform != "win32" and self.metadata.is_10bit:
+            # The Linux AMF decoder exposed through PyAV can open P010 streams
+            # but fails when decoding their first packet. Select the existing
+            # software-decode/ROCm-upload path before consuming any packets so
+            # reference frames and timestamps remain intact.
+            source_ctx.thread_type = "AUTO"
+            log.info(
+                "Using FFmpeg software decoding for 10-bit AMD input %s; "
+                "Linux PyAV AMF P010 decode is not reliable",
+                self.file,
+            )
+            return
         try:
             hwaccel = HWAccel(
                 "amf",
@@ -572,7 +584,8 @@ class NvidiaVideoReader:
             # PyAV 18 rejects assigning time_base on a decoder ("Cannot access
             # 'time_base' as a decoder"); decoders take timing from packets.
             decoder.framerate = source_ctx.framerate
-            decoder.sample_aspect_ratio = source_ctx.sample_aspect_ratio
+            if source_ctx.sample_aspect_ratio is not None:
+                decoder.sample_aspect_ratio = source_ctx.sample_aspect_ratio
             decoder.open(strict=False)
             self._decoder_ctx = decoder
             self._amd_hardware_decode = True

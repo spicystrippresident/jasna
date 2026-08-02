@@ -239,6 +239,8 @@ def primary_restore_loop(
     debug_memory: PipelineDebugMemoryLogger | None = None,
 ) -> None:
     timer = LoopTimer("primary")
+    restored_track_ids: set[int] = set()
+    restoration_clips = 0
     try:
         torch.cuda.set_device(device)
         log.debug("[primary] thread starting")
@@ -259,6 +261,8 @@ def primary_restore_loop(
             if item is _SENTINEL:
                 break
             clip_item: ClipRestoreItem = item
+            restored_track_ids.add(int(clip_item.clip.track_id))
+            restoration_clips += 1
             with timer.measure("restore"):
                 result = restoration_pipeline.prepare_and_run_primary(
                     clip_item.clip,
@@ -283,6 +287,11 @@ def primary_restore_loop(
             error_holder.append(e)
     finally:
         log.info(timer.summary())
+        log.info(
+            "[activity] restoration_clips=%d unique_tracks=%d",
+            restoration_clips,
+            len(restored_track_ids),
+        )
         log.debug("[primary] thread exiting")
         secondary_queue.put(_SENTINEL)
 
