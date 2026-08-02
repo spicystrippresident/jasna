@@ -27,6 +27,16 @@ from jasna.media.video_encoder import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _nvidia_encoder_unit_target(monkeypatch) -> None:
+    """This file snapshots NVENC internals; AMD behavior has dedicated tests."""
+    monkeypatch.setattr(
+        video_encoder_module,
+        "vendor_for_device",
+        lambda device=None: video_encoder_module.AcceleratorVendor.NVIDIA,
+    )
+
+
 def _fake_metadata(**overrides) -> VideoMetadata:
     defaults = dict(
         video_file="fake_input.mkv",
@@ -254,6 +264,24 @@ class TestEncoderOptions:
         enc = _make_encoder(tmp_path, codec_name="h264", video_bitrate=20_000_000)
         assert enc.encoder_options["maxrate"] == "20000000"
         assert enc.encoder_options["bufsize"] == "40000000"
+
+    @pytest.mark.parametrize(
+        "source_bitrate",
+        [
+            1_504_546_792,
+            3_000_000_000,
+        ],
+    )
+    def test_source_bitrate_ceiling_is_omitted_outside_ffmpeg_integer_range(
+        self, tmp_path, source_bitrate
+    ):
+        enc = _make_encoder(
+            tmp_path,
+            codec_name="hevc",
+            video_bitrate=source_bitrate,
+        )
+        assert "maxrate" not in enc.encoder_options
+        assert "bufsize" not in enc.encoder_options
 
     def test_no_ceiling_without_source_bitrate(self, tmp_path):
         enc = _make_encoder(tmp_path, video_bitrate=0)
@@ -568,8 +596,12 @@ class TestEncodeBuffer:
     def test_amd_host_transfer_still_synchronizes_before_from_dlpack(
         self, tmp_path, monkeypatch
     ):
+        monkeypatch.setattr(
+            video_encoder_module,
+            "vendor_for_device",
+            lambda device=None: video_encoder_module.AcceleratorVendor.AMD,
+        )
         enc = _make_encoder(tmp_path, codec="h264", video_width=2, video_height=2)
-        enc.vendor = video_encoder_module.AcceleratorVendor.AMD
         enc.stream = MagicMock()
         enc._host_yuv = torch.empty((3, 2), dtype=torch.uint8)
         enc._packed = torch.zeros((3, 2), dtype=torch.uint8)

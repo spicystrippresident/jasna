@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from jasna.accelerator import AcceleratorVendor
 from jasna.streaming import HlsStreamingServer, _generate_vod_playlist
 
 
@@ -360,7 +361,8 @@ class TestStreamingEncoder:
         assert not enc._started
 
     @patch('jasna.streaming_encoder.subprocess.Popen')
-    def test_ffmpeg_cmd_contains_nvenc(self, mock_popen, tmp_path):
+    @patch('jasna.streaming_encoder.vendor_for_device', return_value=AcceleratorVendor.NVIDIA)
+    def test_ffmpeg_cmd_contains_nvenc(self, _mock_vendor, mock_popen, tmp_path):
         mock_popen.return_value = _mock_ffmpeg_process()
         enc = self._make_encoder(tmp_path)
         enc.start(start_number=0)

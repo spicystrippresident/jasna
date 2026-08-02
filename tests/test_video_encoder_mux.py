@@ -21,7 +21,10 @@ from jasna.media.video_decoder import NvidiaVideoReader
 from jasna.media.video_encoder import NvidiaVideoEncoder
 from jasna.os_utils import resolve_executable
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or getattr(torch.version, "hip", None) is not None,
+    reason="tests NVIDIA NVENC/NVDEC mux behavior",
+)
 
 DEVICE = torch.device("cuda:0")
 

@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import torch
+
+
+pytest.importorskip("tensorrt", reason="BasicVSR++ TensorRT compilation is NVIDIA-only")
 
 
 def test_compile_skips_when_all_sub_engines_exist(monkeypatch, tmp_path: Path) -> None:
@@ -87,4 +91,3 @@ def test_startup_policy_true_when_engines_exist(monkeypatch, tmp_path: Path) -> 
         compile_basicvsrpp=True,
     )
     assert result is True
-

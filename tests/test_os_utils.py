@@ -7,6 +7,12 @@ import pytest
 from jasna import os_utils
 
 
+@pytest.fixture
+def nvidia_torch(monkeypatch) -> None:
+    fake_torch = types.SimpleNamespace(version=types.SimpleNamespace(hip=None))
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+
 class _FakeKernel32:
     def __init__(self) -> None:
         self.free = 0
@@ -84,6 +90,7 @@ def test_parse_ffmpeg_major_version_parses_nightly_build_from_libavutil() -> Non
 
 def test_check_required_executables_uses_expected_version_commands(monkeypatch) -> None:
     monkeypatch.setattr(os_utils.shutil, "which", lambda exe: f"/fake/{exe}")
+    monkeypatch.setattr(os_utils, "_find_source_executable", lambda exe: None)
 
     calls: list[list[str]] = []
 
@@ -323,6 +330,22 @@ def test_find_executable_bundled_wins_over_system_path(monkeypatch, tmp_path) ->
     assert os_utils.find_executable("ffmpeg") == str(ffmpeg)
 
 
+def test_find_executable_source_tools_win_over_system_path(monkeypatch, tmp_path) -> None:
+    repo = tmp_path / "repo"
+    module = repo / "jasna" / "os_utils.py"
+    module.parent.mkdir(parents=True)
+    module.touch()
+    ffprobe = repo / "tools" / "ffprobe"
+    ffprobe.parent.mkdir()
+    ffprobe.touch()
+
+    monkeypatch.setattr(os_utils, "is_frozen", lambda: False)
+    monkeypatch.setattr(os_utils, "__file__", str(module))
+    monkeypatch.setattr(os_utils.shutil, "which", lambda exe: f"/usr/bin/{exe}")
+
+    assert os_utils.find_executable("ffprobe") == str(ffprobe)
+
+
 def test_check_sysmem_fallback_returns_true_when_prefer_no_sysmem(monkeypatch) -> None:
     monkeypatch.setattr(os_utils.sys, "platform", "win32", raising=False)
     monkeypatch.setattr(
@@ -444,6 +467,22 @@ def test_check_supported_gpu_returns_ok_at_exactly_min_compute(monkeypatch) -> N
     assert result == "RTX 2070"
 
 
+def test_check_supported_gpu_accepts_rocm_without_nvidia_compute_check(monkeypatch) -> None:
+    fake_torch = types.SimpleNamespace(
+        version=types.SimpleNamespace(hip="7.2.1"),
+        cuda=types.SimpleNamespace(
+            is_available=lambda: True,
+            get_device_name=lambda device: "AMD Radeon RX 7900 XTX",
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    ok, result = os_utils.check_supported_gpu()
+
+    assert ok is True
+    assert result == "AMD Radeon RX 7900 XTX"
+
+
 def test_nvidia_compatibility_alias_is_not_exposed() -> None:
     assert not hasattr(os_utils, "check_nvidia_gpu")
 
@@ -457,7 +496,7 @@ def test_min_driver_version_is_platform_specific() -> None:
     assert os_utils.MIN_DRIVER_VERSION == (580 if sys.platform == "linux" else 610)
 
 
-def test_check_gpu_driver_version_passes_at_minimum(monkeypatch) -> None:
+def test_check_gpu_driver_version_passes_at_minimum(monkeypatch, nvidia_torch) -> None:
     monkeypatch.setattr(os_utils, "find_executable", lambda name: "/fake/nvidia-smi")
     version = f"{os_utils.MIN_DRIVER_VERSION}.00"
 
@@ -470,7 +509,7 @@ def test_check_gpu_driver_version_passes_at_minimum(monkeypatch) -> None:
     assert info == version
 
 
-def test_check_gpu_driver_version_passes_when_newer(monkeypatch) -> None:
+def test_check_gpu_driver_version_passes_when_newer(monkeypatch, nvidia_torch) -> None:
     monkeypatch.setattr(os_utils, "find_executable", lambda name: "/fake/nvidia-smi")
 
     def fake_run(cmd, **kwargs):
@@ -482,7 +521,7 @@ def test_check_gpu_driver_version_passes_when_newer(monkeypatch) -> None:
     assert info == "611.12"
 
 
-def test_check_gpu_driver_version_fails_below_minimum(monkeypatch) -> None:
+def test_check_gpu_driver_version_fails_below_minimum(monkeypatch, nvidia_torch) -> None:
     monkeypatch.setattr(os_utils, "find_executable", lambda name: "/fake/nvidia-smi")
     below = f"{os_utils.MIN_DRIVER_VERSION - 1}.99"
 
@@ -496,7 +535,7 @@ def test_check_gpu_driver_version_fails_below_minimum(monkeypatch) -> None:
     assert str(os_utils.MIN_DRIVER_VERSION) in info
 
 
-def test_check_gpu_driver_version_fails_when_nvidia_smi_not_found(monkeypatch) -> None:
+def test_check_gpu_driver_version_fails_when_nvidia_smi_not_found(monkeypatch, nvidia_torch) -> None:
     monkeypatch.setattr(os_utils, "find_executable", lambda name: None)
     ok, info = os_utils.check_gpu_driver_version()
     assert ok is False
@@ -532,7 +571,7 @@ def test_find_executable_prefers_path_over_common_locations(monkeypatch, tmp_pat
     assert os_utils.find_executable("nvidia-smi") == str(on_path)
 
 
-def test_check_gpu_driver_version_fails_when_nvidia_smi_errors(monkeypatch) -> None:
+def test_check_gpu_driver_version_fails_when_nvidia_smi_errors(monkeypatch, nvidia_torch) -> None:
     monkeypatch.setattr(os_utils, "find_executable", lambda name: "/fake/nvidia-smi")
 
     def fake_run(cmd, **kwargs):
@@ -544,7 +583,7 @@ def test_check_gpu_driver_version_fails_when_nvidia_smi_errors(monkeypatch) -> N
     assert "exited with code" in info
 
 
-def test_check_gpu_driver_version_fails_on_oserror(monkeypatch) -> None:
+def test_check_gpu_driver_version_fails_on_oserror(monkeypatch, nvidia_torch) -> None:
     monkeypatch.setattr(os_utils, "find_executable", lambda name: "/fake/nvidia-smi")
 
     def fake_run(cmd, **kwargs):
@@ -556,7 +595,7 @@ def test_check_gpu_driver_version_fails_on_oserror(monkeypatch) -> None:
     assert "permission denied" in info
 
 
-def test_check_gpu_driver_version_fails_on_unparseable_output(monkeypatch) -> None:
+def test_check_gpu_driver_version_fails_on_unparseable_output(monkeypatch, nvidia_torch) -> None:
     monkeypatch.setattr(os_utils, "find_executable", lambda name: "/fake/nvidia-smi")
 
     def fake_run(cmd, **kwargs):
@@ -566,6 +605,19 @@ def test_check_gpu_driver_version_fails_on_unparseable_output(monkeypatch) -> No
     ok, info = os_utils.check_gpu_driver_version()
     assert ok is False
     assert "Could not parse" in info
+
+
+def test_check_gpu_driver_version_reports_rocm(monkeypatch) -> None:
+    fake_torch = types.SimpleNamespace(
+        version=types.SimpleNamespace(hip="7.2.1"),
+        cuda=types.SimpleNamespace(is_available=lambda: True),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    ok, info = os_utils.check_gpu_driver_version()
+
+    assert ok is True
+    assert info == "ROCm 7.2.1"
 
 
 def test_check_ascii_install_path_passes_for_ascii(monkeypatch, tmp_path) -> None:

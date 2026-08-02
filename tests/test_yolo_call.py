@@ -5,7 +5,17 @@ import numpy as np
 import torch
 import pytest
 
+import jasna.mosaic.yolo as yolo_module
 from jasna.mosaic.yolo import YoloMosaicDetectionModel, _batched_nms_keep
+
+
+@pytest.fixture(autouse=True)
+def _nvidia_yolo_unit_target(monkeypatch) -> None:
+    monkeypatch.setattr(
+        yolo_module,
+        "is_nvidia_device",
+        lambda device: torch.device(device).type == "cuda",
+    )
 
 
 def _mock_engine_path():

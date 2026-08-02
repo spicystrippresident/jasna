@@ -79,6 +79,17 @@ def test_amf_encoder_settings_are_vendor_specific() -> None:
             codec="h264",
             vendor=AcceleratorVendor.AMD,
         )
+    assert validate_encoder_settings(
+        {"aq_mode": "caq"},
+        codec="av1",
+        vendor=AcceleratorVendor.AMD,
+    ) == {"aq_mode": "caq"}
+    with pytest.raises(ValueError, match="vbaq"):
+        validate_encoder_settings(
+            {"vbaq": 1},
+            codec="av1",
+            vendor=AcceleratorVendor.AMD,
+        )
 
 
 def test_video_encoder_selects_amf_and_normalizes_cq(monkeypatch, tmp_path) -> None:
@@ -102,6 +113,62 @@ def test_video_encoder_selects_amf_and_normalizes_cq(monkeypatch, tmp_path) -> N
     assert "cq" not in encoder.encoder_options
 
 
+@pytest.mark.parametrize(
+    ("is_10bit", "frame_format", "codec_pixel_format"),
+    [
+        (True, "p010le", "yuv420p10le"),
+        (False, "nv12", "yuv420p"),
+    ],
+)
+def test_software_reference_encoder_is_explicit_and_matches_source_depth(
+    monkeypatch, tmp_path, is_10bit, frame_format, codec_pixel_format
+) -> None:
+    import jasna.media.video_encoder as module
+
+    monkeypatch.setattr(
+        module,
+        "vendor_for_device",
+        lambda _device: AcceleratorVendor.AMD,
+    )
+    metadata = _metadata()
+    metadata.is_10bit = is_10bit
+    encoder = module.NvidiaVideoEncoder(
+        str(tmp_path / "out.mp4"),
+        torch.device("cuda:0"),
+        metadata,
+        codec="hevc",
+        encoder_settings={"cq": 21},
+        encoder_backend="software-reference",
+        match_input_bit_depth=True,
+    )
+
+    assert encoder.encoder_name == "libx265"
+    assert encoder.software_reference is True
+    assert encoder.spec.frame_format == frame_format
+    assert encoder.spec.codec_pixel_format == codec_pixel_format
+    assert encoder.encoder_options["crf"] == "21"
+    assert "cq" not in encoder.encoder_options
+
+
+def test_software_reference_encoder_rejects_non_hevc(monkeypatch, tmp_path) -> None:
+    import jasna.media.video_encoder as module
+
+    monkeypatch.setattr(
+        module,
+        "vendor_for_device",
+        lambda _device: AcceleratorVendor.AMD,
+    )
+    with pytest.raises(ValueError, match="only HEVC"):
+        module.NvidiaVideoEncoder(
+            str(tmp_path / "out.mp4"),
+            torch.device("cuda:0"),
+            _metadata(),
+            codec="h264",
+            encoder_settings={},
+            encoder_backend="software-reference",
+        )
+
+
 def test_amf_p010_host_input_reinterprets_signed_storage() -> None:
     import jasna.media.video_encoder as module
 
@@ -112,7 +179,43 @@ def test_amf_p010_host_input_reinterprets_signed_storage() -> None:
     assert torch.equal(host_input, packed.view(torch.uint16))
 
 
-def test_smart_render_is_rejected_on_amd(monkeypatch, tmp_path) -> None:
+def test_amf_uses_its_native_forced_idr_option_name() -> None:
+    import jasna.media.video_encoder as module
+
+    assert module._forced_idr_option(AcceleratorVendor.AMD) == "forced_idr"
+    assert module._forced_idr_option(AcceleratorVendor.NVIDIA) == "forced-idr"
+
+
+def test_linux_smart_render_maps_nvenc_b_reference_setting_to_amf(
+    monkeypatch, tmp_path
+) -> None:
+    import jasna.media.video_encoder as module
+
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        module,
+        "vendor_for_device",
+        lambda _device: AcceleratorVendor.AMD,
+    )
+    encoder = module.NvidiaVideoEncoder(
+        str(tmp_path / "out.mp4"),
+        torch.device("cuda:0"),
+        _metadata(),
+        codec="h264",
+        encoder_settings={"bf": 2, "b_ref_mode": "disabled"},
+        smart_fragment=True,
+    )
+
+    assert encoder.encoder_options["bf"] == "2"
+    assert encoder.encoder_options["bf_ref"] == "0"
+    assert encoder.encoder_options["forced_idr"] == "1"
+    assert encoder.encoder_options["preanalysis"] == "1"
+    assert "b_ref_mode" not in encoder.encoder_options
+
+
+def test_amd_smart_render_keeps_unvalidated_paths_protected(
+    monkeypatch, tmp_path
+) -> None:
     import jasna.media.video_encoder as module
 
     monkeypatch.setattr(
@@ -120,7 +223,19 @@ def test_smart_render_is_rejected_on_amd(monkeypatch, tmp_path) -> None:
         "vendor_for_device",
         lambda _device: AcceleratorVendor.AMD,
     )
-    with pytest.raises(ValueError, match="only with NVENC"):
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    with pytest.raises(ValueError, match="H.264 and HEVC"):
+        module.NvidiaVideoEncoder(
+            str(tmp_path / "out.mp4"),
+            torch.device("cuda:0"),
+            _metadata(),
+            codec="av1",
+            encoder_settings={},
+            smart_fragment=True,
+        )
+
+    monkeypatch.setattr(module.sys, "platform", "win32")
+    with pytest.raises(ValueError, match="validated only on Linux"):
         module.NvidiaVideoEncoder(
             str(tmp_path / "out.mp4"),
             torch.device("cuda:0"),
@@ -227,6 +342,111 @@ def test_amf_decoder_survives_pyav18_time_base_regression(monkeypatch) -> None:
     assert decoder.opened is True
     assert reader._decoder_ctx is decoder
     assert reader._amd_hardware_decode is True
+
+
+def test_amf_decoder_allows_missing_sample_aspect_ratio(monkeypatch) -> None:
+    import jasna.media.video_decoder as module
+
+    decoder = SimpleNamespace(open=MagicMock())
+    monkeypatch.setattr(
+        module.av,
+        "CodecContext",
+        SimpleNamespace(create=MagicMock(return_value=decoder)),
+    )
+    reader = module.NvidiaVideoReader(
+        "input.mp4",
+        4,
+        torch.device("cuda:0"),
+        _metadata(),
+    )
+    source = SimpleNamespace(
+        name="h264",
+        extradata=b"header",
+        width=16,
+        height=16,
+        framerate=Fraction(30, 1),
+        sample_aspect_ratio=None,
+        thread_type=None,
+    )
+
+    reader._setup_amf_decoder(source)
+
+    decoder.open.assert_called_once_with(strict=False)
+    assert not hasattr(decoder, "sample_aspect_ratio")
+    assert reader._decoder_ctx is decoder
+    assert reader._amd_hardware_decode is True
+
+
+def test_linux_10bit_input_skips_unreliable_pyav_amf_decoder(monkeypatch) -> None:
+    import jasna.media.video_decoder as module
+
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    create = MagicMock()
+    monkeypatch.setattr(
+        module.av,
+        "CodecContext",
+        SimpleNamespace(create=create),
+    )
+    metadata = _metadata()
+    metadata.codec_name = "hevc"
+    metadata.is_10bit = True
+    reader = module.NvidiaVideoReader(
+        "input.mkv", 4, torch.device("cuda:0"), metadata
+    )
+    source = SimpleNamespace(name="hevc", thread_type=None)
+
+    reader._setup_amf_decoder(source)
+
+    create.assert_not_called()
+    assert reader._decoder_ctx is None
+    assert reader._amd_hardware_decode is False
+    assert source.thread_type == "AUTO"
+
+
+def test_linux_10bit_amf_encoding_disables_preanalysis(monkeypatch, tmp_path) -> None:
+    import jasna.media.video_encoder as module
+
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        module,
+        "vendor_for_device",
+        lambda _device: AcceleratorVendor.AMD,
+    )
+    metadata = _metadata()
+    metadata.codec_name = "hevc"
+    metadata.is_10bit = True
+
+    encoder = module.NvidiaVideoEncoder(
+        str(tmp_path / "out.mkv"),
+        torch.device("cuda:0"),
+        metadata,
+        codec="hevc",
+        encoder_settings={},
+        match_input_bit_depth=True,
+    )
+
+    assert encoder.spec.ten_bit is True
+    assert encoder.encoder_options["preanalysis"] == "0"
+
+
+def test_amf_av1_uses_its_native_aq_option(monkeypatch, tmp_path) -> None:
+    import jasna.media.video_encoder as module
+
+    monkeypatch.setattr(
+        module,
+        "vendor_for_device",
+        lambda _device: AcceleratorVendor.AMD,
+    )
+    encoder = module.NvidiaVideoEncoder(
+        str(tmp_path / "out.mkv"),
+        torch.device("cuda:0"),
+        _metadata(),
+        codec="av1",
+        encoder_settings={},
+    )
+
+    assert encoder.encoder_options["aq_mode"] == "caq"
+    assert "vbaq" not in encoder.encoder_options
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")

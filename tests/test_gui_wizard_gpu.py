@@ -6,6 +6,7 @@ import types
 import pytest
 
 from jasna.gui.wizard import FirstRunWizard
+from jasna.gui.locales import t
 
 
 def _make_fake_torch(
@@ -87,4 +88,4 @@ def test_check_gpu_fails_when_no_cuda(monkeypatch):
     fake_torch = _make_fake_torch(False)
     passed, msg = _call_check_gpu(monkeypatch, fake_torch)
     assert passed is False
-    assert "compatible GPU" in msg
+    assert msg == t("wizard_no_cuda")

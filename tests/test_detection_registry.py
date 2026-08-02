@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+import jasna.mosaic.detection_registry as detection_registry
 from jasna.mosaic.detection_registry import (
     DEFAULT_DETECTION_MODEL_NAME,
     RFDETR_MODEL_NAMES,
@@ -20,6 +21,19 @@ from jasna.mosaic.detection_registry import (
     rfdetr_model_config,
     require_detection_model_weights,
 )
+
+
+@pytest.fixture(autouse=True)
+def _nvidia_registry_target(monkeypatch):
+    """Keep legacy TensorRT registry tests independent of a ROCm host."""
+
+    def is_nvidia(device=None):
+        return device is None or torch.device(device).type == "cuda"
+
+    monkeypatch.setattr(detection_registry, "is_amd_device", lambda device=None: False)
+    monkeypatch.setattr(detection_registry, "is_nvidia_device", is_nvidia)
+    monkeypatch.setattr("jasna.mosaic.rfdetr.is_amd_device", lambda device=None: False)
+    monkeypatch.setattr("jasna.mosaic.rfdetr.is_nvidia_device", is_nvidia)
 
 
 def test_default_detection_model_is_rfdetr_v6() -> None:
@@ -245,16 +259,16 @@ def test_precompile_noop_on_cpu() -> None:
 
 
 def test_precompile_rfdetr_on_cuda() -> None:
-    with patch("jasna.trt.compile_onnx_to_tensorrt_engine") as mock_compile:
+    with patch("jasna.mosaic.rfdetr.compile_rfdetr_engine") as mock_compile:
         precompile_detection_engine("rfdetr-v5", Path("m.onnx"), 2, torch.device("cuda:0"), True)
         mock_compile.assert_called_once_with(
             Path("m.onnx"), torch.device("cuda:0"),
-            batch_size=4, fp16=True, workspace_gb=20, dynamic_batch=False,
+            batch_size=4, resolution=768, dynamic_batch=False, fp16=True,
         )
 
 
 def test_precompile_rfdetr_v6_uses_requested_dynamic_batch() -> None:
-    with patch("jasna.trt.compile_onnx_to_tensorrt_engine") as mock_compile:
+    with patch("jasna.mosaic.rfdetr.compile_rfdetr_engine") as mock_compile:
         precompile_detection_engine(
             "rfdetr-v6",
             Path("m.onnx"),
@@ -264,7 +278,7 @@ def test_precompile_rfdetr_v6_uses_requested_dynamic_batch() -> None:
         )
         mock_compile.assert_called_once_with(
             Path("m.onnx"), torch.device("cuda:0"),
-            batch_size=8, fp16=True, workspace_gb=20, dynamic_batch=True,
+            batch_size=8, resolution=576, dynamic_batch=True, fp16=True,
         )
 
 

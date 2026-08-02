@@ -3,18 +3,32 @@ from __future__ import annotations
 import statistics
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
 
-from jasna.restorer.basicvrspp_tenorrt_compilation import basicvsrpp_startup_policy
 from jasna.restorer.basicvsrpp_mosaic_restorer import BasicvsrppMosaicRestorer
-from jasna.restorer.basicvsrpp_sub_engines import BasicVSRPlusPlusNetSplit
+
+if TYPE_CHECKING:
+    from jasna.restorer.basicvsrpp_sub_engines import BasicVSRPlusPlusNetSplit
 
 CLIP_LENGTH = 60
 SIZE = 256
 WARMUP = 3
 RUNS = 100
+
+
+def _make_eager_input(
+    device: torch.device,
+    *,
+    clip_length: int = CLIP_LENGTH,
+    size: int = SIZE,
+) -> list[torch.Tensor]:
+    return [
+        torch.randint(0, 256, (3, size, size), dtype=torch.uint8, device=device)
+        for _ in range(clip_length)
+    ]
 
 
 def _timed(label: str, fn, *args, **kwargs):
@@ -165,12 +179,19 @@ def benchmark_basicvsrpp_restoration(
         return
     path = restoration_model_path.resolve()
 
-    use_tensorrt = basicvsrpp_startup_policy(
-        restoration_model_path=str(path),
-        device=device,
-        fp16=fp16,
-        compile_basicvsrpp=compile_basicvsrpp,
-    )
+    use_tensorrt = False
+    if compile_basicvsrpp:
+        from jasna.accelerator import is_nvidia_device
+
+        if is_nvidia_device(device):
+            from jasna.restorer.basicvrspp_tenorrt_compilation import basicvsrpp_startup_policy
+
+            use_tensorrt = basicvsrpp_startup_policy(
+                restoration_model_path=str(path),
+                device=device,
+                fp16=fp16,
+                compile_basicvsrpp=True,
+            )
     restorer = BasicvsrppMosaicRestorer(
         checkpoint_path=str(path),
         device=device,
@@ -188,10 +209,7 @@ def benchmark_basicvsrpp_restoration(
         print("\nNo split forward available (engines missing?), skipping detailed profiling.")
 
         durations: list[float] = []
-        video = [
-            torch.randint(0, 256, (SIZE, SIZE, 3), dtype=torch.uint8, device=device)
-            for _ in range(CLIP_LENGTH)
-        ]
+        video = _make_eager_input(device)
         with torch.inference_mode():
             for _ in range(RUNS):
                 start = time.perf_counter()

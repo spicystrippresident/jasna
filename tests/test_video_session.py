@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import replace
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import MagicMock, patch
 
 from jasna.gui.models import AppSettings
@@ -71,15 +73,30 @@ def test_video_session_key_includes_active_secondary_knobs() -> None:
 
 def _build(settings: AppSettings):
     compile_result = MagicMock(use_basicvsrpp_tensorrt=True)
+    restorer_cls = MagicMock(name="BasicvsrppMosaicRestorer")
+    pipeline_cls = MagicMock(name="RestorationPipeline")
+    unet_cls = MagicMock(name="Unet4xSecondaryRestorer")
+    restorer_module = ModuleType("jasna.restorer.basicvsrpp_mosaic_restorer")
+    restorer_module.BasicvsrppMosaicRestorer = restorer_cls
+    pipeline_module = ModuleType("jasna.restorer.restoration_pipeline")
+    pipeline_module.RestorationPipeline = pipeline_cls
+    unet_module = ModuleType("jasna.restorer.unet4x_secondary_restorer")
+    unet_module.Unet4xSecondaryRestorer = unet_cls
     with (
+        patch.dict(
+            sys.modules,
+            {
+                restorer_module.__name__: restorer_module,
+                pipeline_module.__name__: pipeline_module,
+                unet_module.__name__: unet_module,
+            },
+        ),
         patch("jasna._suppress_noise.install"),
+        patch("jasna.accelerator.is_amd_device", return_value=False),
         patch("jasna.engine_compiler.ensure_engines_compiled", return_value=compile_result) as compiled,
         patch("jasna.engine_paths.model_weights_dir"),
         patch("jasna.mosaic.detection_registry.coerce_detection_model_name", side_effect=lambda n: n),
         patch("jasna.mosaic.detection_registry.require_detection_model_weights") as det_path,
-        patch("jasna.restorer.basicvsrpp_mosaic_restorer.BasicvsrppMosaicRestorer") as restorer_cls,
-        patch("jasna.restorer.restoration_pipeline.RestorationPipeline") as pipeline_cls,
-        patch("jasna.restorer.unet4x_secondary_restorer.Unet4xSecondaryRestorer") as unet_cls,
     ):
         det_path.return_value = "det.engine"
         session = build_video_session(settings, disable_basicvsrpp_tensorrt=False, log=lambda _msg: None)

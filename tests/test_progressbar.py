@@ -78,6 +78,16 @@ class TestProgressbarLifecycle:
         assert last_call[0][3] == 10
         assert last_call[0][4] == 10
 
+    def test_mark_completed_advances_without_timing_samples(self):
+        cb = MagicMock()
+        pb = Progressbar(total_frames=10, video_fps=1, disable=True, callback=cb)
+
+        pb.mark_completed(4)
+
+        assert pb.frames_processed == 4
+        assert pb.frame_processing_durations_buffer == []
+        cb.assert_called_once_with(40.0, 0.0, 0.0, 4, 10)
+
     def test_buffer_respects_max_len(self):
         pb = Progressbar(total_frames=200, video_fps=1, disable=True)
         pb.init()

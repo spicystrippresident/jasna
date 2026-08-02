@@ -30,6 +30,7 @@ def run_benchmarks(
     fp16: bool = True,
     benchmark_videos: list[Path],
     detection_score_threshold: float | None = None,
+    detection_model_path: Path | None = None,
     restoration_model_path: Path | None = None,
     compile_basicvsrpp: bool = True,
     benchmark_filter: str | None = None,
@@ -54,6 +55,7 @@ def run_benchmarks(
                 fp16=fp16,
                 benchmark_videos=videos_to_run,
                 detection_score_threshold=detection_score_threshold,
+                detection_model_path=detection_model_path,
                 restoration_model_path=restoration_model_path,
                 compile_basicvsrpp=compile_basicvsrpp,
             )
@@ -118,6 +120,11 @@ def run_benchmark_cli(args: Namespace) -> None:
             None
             if args.detection_score_threshold is None
             else float(args.detection_score_threshold)
+        ),
+        detection_model_path=(
+            Path(str(args.detection_model_path))
+            if str(args.detection_model_path).strip()
+            else None
         ),
         restoration_model_path=Path(args.restoration_model_path),
         compile_basicvsrpp=bool(args.compile_basicvsrpp),

@@ -22,6 +22,11 @@ CLI_HELP: dict[str, str] = {
         "forces fisheye conditioning for every region. Detection, tracking, and "
         "blending stay in source coordinates. (default: %(default)s)"
     ),
+    "vr_projection": (
+        "Explicit restoration projection for SBS regions. Auto keeps the conservative "
+        "studio/metadata routing; raw, fisheye, and gnomonic force one projection for "
+        "every detected region. This does not change detection or blend coordinates."
+    ),
     "tvai_ffmpeg_path": "Path to Topaz Video ffmpeg.exe (default: %(default)s)",
     "tvai_model": 'Topaz model name for tvai_up (e.g. "iris-2", "prob-4", "iris-3") (default: %(default)s)',
     "tvai_scale": "Topaz tvai_up scale (1=no scale). Output size is 256*scale (default: %(default)s)",

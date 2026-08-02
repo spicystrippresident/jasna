@@ -6,7 +6,11 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 import torch
+
+
+pytest.importorskip("tensorrt", reason="YOLO TensorRT compilation is NVIDIA-only")
 
 
 def _touch(path: Path) -> None:

@@ -6,7 +6,13 @@ from jasna.media.resize_normalize import ResizeNormalizer
 from jasna.mosaic.rfdetr import _IMAGENET_MEAN, _IMAGENET_STD
 from jasna.mosaic.yolo import _YOLO_LETTERBOX_PAD_VALUE, _letterbox_geometry
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA"),
+    pytest.mark.skipif(
+        getattr(torch.version, "hip", None) is not None,
+        reason="tests the NVIDIA CUDA fused preprocess kernel",
+    ),
+]
 
 IDENTITY = (0.0, 0.0, 0.0)
 UNIT = (1.0, 1.0, 1.0)

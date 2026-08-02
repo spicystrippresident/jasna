@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from importlib.util import find_spec
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 from jasna.engine_compiler import (
     EngineCompilationRequest,
@@ -13,6 +15,17 @@ from jasna.engine_compiler import (
     _unet4x_engine_exists,
     ensure_engines_compiled,
 )
+
+
+@pytest.fixture(autouse=True)
+def _nvidia_engine_compiler_target(monkeypatch) -> None:
+    """Exercise NVIDIA composition logic even when pytest runs on ROCm."""
+
+    def is_nvidia(device=None):
+        return device is None or torch.device(device).type == "cuda"
+
+    monkeypatch.setattr("jasna.accelerator.is_amd_device", lambda device=None: False)
+    monkeypatch.setattr("jasna.accelerator.is_nvidia_device", is_nvidia)
 
 
 def _mock_proc(lines: list[str], returncode: int = 0) -> MagicMock:
@@ -185,7 +198,7 @@ def test_detection_engine_exists_rfdetr(tmp_path: Path) -> None:
         "rfdetr-v5", str(onnx_path), 4, True, "cuda:0"
     ) is False
 
-    from jasna.trt import get_onnx_tensorrt_engine_path
+    from jasna.engine_paths import get_onnx_tensorrt_engine_path
     engine = get_onnx_tensorrt_engine_path(
         onnx_path,
         batch_size=4,
@@ -205,7 +218,7 @@ def test_detection_engine_exists_rfdetr_v6_uses_dynamic_path(
     onnx_path = tmp_path / "rfdetr-v6.onnx"
     onnx_path.write_text("x")
 
-    from jasna.trt import get_onnx_tensorrt_engine_path
+    from jasna.engine_paths import get_onnx_tensorrt_engine_path
 
     engine = get_onnx_tensorrt_engine_path(
         onnx_path,
@@ -247,6 +260,10 @@ def test_unet4x_engine_exists_plaintext(monkeypatch, tmp_path: Path) -> None:
     assert _unet4x_engine_exists(fp16=True) is True
 
 
+@pytest.mark.skipif(
+    find_spec("jasna.protection.protected_model") is None,
+    reason="public source tree does not include the protected-model runtime",
+)
 def test_unet4x_engine_exists_encrypted(monkeypatch, tmp_path: Path) -> None:
     onnx_path = tmp_path / "unet-4x.onnx"  # absent → encrypted branch
     monkeypatch.setattr("jasna.engine_paths.UNET4X_ONNX_PATH", onnx_path)

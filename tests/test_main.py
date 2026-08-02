@@ -1,11 +1,31 @@
 import sys
 from contextlib import contextmanager
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+import jasna.accelerator
+import jasna.restorer
 from jasna.main import build_parser
+
+
+@pytest.fixture(autouse=True)
+def _nvidia_composition_root(monkeypatch):
+    """Keep these NVIDIA composition-root tests independent of the host build."""
+    monkeypatch.setattr(jasna.accelerator, "is_amd_device", lambda device=None: False)
+
+    protected_modules = {
+        "unet4x_secondary_restorer": "Unet4xSecondaryRestorer",
+        "rtx_superres_secondary_restorer": "RtxSuperresSecondaryRestorer",
+    }
+    for short_name, class_name in protected_modules.items():
+        full_name = f"jasna.restorer.{short_name}"
+        module = ModuleType(full_name)
+        setattr(module, class_name, MagicMock(name=class_name))
+        monkeypatch.setitem(sys.modules, full_name, module)
+        monkeypatch.setattr(jasna.restorer, short_name, module, raising=False)
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +106,7 @@ class TestBuildParser:
         assert args.denoise_step == "after_primary"
         assert args.secondary_restoration == "none"
         assert args.codec == "hevc"
+        assert args.encoder_backend == "auto"
         assert args.encoder_settings == ""
         assert args.retarget_high_fps is False
         assert args.sharpen == 0.0
@@ -423,8 +444,14 @@ class TestArgForwarding:
         assert pipe["fp16"] is False
 
     def test_encoder_settings_forwarded(self, tmp_path):
-        pipe, _ = self._capture_run(tmp_path, ["--encoder-settings", "cq=22,rc-lookahead=32"])
-        assert pipe["encoder_settings"] == {"cq": 22, "rc-lookahead": 32}
+        pipe, _ = self._capture_run(tmp_path, ["--encoder-settings", "cq=22,g=120"])
+        assert pipe["encoder_settings"] == {"cq": 22, "g": 120}
+
+    def test_explicit_software_reference_encoder_forwarded(self, tmp_path):
+        pipe, _ = self._capture_run(
+            tmp_path, ["--encoder-backend", "software-reference"]
+        )
+        assert pipe["encoder_backend"] == "software-reference"
 
     def test_batch_size_forwarded(self, tmp_path):
         pipe, _ = self._capture_run(tmp_path, ["--batch-size", "8"])
@@ -441,6 +468,12 @@ class TestArgForwarding:
     def test_vr_mode_forwarded(self, tmp_path):
         pipe, _ = self._capture_run(tmp_path, ["--vr-mode", "sbs-fisheye"])
         assert pipe["vr_mode"] == "sbs-fisheye"
+
+    def test_vr_projection_forwarded(self, tmp_path):
+        pipe, _ = self._capture_run(
+            tmp_path, ["--vr-mode", "sbs", "--vr-projection", "gnomonic"]
+        )
+        assert pipe["vr_projection"] == "gnomonic"
 
     def test_no_progress_forwarded(self, tmp_path):
         pipe, _ = self._capture_run(tmp_path, ["--no-progress"])

@@ -45,7 +45,7 @@ def test_settings_scrollbar_only_appears_when_sections_overflow() -> None:
         pytest.skip(f"Tk display unavailable: {exc}")
 
     try:
-        root.geometry("420x420")
+        root.geometry("420x440")
         panel = _settings_panel(root)
 
         assert panel._scroll._scrollbar.winfo_ismapped()

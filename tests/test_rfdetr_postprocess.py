@@ -1,3 +1,4 @@
+from importlib.util import find_spec
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -298,6 +299,7 @@ class TestRfDetrCall:
 
 
 class TestCompileRfdetrEngine:
+    @pytest.mark.skipif(find_spec("tensorrt") is None, reason="needs TensorRT")
     def test_delegates_to_compile_onnx(self):
         with patch("jasna.trt.compile_onnx_to_tensorrt_engine", return_value=Path("out.engine")) as mock_compile:
             result = compile_rfdetr_engine(

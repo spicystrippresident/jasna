@@ -110,6 +110,15 @@ class TestPipelineInit:
         p = _make_pipeline(progress_callback=cb)
         assert p.progress_callback is cb
 
+    def test_close_does_not_close_session_owned_detector(self):
+        detection_model = MagicMock()
+        pipeline = _make_pipeline(detection_model=detection_model)
+
+        pipeline.close()
+
+        detection_model.close.assert_not_called()
+        assert pipeline.detection_model is None
+
     def test_retarget_high_fps_defaults_off_and_can_be_enabled(self):
         assert _make_pipeline().retarget_high_fps is False
         assert _make_pipeline(retarget_high_fps=True).retarget_high_fps is True

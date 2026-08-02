@@ -19,6 +19,10 @@ from jasna.media.video_decoder import NvidiaVideoReader
 from jasna.media.yuv_to_rgb import YuvToRgbConverter
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+NVIDIA_ONLY = pytest.mark.skipif(
+    getattr(torch.version, "hip", None) is not None,
+    reason="tests the NVIDIA NVDEC fallback boundary",
+)
 
 DEVICE = torch.device("cuda:0")
 
@@ -224,6 +228,7 @@ def test_seek_into_software_video_lands_at_or_after_target(ffv1_video):
     assert pts[0] == expected_first
 
 
+@NVIDIA_ONLY
 def test_software_selection_logged_once(ffv1_video, caplog):
     path, metadata = ffv1_video
     with caplog.at_level(logging.WARNING, logger="jasna.media.video_decoder"):
@@ -253,6 +258,7 @@ def test_h264_444_with_b_frames_falls_back_and_keeps_all_frames(tmp_path):
     assert all_pts == sorted(all_pts)
 
 
+@NVIDIA_ONLY
 def test_hardware_input_never_enters_software_path(tmp_path, monkeypatch):
     w, h, n = 128, 96, 24
     frames = [_solid_yuv420p_frame(w, h, 120, 90, 200) for _ in range(n)]

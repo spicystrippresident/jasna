@@ -33,8 +33,52 @@ class RestorationSession:
     detection_model_path: Path
     restoration_pipeline: "RestorationPipeline"
     secondary_restorer: "SecondaryRestorer | None"
+    detection_model: object | None = None
+    detection_model_key: tuple | None = None
+
+    def get_detection_model(
+        self,
+        *,
+        name: str,
+        path: str | Path,
+        batch_size: int,
+        score_threshold: float,
+        fp16: bool,
+    ) -> object:
+        model_path = Path(path)
+        key = (
+            str(name),
+            str(model_path.resolve()),
+            int(batch_size),
+            str(self.device),
+            float(score_threshold),
+            bool(fp16),
+        )
+        if self.detection_model_key != key:
+            if self.detection_model is not None and hasattr(
+                self.detection_model, "close"
+            ):
+                self.detection_model.close()
+            self.detection_model = None
+            self.detection_model_key = None
+            from jasna.mosaic.detection_registry import build_detection_model
+
+            self.detection_model = build_detection_model(
+                str(name),
+                model_path,
+                batch_size=int(batch_size),
+                device=self.device,
+                score_threshold=float(score_threshold),
+                fp16=bool(fp16),
+            )
+            self.detection_model_key = key
+        return self.detection_model
 
     def close(self) -> None:
+        if self.detection_model is not None and hasattr(self.detection_model, "close"):
+            self.detection_model.close()
+        self.detection_model = None
+        self.detection_model_key = None
         self.restoration_pipeline.restorer.close()
         if self.secondary_restorer is not None and hasattr(self.secondary_restorer, "close"):
             self.secondary_restorer.close()
@@ -140,6 +184,30 @@ def build_pipeline(
     splice_plan: "SplicePlan | None" = None,
 ) -> "Pipeline":
     from jasna.pipeline import Pipeline
+    from jasna import __version__
+
+    processing_signature = {
+        "jasna_version": __version__,
+        "device": config.device,
+        "fp16": bool(config.fp16),
+        "batch_size": int(config.batch_size),
+        "detection_model_name": config.detection_model_name,
+        "detection_score_threshold": float(config.detection_score_threshold),
+        "max_detection_gap": int(config.max_detection_gap),
+        "min_detection_duration": int(config.min_detection_duration),
+        "scene_detection": bool(config.scene_detection),
+        "max_clip_size": int(config.max_clip_size),
+        "temporal_overlap": int(config.temporal_overlap),
+        "enable_crossfade": bool(config.enable_crossfade),
+        "denoise_strength": config.denoise_strength,
+        "denoise_step": config.denoise_step,
+        "secondary_restoration": config.secondary_restoration,
+        "vr_mode": config.vr_mode,
+        "vr_projection": config.vr_projection,
+        "encoder_backend": config.encoder_backend,
+        "sharpen_strength": float(config.sharpen_strength),
+        "retarget_high_fps": bool(config.retarget_high_fps),
+    }
 
     return Pipeline(
         input_video=input_video,
@@ -149,6 +217,7 @@ def build_pipeline(
         detection_score_threshold=float(config.detection_score_threshold),
         restoration_pipeline=session.restoration_pipeline,
         codec=config.codec,
+        encoder_backend=config.encoder_backend,
         encoder_settings=dict(config.encoder_settings),
         batch_size=int(config.batch_size),
         device=session.device,
@@ -170,4 +239,7 @@ def build_pipeline(
         segments=segments,
         splice_plan=splice_plan,
         working_dir=config.working_dir,
+        restoration_model_path=config.restoration_model_path,
+        processing_signature=processing_signature,
+        detection_session=session,
     )

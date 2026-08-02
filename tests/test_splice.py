@@ -16,6 +16,7 @@ from jasna.media.splice import (
     _is_safe_random_access_packet,
     build_splice_plan,
     create_copy_fragment,
+    probe_keyframes,
     resolve_smart_encoder_settings,
     validate_smart_render,
 )
@@ -90,6 +91,53 @@ def test_plan_rejects_range_shorter_than_timestamp_interval() -> None:
 def test_packet_reordering_detects_flat_and_hierarchical_b_frames() -> None:
     assert _analyze_packet_reordering((0, 4, 1, 2, 3, 8, 5, 6, 7)) == (3, False)
     assert _analyze_packet_reordering((0, 5, 3, 1, 2, 4, 10, 8, 6, 7, 9)) == (4, True)
+
+
+def test_probe_keyframes_extends_stream_duration_through_last_packet() -> None:
+    class FakePacket:
+        def __init__(self, pts: int, keyframe: bool) -> None:
+            self.pts = pts
+            self.duration = 1
+            self.is_keyframe = keyframe
+
+        def __bytes__(self) -> bytes:
+            return b""
+
+    stream = MagicMock()
+    stream.codec_context.extradata = b""
+    stream.time_base = Fraction(1, 1)
+    stream.start_time = 0
+    stream.duration = 2
+
+    packets = [
+        FakePacket(pts, keyframe)
+        for pts, keyframe in ((0, True), (1, False), (2, False))
+    ]
+
+    container = MagicMock()
+    container.streams.video = [stream]
+    container.demux.return_value = iter(packets)
+    container.__enter__.return_value = container
+
+    with (
+        patch("jasna.media.splice.av.open", return_value=container),
+        patch("jasna.media.splice._is_safe_random_access_packet", return_value=True),
+    ):
+        index = probe_keyframes(
+            "tail-duration.mp4",
+            _metadata(
+                "hevc",
+                video_fps=1.0,
+                video_fps_exact=Fraction(1, 1),
+                time_base=Fraction(1, 1),
+                duration=2.0,
+                num_frames=3,
+                profile="Main",
+            ),
+        )
+
+    assert index.start_pts == 0
+    assert index.end_pts == 3
 
 
 def test_smart_h264_settings_match_source_structure() -> None:

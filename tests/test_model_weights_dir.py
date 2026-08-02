@@ -3,9 +3,16 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 import jasna.engine_paths as engine_paths
 from jasna.engine_paths import model_weights_dir
 from jasna.mosaic import detection_registry
+
+
+@pytest.fixture(autouse=True)
+def _nvidia_model_weights_target(monkeypatch) -> None:
+    monkeypatch.setattr(detection_registry, "is_amd_device", lambda device=None: False)
 
 
 def test_model_weights_dir_in_dev_is_cwd_relative(monkeypatch) -> None:

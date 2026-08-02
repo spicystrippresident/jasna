@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from typing import Sequence
 
 
 @dataclass(frozen=True, order=True)
@@ -83,6 +85,55 @@ def normalize_segments(
         else:
             merged.append(segment)
     return tuple(merged)
+
+
+def segments_from_scores(
+    times: Sequence[float],
+    scores: Sequence[float],
+    *,
+    threshold: float,
+    stride: float,
+    duration: float,
+    pad: float | None = None,
+) -> tuple[SegmentRange, ...]:
+    """Merge above-threshold scan samples into padded restoration ranges."""
+
+    if len(times) != len(scores):
+        raise ValueError("times and scores must have the same length")
+    stride = float(stride)
+    duration = float(duration)
+    threshold = float(threshold)
+    if not math.isfinite(stride) or stride <= 0:
+        raise ValueError("stride must be finite and greater than zero")
+    if not math.isfinite(duration) or duration < 0:
+        raise ValueError("duration must be finite and non-negative")
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError("threshold must be between zero and one")
+    if pad is None:
+        pad = stride / 2
+    pad = float(pad)
+    if not math.isfinite(pad) or pad < 0:
+        raise ValueError("pad must be finite and non-negative")
+
+    hits = []
+    previous_seconds = -1.0
+    for seconds, score in zip(times, scores):
+        seconds = float(seconds)
+        score = float(score)
+        if not math.isfinite(seconds) or seconds < 0:
+            raise ValueError("sample times must be finite and non-negative")
+        if seconds < previous_seconds:
+            raise ValueError("sample times must be ordered")
+        if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+            raise ValueError("sample scores must be finite and between zero and one")
+        previous_seconds = seconds
+        if score < threshold:
+            continue
+        start = max(0.0, seconds - pad)
+        end = min(duration, seconds + stride + pad)
+        if end > start:
+            hits.append(SegmentRange(start, end))
+    return normalize_segments(hits, duration=duration)
 
 
 def parse_segments(spec: str, *, duration: float | None = None) -> tuple[SegmentRange, ...]:

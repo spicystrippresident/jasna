@@ -3,6 +3,7 @@ from __future__ import annotations
 import heapq
 import logging
 import queue
+import sys
 import threading
 from collections import deque
 from dataclasses import dataclass, field
@@ -138,10 +139,21 @@ DEFAULT_AMF_AV1_ENCODER_OPTIONS: dict[str, str] = {
     "qvbr_quality_level": "32",
     "g": "250",
     "preanalysis": "1",
-    "vbaq": "1",
+    "aq_mode": "caq",
     "profile": "main",
     "bitdepth": "10",
 }
+
+# Deliberately optimized for short correctness runs, not for production quality
+# or performance comparisons. This backend is reachable only through the
+# explicit ``software-reference`` selection.
+DEFAULT_SOFTWARE_REFERENCE_HEVC_OPTIONS: dict[str, str] = {
+    "preset": "ultrafast",
+    "crf": "24",
+    "x265-params": "log-level=error",
+}
+
+SOFTWARE_REFERENCE_ENCODER_SETTINGS = frozenset({"cq", "crf", "preset"})
 
 
 @dataclass(frozen=True)
@@ -152,6 +164,7 @@ class EncoderSpec:
     default_options: Mapping[str, str]
     ten_bit: bool
     supported_settings: frozenset[str] = field(default_factory=frozenset)
+    codec_pixel_format: str | None = None
 
 
 ENCODER_SPECS: dict[str, EncoderSpec] = {
@@ -208,6 +221,18 @@ AMF_ENCODER_SPECS: dict[str, EncoderSpec] = {
     ),
 }
 
+SOFTWARE_REFERENCE_ENCODER_SPECS: dict[str, EncoderSpec] = {
+    "hevc": EncoderSpec(
+        name="hevc",
+        encoder_name="libx265",
+        frame_format="p010le",
+        default_options=MappingProxyType(DEFAULT_SOFTWARE_REFERENCE_HEVC_OPTIONS),
+        ten_bit=True,
+        supported_settings=SOFTWARE_REFERENCE_ENCODER_SETTINGS,
+        codec_pixel_format="yuv420p10le",
+    ),
+}
+
 _CODEC_MAP = {spec.name: spec.encoder_name for spec in ENCODER_SPECS.values()}
 
 # ITU-T H.273 matrix, primaries, and transfer-characteristic code points.
@@ -253,6 +278,7 @@ DEFAULT_SOURCE_BITRATE_CAP_FACTOR = 1.0
 # Any VBV buffer of roughly a second or more never becomes the binding
 # constraint; only sub-second buffers throttle, which is the #243 unit trap.
 SOURCE_BITRATE_CAP_BUFFER_RATIO = 2
+FFMPEG_ENCODER_RATE_MAX = 2_147_483_647
 
 
 def source_bitrate_cap_options(metadata: VideoMetadata) -> dict[str, str]:
@@ -266,9 +292,17 @@ def source_bitrate_cap_options(metadata: VideoMetadata) -> dict[str, str]:
         metadata.codec_name.lower(), DEFAULT_SOURCE_BITRATE_CAP_FACTOR
     )
     maxrate = int(metadata.video_bitrate * factor)
+    bufsize = maxrate * SOURCE_BITRATE_CAP_BUFFER_RATIO
+    if maxrate > FFMPEG_ENCODER_RATE_MAX or bufsize > FFMPEG_ENCODER_RATE_MAX:
+        logger.warning(
+            "Source bitrate ceiling for %s exceeds the encoder option range; "
+            "encoding without a source-tied bitrate ceiling",
+            metadata.video_file,
+        )
+        return {}
     return {
         "maxrate": str(maxrate),
-        "bufsize": str(maxrate * SOURCE_BITRATE_CAP_BUFFER_RATIO),
+        "bufsize": str(bufsize),
     }
 
 
@@ -276,6 +310,10 @@ def _option_value(value: object) -> str:
     if isinstance(value, bool):
         return "1" if value else "0"
     return str(value)
+
+
+def _forced_idr_option(vendor: AcceleratorVendor) -> str:
+    return "forced_idr" if vendor is AcceleratorVendor.AMD else "forced-idr"
 
 
 def _drop_unsupported_nvenc_overrides(
@@ -336,6 +374,7 @@ class NvidiaVideoEncoder:
         *,
         codec: str,
         encoder_settings: dict[str, object],
+        encoder_backend: str = "auto",
         lut_path: str | Path | None = None,
         sharpen_strength: float = 0.0,
         output_fps: Fraction | None = None,
@@ -351,17 +390,28 @@ class NvidiaVideoEncoder:
             raise RuntimeError(
                 f"GPU video encoding is not supported on {self.vendor.value}"
             )
+        if encoder_backend not in {"auto", "software-reference"}:
+            raise ValueError(f"Unsupported encoder backend: {encoder_backend}")
+        encoder_settings = dict(encoder_settings)
+        self.encoder_backend = encoder_backend
+        self.software_reference = encoder_backend == "software-reference"
         specs = (
-            AMF_ENCODER_SPECS
+            SOFTWARE_REFERENCE_ENCODER_SPECS
+            if self.software_reference
+            else AMF_ENCODER_SPECS
             if self.vendor is AcceleratorVendor.AMD
             else ENCODER_SPECS
         )
         if codec not in specs:
+            if self.software_reference:
+                raise ValueError(
+                    "software-reference encoding currently supports only HEVC"
+                )
             raise ValueError(f"Unsupported codec: {codec}")
         spec = specs[codec]
         if match_input_bit_depth and codec in {"hevc", "av1"} and not metadata.is_10bit:
             options = dict(spec.default_options)
-            if codec == "hevc":
+            if codec == "hevc" and not self.software_reference:
                 options["profile"] = "main"
             # AMF pins output depth via "bitdepth"; dropping it lets FFmpeg
             # derive 8-bit from the nv12 input instead of conflicting with it.
@@ -373,21 +423,54 @@ class NvidiaVideoEncoder:
                 default_options=MappingProxyType(options),
                 ten_bit=False,
                 supported_settings=spec.supported_settings,
+                codec_pixel_format=(
+                    "yuv420p" if self.software_reference else spec.codec_pixel_format
+                ),
             )
         color_variant = _COLOR_VARIANTS.get((metadata.color_space, metadata.color_range))
         if color_variant is None:
             raise ValueError(f"Unsupported color space or color range: {metadata.color_space} {metadata.color_range}")
         pixel_format = "p010" if spec.frame_format == "p010le" else "nv12"
         converter_variant = f"{pixel_format}_{color_variant}"
-        if encoder_settings:
+        if smart_fragment and self.software_reference:
+            raise ValueError("Smart rendering cannot use the software-reference encoder")
+        if smart_fragment and self.vendor is AcceleratorVendor.AMD:
+            if sys.platform == "win32":
+                raise ValueError(
+                    "AMD smart rendering is validated only on Linux; Windows still uses the protected path"
+                )
+            if codec not in {"h264", "hevc"}:
+                raise ValueError(
+                    "AMD smart rendering is currently validated only for H.264 and HEVC"
+                )
+            if codec == "h264" and "b_ref_mode" in encoder_settings:
+                b_ref_mode = str(encoder_settings.pop("b_ref_mode")).strip().lower()
+                encoder_settings["bf_ref"] = b_ref_mode not in {
+                    "",
+                    "0",
+                    "false",
+                    "disabled",
+                    "none",
+                }
+        if encoder_settings and self.software_reference:
+            invalid = sorted(set(encoder_settings) - set(spec.supported_settings))
+            if invalid:
+                raise ValueError(
+                    "Unsupported software-reference encoder setting(s): "
+                    + ", ".join(invalid)
+                    + ". Supported: "
+                    + ", ".join(sorted(spec.supported_settings))
+                )
+            if "cq" in encoder_settings and "crf" in encoder_settings:
+                raise ValueError(
+                    "Conflicting software-reference encoder settings: cq and crf"
+                )
+        elif encoder_settings:
             validate_encoder_settings(
                 encoder_settings,
                 codec=codec,
                 vendor=self.vendor,
             )
-        if smart_fragment and self.vendor is AcceleratorVendor.AMD:
-            raise ValueError("Smart rendering is currently supported only with NVENC")
-
         self.metadata = metadata
         self.file = file
         self.output_path = Path(file)
@@ -416,16 +499,32 @@ class NvidiaVideoEncoder:
         self._converter = RgbToYuvConverter(converter_variant, device=self.device)
 
         self.encoder_options = dict(spec.default_options)
-        if "maxrate" not in encoder_settings:
+        if (
+            self.vendor is AcceleratorVendor.AMD
+            and not self.software_reference
+            and spec.ten_bit
+            and sys.platform != "win32"
+        ):
+            # Linux AMF 1.4.37 rejects P010 input with preanalysis. Keep
+            # hardware encoding and disable only that incompatible 10-bit
+            # analysis stage; 8-bit QVBR requires preanalysis to stay enabled.
+            self.encoder_options["preanalysis"] = "0"
+        if not self.software_reference and "maxrate" not in encoder_settings:
             self.encoder_options.update(source_bitrate_cap_options(metadata))
         if encoder_settings:
             overrides = {k: _option_value(v) for k, v in encoder_settings.items()}
+            if self.software_reference and "cq" in overrides:
+                overrides["crf"] = overrides.pop("cq")
             # FFmpeg accepts both spellings for HEVC/H.264, but their defaults
             # use the underscore key. Normalize the alias so a user override
             # replaces that default instead of passing two conflicting options.
             if "spatial-aq" in overrides and "spatial_aq" in self.encoder_options:
                 overrides["spatial_aq"] = overrides.pop("spatial-aq")
-            if self.vendor is AcceleratorVendor.AMD and "cq" in overrides:
+            if (
+                not self.software_reference
+                and self.vendor is AcceleratorVendor.AMD
+                and "cq" in overrides
+            ):
                 if "qvbr_quality_level" in overrides:
                     raise ValueError(
                         "Conflicting encoder settings: cq and "
@@ -436,7 +535,7 @@ class NvidiaVideoEncoder:
                 _drop_unsupported_nvenc_overrides(codec, overrides, self.encoder_options)
             self.encoder_options.update(overrides)
         if self.smart_fragment:
-            self.encoder_options["forced-idr"] = "1"
+            self.encoder_options[_forced_idr_option(self.vendor)] = "1"
 
         self.BUFFER_MAX_SIZE = 8
         self._lut_flags: deque[bool] = deque()
@@ -444,6 +543,9 @@ class NvidiaVideoEncoder:
         # them None and allocates per frame (NVENC outlives encode()).
         self._packed: torch.Tensor | None = None
         self._cas_luma: torch.Tensor | None = None
+        self._uses_host_input = (
+            self.vendor is AcceleratorVendor.AMD or self.software_reference
+        )
 
     def __enter__(self):
         try:
@@ -461,11 +563,17 @@ class NvidiaVideoEncoder:
         self.dst = av.open(str(self.output_path), "w", container_options=container_options)
         self.dst.metadata.update(self._src.metadata)
 
+        if self.software_reference:
+            logger.warning(
+                "Using validation-only software-reference encoder libx265; "
+                "this is not a production fallback and must not be used for performance results"
+            )
+
         stream_kwargs = {
             "rate": self.output_fps,
             "options": dict(self.encoder_options),
         }
-        if self.vendor is AcceleratorVendor.AMD:
+        if self.vendor is AcceleratorVendor.AMD and not self.software_reference:
             stream_kwargs["hwaccel"] = HWAccel(
                 "amf",
                 device=str(self.device.index or 0),
@@ -480,8 +588,8 @@ class NvidiaVideoEncoder:
         ctx.time_base = self.metadata.time_base
         ctx.framerate = self.output_fps
         ctx.pix_fmt = (
-            self.spec.frame_format
-            if self.vendor is AcceleratorVendor.AMD
+            self.spec.codec_pixel_format or self.spec.frame_format
+            if self._uses_host_input
             else "cuda"
         )
         if self.smart_fragment:
@@ -513,11 +621,11 @@ class NvidiaVideoEncoder:
         # conversion buffers into the restorer's allocations (issue #252).
         self.stream = (
             current_stream(self.device)
-            if self.vendor is AcceleratorVendor.AMD
+            if self._uses_host_input
             else new_stream(self.device)
         )
         self._cuda_ctx = None
-        if self.vendor is AcceleratorVendor.NVIDIA:
+        if not self._uses_host_input:
             from av.video.frame import CudaContext
 
             self._cuda_ctx = CudaContext(
@@ -531,7 +639,7 @@ class NvidiaVideoEncoder:
         self._packed = None
         self._cas_luma = None
         self._host_yuv = None
-        if self.vendor is AcceleratorVendor.AMD:
+        if self._uses_host_input:
             self._packed = torch.empty(
                 (height + height // 2, width),
                 dtype=self._converter.sample_dtype,
@@ -798,7 +906,7 @@ class NvidiaVideoEncoder:
             if apply_lut and self._lut_applier is not None:
                 frame = self._lut_applier.apply(frame)
             packed = self._to_yuv(frame, height)
-            if self.vendor is AcceleratorVendor.NVIDIA:
+            if not self._uses_host_input:
                 packed = _align_yuv_pitch(packed)
                 if self.spec.frame_format == "p010le":
                     planes = [
@@ -819,13 +927,15 @@ class NvidiaVideoEncoder:
                     non_blocking=True,
                 )
 
-        if self.vendor is AcceleratorVendor.AMD:
+        if self._uses_host_input:
             self.stream.synchronize()
             planes = [self._host_yuv[:height], self._host_yuv[height:]]
             hw_frame = av.VideoFrame.from_dlpack(
                 planes,
                 format=self.spec.frame_format,
             )
+            if self.software_reference:
+                hw_frame = hw_frame.reformat(format=self.spec.codec_pixel_format)
         hw_frame.pts = pts
         hw_frame.time_base = self.metadata.time_base
         try:

@@ -68,7 +68,6 @@ _COMMON_AMF_ENCODER_SETTINGS: frozenset[str] = frozenset(
         "g",
         "bf",
         "preanalysis",
-        "vbaq",
         "maxrate",
         "bufsize",
         "profile",
@@ -77,9 +76,9 @@ _COMMON_AMF_ENCODER_SETTINGS: frozenset[str] = frozenset(
 )
 
 AMF_SUPPORTED_ENCODER_SETTINGS_BY_CODEC: dict[str, frozenset[str]] = {
-    "hevc": _COMMON_AMF_ENCODER_SETTINGS | {"tier", "bitdepth"},
-    "h264": _COMMON_AMF_ENCODER_SETTINGS | {"coder"},
-    "av1": _COMMON_AMF_ENCODER_SETTINGS | {"bitdepth"},
+    "hevc": _COMMON_AMF_ENCODER_SETTINGS | {"tier", "bitdepth", "vbaq"},
+    "h264": _COMMON_AMF_ENCODER_SETTINGS | {"coder", "vbaq", "bf_ref"},
+    "av1": _COMMON_AMF_ENCODER_SETTINGS | {"bitdepth", "aq_mode"},
 }
 
 AMF_SUPPORTED_ENCODER_SETTINGS: frozenset[str] = frozenset().union(

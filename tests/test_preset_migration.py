@@ -1,5 +1,10 @@
 """Old settings.json presets (PyNvVideoCodec-era) must survive loading: unknown
 fields dropped, encoder custom args translated to hevc_nvenc names."""
+from importlib.util import find_spec
+
+import pytest
+
+from jasna.accelerator import AcceleratorVendor
 from jasna.gui.models import AppSettings, _migrate_encoder_custom_args, _migrate_preset_dict
 from jasna.media import parse_encoder_settings, validate_encoder_settings
 
@@ -27,13 +32,13 @@ def test_old_encoder_args_are_translated():
     assert migrated["tf_level"] == 0
     assert migrated["maxrate"] == 5000
     assert migrated["bufsize"] == 10000
-    validate_encoder_settings(migrated)
+    validate_encoder_settings(migrated, vendor=AcceleratorVendor.NVIDIA)
 
 
 def test_preset_and_tuning_values_translated():
     migrated = parse_encoder_settings(_migrate_encoder_custom_args("preset=P5,tuning_info=high_quality"))
     assert migrated == {"preset": "p5", "tune": "hq"}
-    validate_encoder_settings(migrated)
+    validate_encoder_settings(migrated, vendor=AcceleratorVendor.NVIDIA)
 
 
 def test_vbvinit_is_dropped():
@@ -64,6 +69,7 @@ def test_unknown_codec_falls_back_to_hevc():
     assert _migrate_preset_dict({"codec": "prores"})["codec"] == "hevc"
 
 
+@pytest.mark.skipif(find_spec("tkinter") is None, reason="python3-tk is not installed")
 def test_gui_codec_label_maps_round_trip():
     from jasna.gui.settings_sections.encoding import (
         CODEC_CANONICAL_TO_LABEL,

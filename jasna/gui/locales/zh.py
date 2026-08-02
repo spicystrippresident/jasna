@@ -174,6 +174,11 @@ ZH = {
         "btn_reset": "↺",
         
         # Sections
+        "section_processing_mode": "处理模式",
+        "processing_mode_standard": "标准处理",
+        "processing_mode_one_click_vr": "一键 VR",
+        "one_click_scan_interval": "扫描频率",
+        "tip_one_click_scan_interval": "Jasna 预扫描视频的采样频率，仅修复检测到马赛克的区间。",
         "section_basic": "基本处理",
         "section_advanced": "高级处理",
         "section_secondary": "二次修复",

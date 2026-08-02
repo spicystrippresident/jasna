@@ -7,6 +7,10 @@ import torch
 from jasna.media.lut import GpuLutApplier, parse_cube_text
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+NVIDIA_KERNEL_ONLY = pytest.mark.skipif(
+    getattr(torch.version, "hip", None) is not None,
+    reason="tests the NVIDIA CUDA LUT kernel",
+)
 
 
 def _cube_3d(size: int, transform, domain: tuple[float, float] | None = None) -> str:
@@ -102,6 +106,7 @@ def _codes(values: torch.Tensor) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("name", sorted(CUBES))
+@NVIDIA_KERNEL_ONLY
 def test_kernel_is_at_least_as_accurate_as_the_torch_path(name):
     generator = torch.Generator(device="cuda").manual_seed(0)
     frame = torch.randint(

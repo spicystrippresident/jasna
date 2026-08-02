@@ -5,6 +5,11 @@ import torch
 from jasna.media import get_video_meta_data
 from jasna.media.video_decoder import NvidiaVideoReader
 
+pytestmark = pytest.mark.skipif(
+    getattr(torch.version, "hip", None) is not None,
+    reason="tests NVIDIA decode seek performance and timing",
+)
+
 SAMPLE_VIDEOS = [
     "assets/test_clip1_1080p.mp4",
     "assets/test_clip1_2160p.mp4",

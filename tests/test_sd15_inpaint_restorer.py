@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import io
+from importlib.util import find_spec
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import torch
 import torch.nn.functional as F
+import pytest
 
 import jasna.restorer.sd15_inpaint_restorer as sd15
 from jasna.engine_paths import SD15_CKPT_ENC_PATH, SD15_CKPT_PATH
@@ -32,13 +34,15 @@ class TestCheckpointPathSelection:
         with (
             patch.object(sd15, "is_frozen", return_value=False),
             patch.object(sd15.torch, "load", return_value={"state_dict": {}}) as mock_load,
-            patch("jasna.protection.protected_model.decrypt_model_to_buffer") as mock_decrypt,
         ):
             assert use_plaintext_sd15(tmp_path) is True
             _read_checkpoint(tmp_path)
-            mock_decrypt.assert_not_called()
             assert str(tmp_path / SD15_CKPT_PATH.name) == mock_load.call_args.args[0]
 
+    @pytest.mark.skipif(
+        find_spec("jasna.protection.protected_model") is None,
+        reason="public source tree does not include the protected-model runtime",
+    )
     def test_encrypted_path_when_no_plaintext(self, tmp_path: Path):
         _write_bundle(tmp_path, with_plaintext=False, with_enc=True)
         with (

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+from types import ModuleType
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -57,7 +59,20 @@ def _build_session(
     amd: bool = False,
 ):
     compile_result = MagicMock(use_basicvsrpp_tensorrt=True)
+    tvai_cls = MagicMock(name="TvaiSecondaryRestorer")
+    unet_cls = MagicMock(name="Unet4xSecondaryRestorer")
+    rtx_cls = MagicMock(name="RtxSuperresSecondaryRestorer")
+    secondary_modules = {}
+    for module_name, class_name, class_mock in (
+        ("tvai_secondary_restorer", "TvaiSecondaryRestorer", tvai_cls),
+        ("unet4x_secondary_restorer", "Unet4xSecondaryRestorer", unet_cls),
+        ("rtx_superres_secondary_restorer", "RtxSuperresSecondaryRestorer", rtx_cls),
+    ):
+        module = ModuleType(f"jasna.restorer.{module_name}")
+        setattr(module, class_name, class_mock)
+        secondary_modules[module.__name__] = module
     with (
+        patch.dict(sys.modules, secondary_modules),
         patch("jasna.accelerator.is_amd_device", return_value=amd),
         patch(
             "jasna.engine_compiler.ensure_engines_compiled",
@@ -65,9 +80,6 @@ def _build_session(
         ) as compiled,
         patch("jasna.restorer.basicvsrpp_mosaic_restorer.BasicvsrppMosaicRestorer") as restorer_cls,
         patch("jasna.restorer.restoration_pipeline.RestorationPipeline") as pipeline_cls,
-        patch("jasna.restorer.tvai_secondary_restorer.TvaiSecondaryRestorer") as tvai_cls,
-        patch("jasna.restorer.unet4x_secondary_restorer.Unet4xSecondaryRestorer") as unet_cls,
-        patch("jasna.restorer.rtx_superres_secondary_restorer.RtxSuperresSecondaryRestorer") as rtx_cls,
     ):
         session = build_restoration_session(
             config,
@@ -151,9 +163,14 @@ def test_amd_disables_basicvsrpp_compilation() -> None:
 
 def test_session_close_closes_restorers() -> None:
     session, *_ = _build_session(_config(secondary_restoration="unet-4x"))
+    detection_model = MagicMock()
+    session.detection_model = detection_model
 
     session.close()
 
+    detection_model.close.assert_called_once_with()
+    assert session.detection_model is None
+    assert session.detection_model_key is None
     session.restoration_pipeline.restorer.close.assert_called_once_with()
     session.secondary_restorer.close.assert_called_once_with()
 
@@ -166,8 +183,9 @@ def test_build_pipeline_passes_through_config_and_session() -> None:
         working_dir=Path("/scratch"),
         vr_projection="gnomonic",
     )
+    device = MagicMock()
     session = RestorationSession(
-        device=MagicMock(),
+        device=device,
         detection_model_name="rfdetr-v5",
         detection_model_path=Path("det.onnx"),
         restoration_pipeline=MagicMock(),
@@ -195,8 +213,10 @@ def test_build_pipeline_passes_through_config_and_session() -> None:
     assert kwargs["detection_model_name"] == "rfdetr-v5"
     assert kwargs["detection_model_path"] == Path("det.onnx")
     assert kwargs["detection_score_threshold"] == 0.25
+    assert kwargs["detection_session"] is session
     assert kwargs["restoration_pipeline"] is session.restoration_pipeline
     assert kwargs["codec"] == "hevc"
+    assert kwargs["encoder_backend"] == "auto"
     assert kwargs["encoder_settings"] == {"cq": 25}
     assert kwargs["batch_size"] == 4
     assert kwargs["device"] is session.device
@@ -234,3 +254,105 @@ def test_build_pipeline_defaults_optional_runtime_inputs() -> None:
     assert kwargs["progress_callback"] is None
     assert kwargs["segments"] is None
     assert kwargs["splice_plan"] is None
+    assert kwargs["detection_session"] is session
+
+
+def test_session_reuses_detection_model() -> None:
+    session = RestorationSession(
+        device=MagicMock(),
+        detection_model_name="rfdetr-v5",
+        detection_model_path=Path("det.onnx"),
+        restoration_pipeline=MagicMock(),
+        secondary_restorer=None,
+    )
+
+    with patch(
+            "jasna.mosaic.detection_registry.build_detection_model"
+        ) as build_detection_model:
+        kwargs = dict(
+            name="rfdetr-v5",
+            path=Path("det.onnx"),
+            batch_size=4,
+            score_threshold=0.25,
+            fp16=True,
+        )
+        first = session.get_detection_model(**kwargs)
+        second = session.get_detection_model(**kwargs)
+
+    assert first is second
+    build_detection_model.assert_called_once_with(
+        "rfdetr-v5",
+        Path("det.onnx"),
+        batch_size=4,
+        device=session.device,
+        score_threshold=0.25,
+        fp16=True,
+    )
+
+
+def test_session_replaces_detector_when_contract_changes() -> None:
+    session = RestorationSession(
+        device=MagicMock(),
+        detection_model_name="rfdetr-v5",
+        detection_model_path=Path("det.onnx"),
+        restoration_pipeline=MagicMock(),
+        secondary_restorer=None,
+    )
+    first_detector = MagicMock()
+    second_detector = MagicMock()
+
+    with patch(
+            "jasna.mosaic.detection_registry.build_detection_model",
+            side_effect=(first_detector, second_detector),
+        ) as build_detection_model:
+        session.get_detection_model(
+            name="rfdetr-v5",
+            path=Path("det.onnx"),
+            batch_size=4,
+            score_threshold=0.25,
+            fp16=True,
+        )
+        session.get_detection_model(
+            name="rfdetr-v5",
+            path=Path("det.onnx"),
+            batch_size=4,
+            score_threshold=0.5,
+            fp16=True,
+        )
+
+    assert build_detection_model.call_count == 2
+    first_detector.close.assert_called_once_with()
+    second_detector.close.assert_not_called()
+    assert session.detection_model is second_detector
+
+
+def test_session_drops_closed_detector_when_replacement_fails() -> None:
+    old_detector = MagicMock()
+    session = RestorationSession(
+        device=MagicMock(),
+        detection_model_name="rfdetr-v5",
+        detection_model_path=Path("det.onnx"),
+        restoration_pipeline=MagicMock(),
+        secondary_restorer=None,
+        detection_model=old_detector,
+        detection_model_key=("old",),
+    )
+
+    with (
+        patch(
+            "jasna.mosaic.detection_registry.build_detection_model",
+            side_effect=RuntimeError("load failed"),
+        ),
+        pytest.raises(RuntimeError, match="load failed"),
+    ):
+        session.get_detection_model(
+            name="rfdetr-v5",
+            path=Path("det.onnx"),
+            batch_size=4,
+            score_threshold=0.25,
+            fp16=True,
+        )
+
+    old_detector.close.assert_called_once_with()
+    assert session.detection_model is None
+    assert session.detection_model_key is None

@@ -23,13 +23,18 @@ def _run_single(
     fp16: bool,
     video_path: Path,
     score_threshold: float,
+    model_path: Path | None = None,
 ) -> tuple[float, dict]:
     path = video_path.resolve()
     if not path.exists():
         raise FileNotFoundError(str(path))
 
     metadata = get_video_meta_data(str(path))
-    model_path = detection_model_weights_path(DEFAULT_DETECTION_MODEL_NAME)
+    model_path = (
+        detection_model_weights_path(DEFAULT_DETECTION_MODEL_NAME)
+        if model_path is None
+        else model_path.resolve()
+    )
     if not model_path.exists():
         raise FileNotFoundError(str(model_path))
 
@@ -88,6 +93,7 @@ def benchmark_rfdetr_detection_speed(
     fp16: bool,
     benchmark_videos: list[Path],
     detection_score_threshold: float | None,
+    detection_model_path: Path | None = None,
     **_: object,
 ) -> dict[str, tuple[float, float]]:
     results: dict[str, tuple[float, float]] = {}
@@ -107,6 +113,7 @@ def benchmark_rfdetr_detection_speed(
                 fp16=fp16,
                 video_path=vp,
                 score_threshold=score_threshold,
+                model_path=detection_model_path,
             ),
             runs=3,
         )

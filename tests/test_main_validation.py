@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from jasna.accelerator import AcceleratorVendor
 from jasna.segments import SegmentRange
 
 
@@ -34,6 +35,7 @@ def _run_main_with_args(tmp_path, extra_args, *, create_input=True, create_detec
         patch("jasna.main.check_supported_gpu", return_value=(True, "Fake GPU")),
         patch("jasna.main.check_gpu_driver_version", return_value=(True, "610.18")),
         patch("jasna.main.check_required_executables"),        patch("jasna.main.check_windows_nvidia_sysmem_fallback_policy", return_value=(True, "OK")),
+        patch("jasna.media.vendor_for_device", return_value=AcceleratorVendor.NVIDIA),
         patch("jasna.engine_compiler.ensure_engines_compiled", return_value=MagicMock(use_basicvsrpp_tensorrt=False)),
         patch("jasna.pipeline.Pipeline", return_value=MagicMock()) as pipeline_cls,
         patch("jasna.restorer.basicvsrpp_mosaic_restorer.BasicvsrppMosaicRestorer", MagicMock()),

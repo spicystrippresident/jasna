@@ -21,12 +21,12 @@ def check_supported_gpu(
         from jasna._suppress_noise import install as _install_noise_filters
         _install_noise_filters()
         import torch
-        from jasna.accelerator import AcceleratorVendor, vendor_for_device
     except ImportError:
         return False, "no_cuda"
     if not torch.cuda.is_available():
         return False, "no_cuda"
-    if vendor_for_device(device) is AcceleratorVendor.AMD:
+    hip_version = getattr(getattr(torch, "version", None), "hip", None)
+    if hip_version:
         return True, torch.cuda.get_device_name(device)
     capability = torch.cuda.get_device_capability(device)
     if capability < MIN_GPU_COMPUTE:
@@ -54,6 +54,13 @@ def _find_bundled_executable(name: str) -> Path | None:
     return None
 
 
+def _find_source_executable(name: str) -> Path | None:
+    if is_frozen() or name not in {"ffmpeg", "ffprobe"}:
+        return None
+    candidate = Path(__file__).resolve().parent.parent / "tools" / _bundled_exe_filename(name)
+    return candidate if candidate.is_file() else None
+
+
 _COMMON_EXECUTABLE_LOCATIONS: dict[str, tuple[str, ...]] = {
     "nvidia-smi": (
         # Windows
@@ -79,6 +86,9 @@ def find_executable(name: str) -> str | None:
     bundled = _find_bundled_executable(name)
     if bundled is not None:
         return str(bundled)
+    source_tool = _find_source_executable(name)
+    if source_tool is not None:
+        return str(source_tool)
     found = shutil.which(name)
     if found is not None:
         return found
@@ -300,7 +310,7 @@ def check_gpu_driver_version() -> tuple[bool, str]:
     try:
         import torch
 
-        hip_version = getattr(torch.version, "hip", None)
+        hip_version = getattr(getattr(torch, "version", None), "hip", None)
         if hip_version:
             if not torch.cuda.is_available():
                 return False, f"ROCm {hip_version} is installed but no AMD GPU is available"

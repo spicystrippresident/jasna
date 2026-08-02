@@ -61,7 +61,9 @@ def _session_config_from_args(
         rtx_denoise=str(args.rtx_denoise).lower(),
         rtx_deblur=str(args.rtx_deblur).lower(),
         vr_mode=str(args.vr_mode),
+        vr_projection=str(args.vr_projection),
         codec=codec,
+        encoder_backend=str(args.encoder_backend),
         encoder_settings=encoder_settings,
         lut_path=lut_path,
         sharpen_strength=float(args.sharpen),
@@ -356,6 +358,13 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["auto", "off", "sbs", "sbs-fisheye"],
         help=CLI_HELP["vr_mode"],
     )
+    projection.add_argument(
+        "--vr-projection",
+        type=str,
+        default="auto",
+        choices=["auto", "raw", "fisheye", "gnomonic"],
+        help=CLI_HELP["vr_projection"],
+    )
 
     streaming = parser.add_argument_group("Streaming")
     streaming.add_argument(
@@ -388,6 +397,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="hevc",
         choices=["hevc", "h264", "av1"],
         help=CLI_HELP["codec"],
+    )
+    encoding.add_argument(
+        "--encoder-backend",
+        default="auto",
+        choices=["auto", "software-reference"],
+        help=(
+            "Encoder selection. auto uses the GPU hardware encoder. "
+            "software-reference explicitly uses CPU libx265 for validation only; "
+            "it is never selected as a fallback."
+        ),
     )
     encoding.add_argument(
         "--encoder-settings",
@@ -487,6 +506,8 @@ def main() -> None:
         parser.error("--retarget-high-fps is only supported for offline exports")
     if is_streaming and args.fmp4:
         parser.error("--fmp4 is only supported for offline exports")
+    if is_streaming and args.encoder_backend == "software-reference":
+        parser.error("--encoder-backend software-reference is only supported for offline exports")
     from jasna.post_export_action import validate_post_export_action, run_post_export_action_safely
     validate_post_export_action(str(args.post_export_action), str(args.post_export_command))
 
@@ -568,6 +589,8 @@ def main() -> None:
             parser.error("--segments requires a single video input, not a folder")
         if args.fmp4:
             parser.error("--fmp4 cannot be combined with --segments")
+        if args.encoder_backend == "software-reference":
+            parser.error("--encoder-backend software-reference cannot be combined with --segments")
 
     folder_videos: list[Path] = []
     folder_output_dir: Path | None = None
@@ -696,6 +719,8 @@ def main() -> None:
             parser.error(str(exc))
     if codec not in {"hevc", "h264", "av1"}:
         raise ValueError(f"Unsupported codec: {codec} (supported: hevc, h264, av1)")
+    if args.encoder_backend == "software-reference" and codec != "hevc":
+        parser.error("--encoder-backend software-reference currently requires --codec hevc")
 
     encoder_settings = validate_encoder_settings(parse_encoder_settings(str(args.encoder_settings)), codec=codec)
 
@@ -742,7 +767,7 @@ def main() -> None:
         raise ValueError(f"Unsupported restoration model: {restoration_model_name}")
 
     if args.license_email and args.license_key:
-        from jasna.protection import license_store
+        from jasna.license_api import license_store
         license_store.set_license(args.license_email, args.license_key)
 
     lut_arg = str(args.lut).strip()

@@ -12,10 +12,15 @@ import pytest
 import torch
 
 from jasna.media import get_video_meta_data, VideoMetadata
+from jasna.accelerator import is_nvidia_device
 
 TEST_CLIP = Path("assets/test_clip1_1080p.mp4")
 REQUIRES_TEST_CLIP = pytest.mark.skipif(not TEST_CLIP.exists(), reason="test clip not found")
 REQUIRES_CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+REQUIRES_NVIDIA = pytest.mark.skipif(
+    not is_nvidia_device("cuda:0"),
+    reason="NVENC/RTX end-to-end test requires an NVIDIA build",
+)
 
 RESTORATION_MODEL_PTH = Path("model_weights/lada_mosaic_restoration_model_generic_v1.2.pth")
 RESTORATION_ENGINE_CLIP10 = Path("model_weights/lada_mosaic_restoration_model_generic_v1.2_clip10.trt_fp16.win.engine")
@@ -163,6 +168,7 @@ class TestDetectionE2E:
 
 @REQUIRES_TEST_CLIP
 @REQUIRES_CUDA
+@REQUIRES_NVIDIA
 class TestEncoderE2E:
     def test_encode_decoded_frames(self, tmp_path):
         meta = get_video_meta_data(str(TEST_CLIP))
@@ -246,6 +252,7 @@ class _MethodSpy:
 @REQUIRES_CUDA
 @REQUIRES_RFDETR
 @REQUIRES_RESTORER_PTH
+@REQUIRES_NVIDIA
 class TestFullPipelineE2E:
 
     EXPECTED_FRAMES = 300
@@ -487,6 +494,7 @@ def _make_synthetic_clip(n: int, h: int, w: int, device: torch.device):
 @REQUIRES_CUDA
 @REQUIRES_RESTORER
 @REQUIRES_NVVFX
+@REQUIRES_NVIDIA
 class TestRestorationPipelineRtxE2E:
     def test_restore_clip(self):
         from jasna.restorer.rtx_superres_secondary_restorer import RtxSuperresSecondaryRestorer

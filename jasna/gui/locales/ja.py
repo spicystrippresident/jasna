@@ -174,6 +174,11 @@ JA = {
         "btn_reset": "↺",
 
         # Sections
+        "section_processing_mode": "処理モード",
+        "processing_mode_standard": "標準処理",
+        "processing_mode_one_click_vr": "ワンクリックVR",
+        "one_click_scan_interval": "スキャン頻度",
+        "tip_one_click_scan_interval": "Jasnaが動画を事前スキャンする間隔です。モザイクを検出した区間だけを復元します。",
         "section_basic": "基本設定",
         "section_advanced": "詳細設定",
         "section_secondary": "二次修復",

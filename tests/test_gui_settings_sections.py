@@ -13,6 +13,7 @@ from jasna.gui.settings_sections.advanced import AdvancedSection
 from jasna.gui.settings_sections.basic import BasicSection
 from jasna.gui.settings_sections.encoding import EncodingSection
 from jasna.gui.settings_sections.image_restoration import ImageRestorationSection
+from jasna.gui.settings_sections.one_click_vr import ProcessingModeSection
 from jasna.gui.settings_sections.post_export import PostExportSection
 from jasna.gui.settings_sections.secondary import SecondarySection
 from jasna.gui.settings_sections.widgets import ValueOptionMenu
@@ -61,6 +62,10 @@ def test_value_option_menu_falls_back_to_first_option_for_unknown_value() -> Non
 
 def _fake_section_widgets() -> dict:
     return {
+        "processing_mode": _FakeWidget("一键 VR"),
+        "one_click_scan_interval": _FakeValueMenu(
+            {"0.5": "每半秒", "1.0": "每秒"}, "0.5"
+        ),
         "max_clip_size": _FakeWidget(90),
         "fp16_mode": _FakeWidget(1),
         "detection_model": _FakeWidget("rfdetr-v6"),
@@ -103,9 +108,13 @@ def _fake_section_widgets() -> dict:
 
 
 def _collect_all(widgets: dict) -> dict:
-    fake = SimpleNamespace(_widgets=widgets)
+    fake = SimpleNamespace(
+        _widgets=widgets,
+        _label_to_mode={"标准处理": "standard", "一键 VR": "one_click_vr"},
+    )
     values: dict = {}
     for section in (
+        ProcessingModeSection,
         BasicSection,
         AdvancedSection,
         SecondarySection,
@@ -121,6 +130,8 @@ def test_sections_collect_internal_values_without_translation_lookups() -> None:
     values = _collect_all(_fake_section_widgets())
 
     assert values["file_conflict"] == "skip"
+    assert values["processing_mode"] == "one_click_vr"
+    assert values["one_click_scan_interval"] == 0.5
     assert values["vr_mode"] == "off"
     assert values["denoise_strength"] == "high"
     assert values["denoise_step"] == "after_secondary"
@@ -179,7 +190,10 @@ def _basic_section_panel(monkeypatch, tmp_path):
 
     panel = SettingsPanel(root)
     try:
-        yield panel, panel._sections[0]
+        basic = next(
+            section for section in panel._sections if isinstance(section, BasicSection)
+        )
+        yield panel, basic
     finally:
         root.destroy()
 

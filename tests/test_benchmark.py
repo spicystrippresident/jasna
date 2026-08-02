@@ -51,6 +51,7 @@ def test_benchmark_cli_preserves_auto_threshold_for_each_benchmark() -> None:
         batch_size=4,
         fp16=True,
         detection_score_threshold=None,
+        detection_model_path="",
         restoration_model_path="model.pth",
         compile_basicvsrpp=True,
         benchmark_filter=None,
@@ -66,6 +67,7 @@ def test_benchmark_cli_preserves_auto_threshold_for_each_benchmark() -> None:
         run_benchmark_cli(args)
 
     assert run_benchmarks.call_args.kwargs["detection_score_threshold"] is None
+    assert run_benchmarks.call_args.kwargs["detection_model_path"] is None
 
 
 def test_rfdetr_benchmark_uses_its_model_recommended_threshold(
@@ -96,6 +98,35 @@ def test_rfdetr_benchmark_uses_its_model_recommended_threshold(
         )
 
     assert run_single.call_args.kwargs["score_threshold"] == pytest.approx(0.35)
+
+
+def test_rfdetr_benchmark_passes_explicit_model_path(tmp_path) -> None:
+    from jasna.benchmark.rfdetr_detection_speed import benchmark_rfdetr_detection_speed
+
+    video = tmp_path / "video.mp4"
+    model = tmp_path / "rfdetr-v6.pt"
+    video.touch()
+    model.touch()
+    with (
+        patch(
+            "jasna.benchmark.rfdetr_detection_speed._run_single",
+            return_value=(1.0, {"frames": 1}),
+        ) as run_single,
+        patch(
+            "jasna.benchmark.rfdetr_detection_speed.run_repeatedly",
+            side_effect=lambda callback, runs: (1.0, callback()[1]),
+        ),
+    ):
+        benchmark_rfdetr_detection_speed(
+            device=MagicMock(),
+            batch_size=4,
+            fp16=True,
+            benchmark_videos=[video],
+            detection_score_threshold=None,
+            detection_model_path=model,
+        )
+
+    assert run_single.call_args.kwargs["model_path"] == model
 
 
 def test_benchmark_harness_runs_three_times_and_takes_median() -> None:

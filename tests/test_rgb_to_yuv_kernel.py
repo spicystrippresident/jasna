@@ -6,6 +6,10 @@ from jasna.media.rgb_to_yuv import _TORCH_CONVERTERS, RgbToYuvConverter
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 VARIANTS = sorted(_TORCH_CONVERTERS)
+NVIDIA_KERNEL_ONLY = pytest.mark.skipif(
+    getattr(torch.version, "hip", None) is not None,
+    reason="tests the NVIDIA CUDA RGB-to-YUV kernel",
+)
 
 
 def _device() -> torch.device:
@@ -20,6 +24,7 @@ def _random_frame(height: int, width: int) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("variant", VARIANTS)
+@NVIDIA_KERNEL_ONLY
 def test_matches_the_torch_reference_within_one_code(variant):
     frame = _random_frame(64, 96)
     converter = RgbToYuvConverter(variant, device=_device())
@@ -33,6 +38,18 @@ def test_matches_the_torch_reference_within_one_code(variant):
     # P010 stores codes shifted left by 6, so one code of disagreement is 64.
     tolerance = 64 if converter.ten_bit else 1
     assert (ours.int() - reference.int()).abs().max().item() <= tolerance
+
+
+@pytest.mark.skipif(
+    getattr(torch.version, "hip", None) is None,
+    reason="tests the ROCm Torch fallback",
+)
+def test_rocm_uses_torch_fallback():
+    frame = _random_frame(16, 24)
+    converter = RgbToYuvConverter("nv12_bt709_limited", device=_device())
+
+    assert not converter.uses_kernel
+    assert torch.equal(converter.convert(frame), _TORCH_CONVERTERS[converter.variant](frame))
 
 
 @pytest.mark.parametrize("variant", VARIANTS)

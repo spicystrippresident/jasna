@@ -1,4 +1,5 @@
 import importlib
+from importlib.util import find_spec
 import sys
 from unittest.mock import patch
 
@@ -30,6 +31,7 @@ def test_cli_main_patches_frozen_torch(tmp_path):
     spy.assert_called()
 
 
+@pytest.mark.skipif(find_spec("tkinter") is None, reason="python3-tk is not installed")
 def test_gui_run_gui_patches_frozen_torch():
     from jasna.gui import app as gui_app
 
