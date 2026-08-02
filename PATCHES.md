@@ -68,6 +68,11 @@ fail, and then reruns. The second run calls none of detector, restoration,
 encoder, packet copy or fragment normalization and assembles directly from the
 verified fragments.
 
+The workspace algorithm is versioned independently of its manifest schema.
+Encoder-policy changes must bump that algorithm version so completed fragments
+created under an older rate-control contract cannot be reused. Version 2
+invalidates the earlier Linux AMD HEVC QVBR fragments.
+
 The removed toolbox runtime remains recoverable from
 `/home/latiao/vr_toolbox_jasna_linux/migration_archive_vr_remove_mosaic_linux_20260802.tar.zst`
 (SHA-256 `0b9794d17ac6de0789142b6e19f8f2cfaba2344aba74be13aa63227ce82f4555`).
@@ -119,9 +124,9 @@ an AMD ROCm environment. NVENC option validation now selects NVIDIA explicitly;
 CUDA fatbin, TensorRT, NVDEC seek/performance, NVENC mux and RTX tests are
 skipped on ROCm. The generic RGB-to-YUV, metadata, decode and detector tests
 still run on ROCm and assert that Torch fallbacks remain correct. No production
-protection was relaxed for these test-only fixes. Linux AMD H.264/HEVC smart
-fragments were enabled only after the hardware acceptance described below;
-Windows AMD and AV1 remain rejected.
+protection was relaxed for these test-only fixes. Linux AMD H.264/HEVC/AV1
+smart fragments were enabled only after the hardware acceptance described
+below; Windows AMD remains rejected.
 
 The shared CLI forwarding test now uses encoder settings supported by both
 AMF and NVENC. Composition-root tests inject lightweight secondary-restorer
@@ -175,25 +180,97 @@ blocker is superseded by the hardware results below.
 Linux AMF now selects native encoder options per codec. Ten-bit P010 encoding
 disables only the incompatible preanalysis stage; AV1 uses `aq_mode=caq`; and
 smart fragments use AMF's `forced_idr` spelling. Jasna's portable H.264
-`b_ref_mode` option maps to AMF `bf_ref`. Linux AMD H.264 and HEVC fragments are
-enabled, while AV1 and every Windows AMD fragment remain explicit errors.
+`b_ref_mode` option maps to AMF `bf_ref`. Linux AMD H.264, HEVC and AV1
+fragments are enabled, while every Windows AMD fragment remains an explicit
+error.
 
 The hardware codec matrix passed H.264 8-bit, HEVC 8-bit, HEVC Main 10 and AV1
-Main 10. The sparse matrix passed H.264 8-bit, HEVC 8-bit and HEVC 10-bit with
-closed GOPs, forced IDR, B frames, PTS/DTS, audio mux, `60/60` frames, matching
-five-second audio/video duration and zero-error full decode.
+Main 10. The sparse matrix passed H.264 8-bit, HEVC 8-bit, HEVC 10-bit, AV1
+8-bit and AV1 Main 10 with closed GOPs, forced IDR, PTS/DTS, audio mux and
+zero-error full decode. H.264/HEVC also retain their validated B-frame
+contracts.
 
 Linux PyAV AMF P010 decode is rejected before consuming packets because its
-first packet fails unreliably. Those inputs use the existing FFmpeg software
-decoder and upload to ROCm. Eight-bit AMF decode remains available. rocDecode is
-installed but is not treated as integrated; a dedicated backend needs separate
-frame-count, PTS, depth and performance acceptance first.
+first packet fails unreliably. AV1 has a separate measured guard: PyAV AMF
+decodes the 8K 8-bit source at only 11.8 fps while consuming about 7.2 GiB VRAM,
+versus 39.9 fps and about 3.7 GiB for libdav1d plus ROCm upload. Direct FFmpeg
+AMF GPU-surface decode reaches 88.1 fps with the media engine at 100%, so the
+hardware is not the blocker; the PyAV surface transfer is. Linux AV1 therefore
+uses the measured faster software path until a direct rocDecode backend passes
+frame-count, PTS, depth, GPU-surface conversion and performance acceptance.
+
+rocDecode 1.7 device-memory evaluation output all 1202 frames of both the 8-bit
+and Main 10 sources at up to 88.3 fps. The complete 8-bit decoded-pixel MD5
+matched libdav1d, as did the first 60 Main 10 frames. With 250 ms telemetry the
+two paths ran at about 85.7 fps with median media utilization of 100%; median
+VRAM was 3.86/4.62 GiB, median socket power was 89/103 W, and peak hotspot
+temperature was 66 C.
+
+The official copied-buffer C++ helper initially appeared to fail PTS acceptance:
+1200 adjacent values were duplicates. The helper refreshed pixels when reusing
+an output slot but left the slot's original PTS unchanged. Refreshing that
+metadata in the isolated evaluation copy produced 1202 strictly increasing PTS
+for both depths and the same FNV-1a sequence hash (`8763091125427738767`) as the
+PyAV-demuxed expectation. This was a sample-helper defect, not AV1 reordering or
+a rocDecode core timestamp loss.
+
+A production backend still requires PyAV demux with the original stream time
+base, native rocDecode/HIP lifetime management, and zero-readback NV12/P010 GPU
+surface conversion into Torch RGB tensors. The sample's integer-millisecond
+demux and copied-surface helper are not acceptable integration boundaries.
+Because the accepted AV1 E2E runs already spend 60.8-80.6 seconds on a media
+encoder at 89-98% utilization, raw-decode acceleration is not on their critical
+path. The stable libdav1d plus ROCm-upload route therefore remains the production
+choice until that native integration can demonstrate an end-to-end wall-time
+gain, rather than only a decoder microbenchmark gain.
 
 The 8K one-click E2E exposed two additional boundaries. A source-derived VBV
 buffer can exceed FFmpeg's signed encoder-option range on lossless input; Jasna
 now omits that optional ceiling instead of passing an invalid value. AMF decoder
 setup also skips an absent sample-aspect-ratio instead of failing before its
 normal software fallback.
+
+Linux PyAV AMF also loses badly to software decode for sparse 8K HEVC scans.
+On the same 30-second, one-sample-per-second RF-DETR scan, AMF took 87.3 seconds
+with median process CPU/GPU graphics/media utilization of 128.5/31/87 percent
+and 11.16 GiB VRAM. FFmpeg software decode plus ROCm upload produced the same 30
+samples and five hits in 40.47 seconds, with 398.6/29.5/0 percent and 6.10 GiB.
+
+That result is deliberately not a global decoder switch. Two concurrent
+software readers stopped making progress inside the 8K HEVC render span after
+decode/detect had completed, while an otherwise identical forced-AMF control
+finished normally. `NvidiaVideoReader` therefore exposes an explicit scan
+preference. Only `MosaicScanWorker` supplies it, and only Linux AMD HEVC inputs
+at or above 30 million pixels select software through that preference. Regular
+pipeline and preview readers keep Jasna's AMF path.
+
+The accepted split-policy smoke selected software for the real scan worker and
+processed seven samples in 13.791 seconds. The matching sparse E2E selected AMF
+for both pipeline readers and finished in 43.948 seconds. Its HEVC Main 8-bit
+output has 368 unique presentation timestamps and completes AMF decode at
+`368/368`; packet coverage is 6.139477778 seconds versus 6.139466667 seconds in
+the source. Median E2E process CPU, GPU graphics/media, VRAM and socket power
+were 175 percent, 48/48 percent, 13.82 GiB and 92 W; hotspot peaked at 76 C.
+
+Benchmark telemetry no longer initializes AMD SMI or repeatedly launches its
+Python CLI. Linux AMD metrics come from the amdgpu sysfs files for graphics,
+memory and VCN activity, VRAM use, socket power and junction temperature. This
+avoids the desktop `amdsmi_cli.py` crash reporter while retaining all required
+CPU/GPU/media/memory/power/temperature columns.
+
+AV1 Main 10 now replaces QVBR-without-preanalysis with peak VBR and binds the
+target rate to the source stream. On the 8192x4096 positive source this kept the
+output at 16.60 Mbps versus 16.75 Mbps input, instead of the earlier unbounded
+653 Mbps result. The 8-bit path retains QVBR with preanalysis.
+
+The 20.05-second AV1 8-bit and Main 10 positive sparse runs each preserved
+`1202/1202` video packets, `941/941` audio packets and keyframes at
+0/5.005/10.010/15.015/20.020 seconds. Their copy spans are pixel-identical by
+full-frame MD5 and every one of the 300 render-span frames changed. Both outputs
+completed direct AMF full decode at about 88.1 fps with no duplicate or dropped
+frames. End-to-end wall times were 104.03 seconds (8-bit) and 97.37 seconds
+(Main 10); GPU media utilization medians of 89% and 98% identify AV1 encoding as
+the dominant production bottleneck.
 
 ## Exclusive smart-render tail boundary
 
@@ -232,6 +309,50 @@ now forwards to the private module when present and supplies a free-only source
 fallback otherwise. Free models and the GUI start normally; an attempted
 supporter activation returns a clear error instead of pretending to succeed.
 
+## AMD restoration compiler backend evaluation
+
+BasicVSR++ FP16 eager processes a fixed 16-frame 256x256 clip in a median
+0.2113 seconds (75.7 fps) on the RX 7900 XTX. Median GPU graphics utilization
+is 71%, process CPU utilization 119%, and peak Torch allocation about 150 MiB.
+
+TorchInductor with the bundled ROCm Triton 3.5.1 was required to compile the
+whole model with `fullgraph=True` and no fallback. It did not complete its first
+T=16 compile within ten minutes, while 16 compiler workers consumed more than
+ten GiB of RAM. Torch-MIGraphX registered a real backend against system
+MIGraphX 2.15, but its strict T=4 smoke compile did not finish within 180
+seconds. Both runs were terminated cleanly at their declared limits.
+
+These cold-start costs are not amortized by the production workload: the real
+AV1 sparse runs spend 60.8-80.6 seconds in the media-engine-limited encoder,
+while four restoration clips take 14.8-16.3 seconds and overlap that write.
+The AMD production path therefore remains eager; no compiler backend is
+silently selected or reported as faster without a completed numerical and
+steady-state comparison.
+
+## Whole-title HEVC acceptance
+
+The complete 34:23 SAVR-1058 8192x4096 HEVC Main title finished the one-click VR
+pipeline in 11881.316 seconds (about 3 hours 18 minutes). The final large span
+contained 2632 restoration clips. Its 7,184,192,769-byte output carries 123669
+of 123669 video frames at 27.583 Mbps and 96716 of 96716 audio packets; total
+bitrate is 27.855 Mbps. Video duration differs from the source by about 17
+microseconds, maximum absolute PTS error is about 11.11 microseconds with no
+duplicate PTS, and every audio payload and PTS is identical.
+
+Direct MP4 packet bytes differ because transport-stream normalization and the
+final MP4 mux add an AUD to each packet and parameter sets plus SEI to the first
+packet. Parsing the length-prefixed HEVC stream and comparing only VCL NAL types
+0-31 proves all 45852 copy-span payloads byte-identical; all 77817 render-span
+payloads changed. A separate full decode with the repository AMF FFmpeg exited
+zero at 123669 frames in 1318.371 seconds, about 94 fps or 1.56x real time.
+
+Median process CPU, GPU graphics/media utilization, VRAM and socket power during
+the render were 227.3%, 61/85%, 17.94 GiB and 153 W. VRAM peaked at 19.44 GiB and
+hotspot temperature at 86 C. There was no offload, GPU reset, VBV error,
+segmentation fault or sustained memory growth. The successful version-2
+workspace cleaned itself; after packet-level validation, the invalidated
+version-1 high-bitrate workspace was removed to reclaim disk space.
+
 ## Current source-tree verification
 
 On kernel `6.17.0-41-generic`, RX 7900 XTX and ROCm 7.2.1:
@@ -253,7 +374,11 @@ both. The corrected full run took 1193.108 seconds, produced 376 restoration
 clips in the final span, peaked at 8170 MiB VRAM without offload, and preserved
 all 10977 frames through zero-error AMF decode.
 
+The complete 34:23 title then passed the whole-title acceptance above, including
+123669-frame AMF decode, lossless audio packet passthrough and byte-identical VCL
+payloads for every copy span.
+
 The skips correspond to inapplicable TensorRT, protected-model, NVENC/NVDEC,
-RTX and TVAI paths. Remaining work is the rocDecode backend acceptance, AMD AV1
-and Windows smart rendering, a positive 10-bit mosaic sample, whole-title long
-testing and AMD compiler-backend A/B; none is reported as complete.
+RTX and TVAI paths. Remaining work is native rocDecode GPU-surface integration,
+Windows AMD smart rendering, and Main 10 plus broader-source whole-title testing;
+none is reported as complete.

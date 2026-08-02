@@ -51,6 +51,13 @@ _ROCDECODE_AUTO_MIN_PIXELS = 30_000_000
 _NVDEC_DECODER_OVERRIDES = {"av1": "av1"}
 _NVDEC_MIN_CODED_SIZE = {"av1": (128, 128)}
 
+# During sparse scans at 8K, Linux PyAV's AMF HEVC path spends more time
+# transferring decoded surfaces back to the host than libavcodec spends
+# decoding in software. Keep regular pipeline readers and smaller scan inputs
+# on AMF; this threshold covers UHD/VR 8K without extrapolating the measured
+# result to ordinary resolutions.
+_AMD_AMF_SOFTWARE_DECODE_MIN_PIXELS = 30_000_000
+
 
 class VideoDecodeError(RuntimeError):
     pass
@@ -401,6 +408,7 @@ class NvidiaVideoReader:
         metadata: VideoMetadata,
         *,
         frame_stride: int = 1,
+        prefer_software_decode: bool = False,
     ):
         frame_stride = int(frame_stride)
         if frame_stride <= 0:
@@ -410,6 +418,7 @@ class NvidiaVideoReader:
         self.batch_size = batch_size
         self.metadata = metadata
         self.frame_stride = frame_stride
+        self.prefer_software_decode = bool(prefer_software_decode)
         self.vendor = vendor_for_device(device)
         self._decoder_ctx = None
         self._amd_hardware_decode = False
@@ -546,13 +555,43 @@ class NvidiaVideoReader:
         )
 
     def _setup_amf_decoder(self, source_ctx) -> None:
+        codec_name = str(self.metadata.codec_name).lower()
         decoder_name = {
             "h264": "h264_amf",
             "hevc": "hevc_amf",
             "av1": "av1_amf",
-        }.get(str(source_ctx.name).lower())
+        }.get(codec_name)
         if decoder_name is None:
             source_ctx.thread_type = "AUTO"
+            return
+        if sys.platform != "win32" and codec_name == "av1":
+            # Linux PyAV AMF AV1 returns frames through a costly host transfer.
+            # On an RX 7900 XTX at 8K, libdav1d plus ROCm upload is over three
+            # times faster and uses about half as much VRAM. Keep AV1 on the
+            # measured faster path until a direct rocDecode backend is accepted.
+            source_ctx.thread_type = "AUTO"
+            log.info(
+                "Using FFmpeg software decoding for AV1 AMD input %s; "
+                "Linux PyAV AMF AV1 surface transfer is slower",
+                self.file,
+            )
+            return
+        if (
+            sys.platform != "win32"
+            and codec_name == "hevc"
+            and self.prefer_software_decode
+            and int(self.metadata.video_width) * int(self.metadata.video_height)
+            >= _AMD_AMF_SOFTWARE_DECODE_MIN_PIXELS
+        ):
+            # On an RX 7900 XTX, the same 8K one-click scan is over twice as
+            # fast with libavcodec plus ROCm upload, while using about 5 GiB
+            # less VRAM and leaving the media engine free for AMF encoding.
+            source_ctx.thread_type = "AUTO"
+            log.info(
+                "Using FFmpeg software decoding for 8K HEVC AMD scan input %s; "
+                "Linux PyAV AMF surface transfer is slower for sparse scans",
+                self.file,
+            )
             return
         if sys.platform != "win32" and self.metadata.is_10bit:
             # The Linux AMF decoder exposed through PyAV can open P010 streams

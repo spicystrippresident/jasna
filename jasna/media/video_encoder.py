@@ -516,10 +516,6 @@ class NvidiaVideoEncoder:
                 raise ValueError(
                     "AMD smart rendering is validated only on Linux; Windows still uses the protected path"
                 )
-            if codec not in {"h264", "hevc"}:
-                raise ValueError(
-                    "AMD smart rendering is currently validated only for H.264 and HEVC"
-                )
             if codec == "h264" and "b_ref_mode" in encoder_settings:
                 b_ref_mode = str(encoder_settings.pop("b_ref_mode")).strip().lower()
                 encoder_settings["bf_ref"] = b_ref_mode not in {
@@ -577,6 +573,8 @@ class NvidiaVideoEncoder:
 
         self.encoder_options = dict(spec.default_options)
         overrides: dict[str, str] = {}
+        self._target_bit_rate: int | None = None
+        derived_source_bitrate_ceiling = False
         if (
             self.vendor is AcceleratorVendor.AMD
             and not self.software_reference
@@ -613,14 +611,52 @@ class NvidiaVideoEncoder:
             and overrides.get("rc", self.encoder_options["rc"]) in {"cqp", "0"}
         )
         if "maxrate" not in overrides and not uses_amf_hevc_cqp:
-            self.encoder_options.update(
-                source_bitrate_cap_options(
-                    metadata,
-                    output_codec=codec,
-                    vendor=self.vendor,
-                )
+            bitrate_cap_options = source_bitrate_cap_options(
+                metadata,
+                output_codec=codec,
+                vendor=self.vendor,
             )
+            self.encoder_options.update(bitrate_cap_options)
+            derived_source_bitrate_ceiling = "maxrate" in bitrate_cap_options
         self.encoder_options.update(overrides)
+        if (
+            self.vendor is AcceleratorVendor.AMD
+            and not self.software_reference
+            and codec == "hevc"
+            and sys.platform != "win32"
+            and derived_source_bitrate_ceiling
+            and "rc" not in encoder_settings
+        ):
+            # AMF 1.4.37 QVBR ignores the source ceiling on 8K HEVC and rejects
+            # its derived VBV buffer. Peak VBR without preanalysis is stable for
+            # both NV12 and P010 and binds the native target rate to maxrate.
+            self.encoder_options["rc"] = "vbr_peak"
+            self.encoder_options["preanalysis"] = "0"
+            self.encoder_options.pop("qvbr_quality_level", None)
+            self.encoder_options.pop("bufsize", None)
+            self._target_bit_rate = int(self.encoder_options["maxrate"])
+        if (
+            self.vendor is AcceleratorVendor.AMD
+            and not self.software_reference
+            and spec.ten_bit
+            and codec == "av1"
+            and sys.platform != "win32"
+        ):
+            # AMF 1.4.37 cannot open P010 AV1 with preanalysis, while QVBR
+            # without preanalysis ignores maxrate/bufsize and can exceed
+            # 600 Mbps on 8K input. Peak VBR preserves the source-tied rate
+            # contract at the same measured encoder throughput.
+            self.encoder_options["rc"] = "vbr_peak"
+            self.encoder_options.pop("qvbr_quality_level", None)
+            pixel_rate = (
+                int(metadata.video_width)
+                * int(metadata.video_height)
+                * float(metadata.video_fps)
+            )
+            self._target_bit_rate = int(
+                metadata.video_bitrate
+                or max(2_000_000, min(100_000_000, round(pixel_rate * 0.02)))
+            )
         if self.smart_fragment:
             self.encoder_options.update(spec.smart_fragment_options)
 
@@ -672,6 +708,8 @@ class NvidiaVideoEncoder:
         out_v.height = self.metadata.video_height
         out_v.time_base = self.metadata.time_base
         ctx = out_v.codec_context
+        if self._target_bit_rate is not None:
+            ctx.bit_rate = self._target_bit_rate
         ctx.time_base = self.metadata.time_base
         ctx.framerate = self.output_fps
         ctx.pix_fmt = (
