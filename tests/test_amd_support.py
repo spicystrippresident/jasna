@@ -213,7 +213,7 @@ def test_linux_smart_render_maps_nvenc_b_reference_setting_to_amf(
     assert "b_ref_mode" not in encoder.encoder_options
 
 
-def test_amd_smart_render_keeps_unvalidated_paths_protected(
+def test_linux_amd_smart_render_accepts_av1_but_keeps_windows_protected(
     monkeypatch, tmp_path
 ) -> None:
     import jasna.media.video_encoder as module
@@ -224,15 +224,16 @@ def test_amd_smart_render_keeps_unvalidated_paths_protected(
         lambda _device: AcceleratorVendor.AMD,
     )
     monkeypatch.setattr(module.sys, "platform", "linux")
-    with pytest.raises(ValueError, match="H.264 and HEVC"):
-        module.NvidiaVideoEncoder(
-            str(tmp_path / "out.mp4"),
-            torch.device("cuda:0"),
-            _metadata(),
-            codec="av1",
-            encoder_settings={},
-            smart_fragment=True,
-        )
+    encoder = module.NvidiaVideoEncoder(
+        str(tmp_path / "out.mp4"),
+        torch.device("cuda:0"),
+        _metadata(),
+        codec="av1",
+        encoder_settings={},
+        smart_fragment=True,
+    )
+    assert encoder.encoder_name == "av1_amf"
+    assert encoder.encoder_options["forced_idr"] == "1"
 
     monkeypatch.setattr(module.sys, "platform", "win32")
     with pytest.raises(ValueError, match="validated only on Linux"):
@@ -244,6 +245,185 @@ def test_amd_smart_render_keeps_unvalidated_paths_protected(
             encoder_settings={},
             smart_fragment=True,
         )
+
+
+def test_linux_amd_p010_av1_uses_source_rate_peak_vbr(monkeypatch, tmp_path) -> None:
+    import jasna.media.video_encoder as module
+
+    monkeypatch.setattr(
+        module,
+        "vendor_for_device",
+        lambda _device: AcceleratorVendor.AMD,
+    )
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    metadata = _metadata()
+    metadata.codec_name = "av1"
+    metadata.is_10bit = True
+    metadata.video_bitrate = 17_000_000
+
+    encoder = module.NvidiaVideoEncoder(
+        str(tmp_path / "out.mp4"),
+        torch.device("cuda:0"),
+        metadata,
+        codec="av1",
+        encoder_settings={"cq": 35},
+    )
+
+    assert encoder.encoder_options["rc"] == "vbr_peak"
+    assert encoder.encoder_options["preanalysis"] == "0"
+    assert "qvbr_quality_level" not in encoder.encoder_options
+    assert encoder._target_bit_rate == 17_000_000
+
+
+@pytest.mark.parametrize("is_10bit", [False, True])
+def test_linux_amd_hevc_source_ceiling_uses_stable_peak_vbr(
+    monkeypatch, tmp_path, is_10bit
+) -> None:
+    import jasna.media.video_encoder as module
+
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        module,
+        "vendor_for_device",
+        lambda _device: AcceleratorVendor.AMD,
+    )
+    metadata = _metadata()
+    metadata.codec_name = "hevc"
+    metadata.is_10bit = is_10bit
+    metadata.video_bitrate = 22_002_901
+
+    encoder = module.NvidiaVideoEncoder(
+        str(tmp_path / "out.mp4"),
+        torch.device("cuda:0"),
+        metadata,
+        codec="hevc",
+        encoder_settings={},
+        match_input_bit_depth=True,
+    )
+
+    expected_rate = int(metadata.video_bitrate * 1.25)
+    assert encoder.spec.ten_bit is is_10bit
+    assert encoder.encoder_options["rc"] == "vbr_peak"
+    assert encoder.encoder_options["preanalysis"] == "0"
+    assert encoder.encoder_options["maxrate"] == str(expected_rate)
+    assert "qvbr_quality_level" not in encoder.encoder_options
+    assert "bufsize" not in encoder.encoder_options
+    assert encoder._target_bit_rate == expected_rate
+
+
+def test_linux_amd_hevc_explicit_rate_control_is_preserved(monkeypatch, tmp_path) -> None:
+    import jasna.media.video_encoder as module
+
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        module,
+        "vendor_for_device",
+        lambda _device: AcceleratorVendor.AMD,
+    )
+    metadata = _metadata()
+    metadata.codec_name = "hevc"
+    metadata.video_bitrate = 20_000_000
+
+    encoder = module.NvidiaVideoEncoder(
+        str(tmp_path / "out.mp4"),
+        torch.device("cuda:0"),
+        metadata,
+        codec="hevc",
+        encoder_settings={"rc": "qvbr"},
+        match_input_bit_depth=True,
+    )
+
+    assert encoder.encoder_options["rc"] == "qvbr"
+    assert encoder.encoder_options["qvbr_quality_level"] == "25"
+    assert encoder.encoder_options["bufsize"] == "50000000"
+    assert encoder._target_bit_rate is None
+
+
+def test_linux_amd_h264_source_ceiling_keeps_native_qvbr(monkeypatch, tmp_path) -> None:
+    import jasna.media.video_encoder as module
+
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        module,
+        "vendor_for_device",
+        lambda _device: AcceleratorVendor.AMD,
+    )
+    metadata = _metadata()
+    metadata.video_bitrate = 20_000_000
+
+    encoder = module.NvidiaVideoEncoder(
+        str(tmp_path / "out.mp4"),
+        torch.device("cuda:0"),
+        metadata,
+        codec="h264",
+        encoder_settings={},
+    )
+
+    assert encoder.encoder_options["rc"] == "qvbr"
+    assert encoder.encoder_options["preanalysis"] == "1"
+    assert encoder.encoder_options["maxrate"] == "20000000"
+    assert encoder.encoder_options["bufsize"] == "40000000"
+    assert encoder._target_bit_rate is None
+
+
+def test_windows_amd_hevc_source_ceiling_keeps_native_qvbr(monkeypatch, tmp_path) -> None:
+    import jasna.media.video_encoder as module
+
+    monkeypatch.setattr(module.sys, "platform", "win32")
+    monkeypatch.setattr(
+        module,
+        "vendor_for_device",
+        lambda _device: AcceleratorVendor.AMD,
+    )
+    metadata = _metadata()
+    metadata.codec_name = "hevc"
+    metadata.video_bitrate = 20_000_000
+
+    encoder = module.NvidiaVideoEncoder(
+        str(tmp_path / "out.mp4"),
+        torch.device("cuda:0"),
+        metadata,
+        codec="hevc",
+        encoder_settings={},
+        match_input_bit_depth=True,
+    )
+
+    assert encoder.encoder_options["rc"] == "qvbr"
+    assert encoder.encoder_options["preanalysis"] == "1"
+    assert encoder.encoder_options["bufsize"] == "50000000"
+    assert encoder._target_bit_rate is None
+
+
+@pytest.mark.parametrize("source_bitrate", [0, 1_504_546_792, 3_000_000_000])
+def test_linux_amd_hevc_without_valid_source_ceiling_keeps_qvbr(
+    monkeypatch, tmp_path, source_bitrate
+) -> None:
+    import jasna.media.video_encoder as module
+
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        module,
+        "vendor_for_device",
+        lambda _device: AcceleratorVendor.AMD,
+    )
+    metadata = _metadata()
+    metadata.codec_name = "hevc"
+    metadata.video_bitrate = source_bitrate
+
+    encoder = module.NvidiaVideoEncoder(
+        str(tmp_path / "out.mp4"),
+        torch.device("cuda:0"),
+        metadata,
+        codec="hevc",
+        encoder_settings={},
+        match_input_bit_depth=True,
+    )
+
+    assert encoder.encoder_options["rc"] == "qvbr"
+    assert encoder.encoder_options["preanalysis"] == "1"
+    assert "maxrate" not in encoder.encoder_options
+    assert "bufsize" not in encoder.encoder_options
+    assert encoder._target_bit_rate is None
 
 
 def test_streaming_encoder_selects_amf(monkeypatch, tmp_path) -> None:
@@ -301,6 +481,143 @@ def test_amf_decoder_context_is_created(monkeypatch) -> None:
     assert reader._amd_hardware_decode is True
 
 
+def test_windows_av1_amf_decoder_uses_stream_codec_instead_of_libdav1d_name(
+    monkeypatch,
+) -> None:
+    import jasna.media.video_decoder as module
+
+    monkeypatch.setattr(module.sys, "platform", "win32")
+    decoder = MagicMock()
+    monkeypatch.setattr(
+        module.av,
+        "CodecContext",
+        SimpleNamespace(create=MagicMock(return_value=decoder)),
+    )
+    metadata = _metadata()
+    metadata.codec_name = "av1"
+    reader = module.NvidiaVideoReader(
+        "input.mp4",
+        4,
+        torch.device("cuda:0"),
+        metadata,
+    )
+    source = SimpleNamespace(
+        name="libdav1d",
+        extradata=b"header",
+        width=16,
+        height=16,
+        framerate=Fraction(30, 1),
+        sample_aspect_ratio=Fraction(1, 1),
+        thread_type=None,
+    )
+
+    reader._setup_amf_decoder(source)
+
+    create = module.av.CodecContext.create
+    assert create.call_args.args[:2] == ("av1_amf", "r")
+    decoder.open.assert_called_once_with(strict=False)
+    assert reader._decoder_ctx is decoder
+    assert reader._amd_hardware_decode is True
+
+
+def test_linux_av1_input_uses_faster_software_decoder(monkeypatch) -> None:
+    import jasna.media.video_decoder as module
+
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    create = MagicMock()
+    monkeypatch.setattr(
+        module.av,
+        "CodecContext",
+        SimpleNamespace(create=create),
+    )
+    metadata = _metadata()
+    metadata.codec_name = "av1"
+    reader = module.NvidiaVideoReader(
+        "input.mp4",
+        4,
+        torch.device("cuda:0"),
+        metadata,
+    )
+    source = SimpleNamespace(name="libdav1d", thread_type=None)
+
+    reader._setup_amf_decoder(source)
+
+    create.assert_not_called()
+    assert reader._decoder_ctx is None
+    assert reader._amd_hardware_decode is False
+    assert source.thread_type == "AUTO"
+
+
+def test_linux_8k_hevc_scan_uses_faster_software_decoder(monkeypatch) -> None:
+    import jasna.media.video_decoder as module
+
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    create = MagicMock()
+    monkeypatch.setattr(
+        module.av,
+        "CodecContext",
+        SimpleNamespace(create=create),
+    )
+    metadata = _metadata()
+    metadata.codec_name = "hevc"
+    metadata.video_width = 8192
+    metadata.video_height = 4096
+    reader = module.NvidiaVideoReader(
+        "input.mp4",
+        4,
+        torch.device("cuda:0"),
+        metadata,
+        prefer_software_decode=True,
+    )
+    source = SimpleNamespace(name="hevc", thread_type=None)
+
+    reader._setup_amf_decoder(source)
+
+    create.assert_not_called()
+    assert reader._decoder_ctx is None
+    assert reader._amd_hardware_decode is False
+    assert source.thread_type == "AUTO"
+
+
+def test_linux_8k_hevc_regular_reader_keeps_amf_decoder(monkeypatch) -> None:
+    import jasna.media.video_decoder as module
+
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    decoder = MagicMock()
+    monkeypatch.setattr(
+        module.av,
+        "CodecContext",
+        SimpleNamespace(create=MagicMock(return_value=decoder)),
+    )
+    metadata = _metadata()
+    metadata.codec_name = "hevc"
+    metadata.video_width = 8192
+    metadata.video_height = 4096
+    reader = module.NvidiaVideoReader(
+        "input.mp4",
+        4,
+        torch.device("cuda:0"),
+        metadata,
+    )
+    source = SimpleNamespace(
+        name="hevc",
+        extradata=b"header",
+        width=8192,
+        height=4096,
+        framerate=Fraction(60, 1),
+        sample_aspect_ratio=Fraction(1, 1),
+        thread_type=None,
+    )
+
+    reader._setup_amf_decoder(source)
+
+    create = module.av.CodecContext.create
+    assert create.call_args.args[:2] == ("hevc_amf", "r")
+    decoder.open.assert_called_once_with(strict=False)
+    assert reader._decoder_ctx is decoder
+    assert reader._amd_hardware_decode is True
+
+
 def test_amf_decoder_survives_pyav18_time_base_regression(monkeypatch) -> None:
     import jasna.media.video_decoder as module
 
@@ -322,11 +639,13 @@ def test_amf_decoder_survives_pyav18_time_base_regression(monkeypatch) -> None:
         "CodecContext",
         SimpleNamespace(create=MagicMock(return_value=decoder)),
     )
+    metadata = _metadata()
+    metadata.codec_name = "hevc"
     reader = module.NvidiaVideoReader(
         "input.mp4",
         4,
         torch.device("cuda:0"),
-        _metadata(),
+        metadata,
     )
     source = SimpleNamespace(
         name="hevc",
@@ -339,6 +658,8 @@ def test_amf_decoder_survives_pyav18_time_base_regression(monkeypatch) -> None:
         thread_type=None,
     )
     reader._setup_amf_decoder(source)
+    create = module.av.CodecContext.create
+    assert create.call_args.args[:2] == ("hevc_amf", "r")
     assert decoder.opened is True
     assert reader._decoder_ctx is decoder
     assert reader._amd_hardware_decode is True

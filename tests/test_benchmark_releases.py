@@ -1,5 +1,6 @@
 import argparse
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -17,7 +18,7 @@ from benchmark_releases import (
     safe_name,
     targets_for_repeat,
 )
-from bench_memory import MemorySampler
+from bench_memory import MemorySampler, _med_peak
 
 
 def test_parse_target_spec_resolves_path(tmp_path: Path) -> None:
@@ -103,6 +104,57 @@ def test_memory_sampler_reads_ram_cross_platform() -> None:
     sampler._sample_ram()
 
     assert sampler._ram_mb[0] > 0
+
+
+def test_memory_sampler_summary_handles_empty_and_populated_samples() -> None:
+    assert _med_peak([]) == (0.0, 0.0)
+    assert _med_peak([3.0, 1.0, 2.0]) == (2.0, 3.0)
+
+
+def test_memory_sampler_reads_amd_sysfs_without_amd_smi(tmp_path: Path) -> None:
+    sampler = MemorySampler.__new__(MemorySampler)
+    sampler._amd_device = tmp_path
+    sampler._amd_hwmon = tmp_path / "hwmon"
+    sampler._amd_temperature = sampler._amd_hwmon / "temp2_input"
+    sampler._gpu_util_percent = []
+    sampler._gpu_memory_util_percent = []
+    sampler._gpu_media_util_percent = []
+    sampler._vram_mb = []
+    sampler._gpu_power_w = []
+    sampler._gpu_temperature_c = []
+    sampler._amd_hwmon.mkdir()
+    (tmp_path / "gpu_busy_percent").write_text("71\n")
+    (tmp_path / "mem_busy_percent").write_text("32\n")
+    (tmp_path / "vcn_busy_percent").write_text("94\n")
+    (tmp_path / "mem_info_vram_used").write_text(str(3 * 1024 * 1024))
+    (sampler._amd_hwmon / "power1_average").write_text("123000000\n")
+    sampler._amd_temperature.write_text("67000\n")
+
+    assert sampler._sample_amd_gpu()
+    assert sampler._gpu_util_percent == [71.0]
+    assert sampler._gpu_memory_util_percent == [32.0]
+    assert sampler._gpu_media_util_percent == [94.0]
+    assert sampler._vram_mb == [3.0]
+    assert sampler._gpu_power_w == [123.0]
+    assert sampler._gpu_temperature_c == [67.0]
+
+
+def test_memory_sampler_reports_cpu_and_gpu_fields() -> None:
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(0.2)"]
+    )
+    sampler = MemorySampler(process.pid, interval_seconds=0.02)
+    process.wait(timeout=5)
+    result = sampler.stop()
+
+    assert result["samples"] >= 1
+    assert result["ram_peak_mb"] > 0
+    assert result["system_cpu_peak_percent"] >= 0
+    assert result["process_cpu_peak_percent"] >= 0
+    assert "gpu_util_med_percent" in result
+    assert "gpu_media_util_med_percent" in result
+    assert "gpu_power_peak_w" in result
+    assert "gpu_temperature_peak_c" in result
 
 
 def test_run_once_times_out_and_removes_partial_output(tmp_path: Path) -> None:

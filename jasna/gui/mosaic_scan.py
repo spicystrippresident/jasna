@@ -574,6 +574,7 @@ class MosaicScanWorker:
                     device,
                     metadata,
                     frame_stride=frame_stride,
+                    prefer_software_decode=True,
                 )
                 with reader:
                     start_pts = reader.start_pts

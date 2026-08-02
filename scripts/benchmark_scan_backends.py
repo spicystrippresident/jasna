@@ -9,7 +9,7 @@ covers decode + detection + the final CPU sync only.
 
 Usage:
     ~/.virtualenvs/jasna-linux/bin/python scripts/benchmark_scan_backends.py
-    ... [--clips CLIP ...] [--backends vali pyav-hw pyav-sw] [--repeats N]
+    ... [--clips CLIP ...] [--backends auto vali pyav-hw pyav-sw] [--repeats N]
 """
 
 import argparse
@@ -23,7 +23,7 @@ from bench_memory import MemorySampler
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CLIP_DIR = REPO_ROOT / "assets" / "benchmark"
-BACKENDS = ("vali", "pyav-hw", "pyav-sw")
+BACKENDS = ("auto", "vali", "pyav-hw", "pyav-sw")
 
 RUNNER_SHIM = """
 import queue
@@ -86,7 +86,7 @@ def run_once(clip: Path, backend: str) -> tuple[float, int, str, dict[str, float
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--clips", nargs="+", type=Path, default=None)
-    parser.add_argument("--backends", nargs="+", choices=BACKENDS, default=["vali"])
+    parser.add_argument("--backends", nargs="+", choices=BACKENDS, default=["auto"])
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--csv", type=Path, default=None)
     parser.add_argument("--no-warmup", action="store_true")
@@ -120,22 +120,41 @@ def main() -> None:
             rows.append((
                 clip.name, backend, samples, wall, fps,
                 memory["ram_med_mb"], memory["ram_peak_mb"],
-                memory["vram_med_mb"], memory["vram_peak_mb"], flags,
+                memory["vram_med_mb"], memory["vram_peak_mb"],
+                memory["process_cpu_med_percent"], memory["process_cpu_peak_percent"],
+                memory["system_cpu_med_percent"], memory["system_cpu_peak_percent"],
+                memory["gpu_util_med_percent"], memory["gpu_util_peak_percent"],
+                memory["gpu_media_util_med_percent"], memory["gpu_media_util_peak_percent"],
+                memory["gpu_power_med_w"], memory["gpu_power_peak_w"],
+                memory["gpu_temperature_peak_c"], flags,
             ))
             print(
                 f"{clip.name} [{backend}]: {wall:.1f}s {fps:.1f}fps "
                 f"ram {memory['ram_med_mb']:.0f}/{memory['ram_peak_mb']:.0f}MB "
-                f"vram {memory['vram_med_mb']:.0f}/{memory['vram_peak_mb']:.0f}MB {flags}",
+                f"vram {memory['vram_med_mb']:.0f}/{memory['vram_peak_mb']:.0f}MB "
+                f"cpu(proc/sys) {memory['process_cpu_med_percent']:.0f}/"
+                f"{memory['system_cpu_med_percent']:.0f}% "
+                f"gpu(gfx/media) {memory['gpu_util_med_percent']:.0f}/"
+                f"{memory['gpu_media_util_med_percent']:.0f}% "
+                f"power {memory['gpu_power_med_w']:.0f}W "
+                f"temp {memory['gpu_temperature_peak_c']:.0f}C {flags}",
                 flush=True,
             )
 
     print(flush=True)
-    print("| clip | backend | frames | wall s | fps | ram med/peak MB | vram med/peak MB | flags |")
-    print("|---|---|---|---|---|---|---|---|")
-    for name, backend, samples, wall, fps, ram_med, ram_peak, vram_med, vram_peak, flags in rows:
+    print("| clip | backend | frames | wall s | fps | ram med/peak MB | vram med/peak MB | cpu proc/sys med % | gpu gfx/media med % | power med/peak W | temp peak C | flags |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|")
+    for (
+        name, backend, samples, wall, fps, ram_med, ram_peak, vram_med, vram_peak,
+        proc_cpu_med, _proc_cpu_peak, sys_cpu_med, _sys_cpu_peak,
+        gpu_med, _gpu_peak, media_med, _media_peak, power_med, power_peak,
+        temp_peak, flags,
+    ) in rows:
         print(
             f"| {name} | {backend} | {samples} | {wall:.1f} | {fps:.1f} "
-            f"| {ram_med:.0f}/{ram_peak:.0f} | {vram_med:.0f}/{vram_peak:.0f} | {flags} |"
+            f"| {ram_med:.0f}/{ram_peak:.0f} | {vram_med:.0f}/{vram_peak:.0f} "
+            f"| {proc_cpu_med:.0f}/{sys_cpu_med:.0f} | {gpu_med:.0f}/{media_med:.0f} "
+            f"| {power_med:.0f}/{power_peak:.0f} | {temp_peak:.0f} | {flags} |"
         )
 
     if args.csv:
@@ -143,7 +162,13 @@ def main() -> None:
             writer = csv.writer(fh)
             writer.writerow([
                 "clip", "backend", "frames", "wall_s", "fps",
-                "ram_med_mb", "ram_peak_mb", "vram_med_mb", "vram_peak_mb", "flags",
+                "ram_med_mb", "ram_peak_mb", "vram_med_mb", "vram_peak_mb",
+                "process_cpu_med_percent", "process_cpu_peak_percent",
+                "system_cpu_med_percent", "system_cpu_peak_percent",
+                "gpu_util_med_percent", "gpu_util_peak_percent",
+                "gpu_media_util_med_percent", "gpu_media_util_peak_percent",
+                "gpu_power_med_w", "gpu_power_peak_w", "gpu_temperature_peak_c",
+                "flags",
             ])
             writer.writerows(rows)
         print(f"csv written to {args.csv}", flush=True)

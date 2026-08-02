@@ -7,6 +7,7 @@ from jasna.media.splice import KeyframeIndex, SplicePlan, SpliceSpan
 from jasna.segments import SegmentRange
 from jasna.smart_render_workspace import (
     SmartRenderWorkspace,
+    WORKSPACE_ALGORITHM_VERSION,
     workspace_signature,
 )
 
@@ -99,6 +100,31 @@ def test_workspace_signature_change_uses_separate_directory(tmp_path) -> None:
     assert first.path != second.path
     assert first.path.is_dir()
     assert second.path.is_dir()
+
+
+def test_encoder_policy_version_is_part_of_workspace_signature(
+    monkeypatch, tmp_path
+) -> None:
+    import jasna.smart_render_workspace as module
+
+    assert WORKSPACE_ALGORITHM_VERSION == "jasna-smart-render-workspace-v2"
+    first = SmartRenderWorkspace.open(
+        tmp_path / "work",
+        output=tmp_path / "output.mp4",
+        signature=_signature(tmp_path),
+    )
+    monkeypatch.setattr(
+        module,
+        "WORKSPACE_ALGORITHM_VERSION",
+        "jasna-smart-render-workspace-v3-test",
+    )
+    second = SmartRenderWorkspace.open(
+        tmp_path / "work",
+        output=tmp_path / "output.mp4",
+        signature=_signature(tmp_path),
+    )
+
+    assert first.path != second.path
 
 
 def test_workspace_preserves_invalid_manifest_before_reinitializing(tmp_path) -> None:
