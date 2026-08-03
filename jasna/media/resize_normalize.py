@@ -10,11 +10,15 @@ caller already had, which is also what the kernel is tested against.
 from __future__ import annotations
 
 import ctypes
+import logging
 
 import torch
+import torch.nn.functional as F
 
-from jasna.accelerator import is_nvidia_device
+from jasna.accelerator import is_amd_device, is_nvidia_device
 from jasna.media.cuda_kernel import check_cuda, cuda_driver, resolve_function
+
+logger = logging.getLogger(__name__)
 
 _FATBIN = "resize_normalize.fatbin"
 _BLOCK_WIDTH = 16
@@ -116,15 +120,34 @@ class ResizeNormalizer:
         self._std = torch.tensor(std, dtype=torch.float32, device=device)
         self._fill = torch.tensor(fill, dtype=torch.float32, device=device)
         function = _FUNCTIONS.get(dtype)
-        self._kernel = (
-            _ResizeNormalizeKernel(function)
-            if function is not None and is_nvidia_device(device)
-            else None
-        )
+        self._backend = "torch"
+        if function is not None and is_nvidia_device(device):
+            self._kernel = _ResizeNormalizeKernel(function)
+            self._backend = "cuda"
+        elif function is not None and is_amd_device(device):
+            try:
+                from jasna.media.triton_resize_normalize import (
+                    TritonResizeNormalizeKernel,
+                )
+
+                self._kernel = TritonResizeNormalizeKernel()
+                self._backend = "triton-rocm"
+            except (ImportError, RuntimeError):
+                logger.warning(
+                    "ROCm fused resize-normalize is unavailable; using Torch",
+                    exc_info=True,
+                )
+                self._kernel = None
+        else:
+            self._kernel = None
 
     @property
     def available(self) -> bool:
         return self._kernel is not None
+
+    @property
+    def backend(self) -> str:
+        return self._backend
 
     def run(
         self,
@@ -133,8 +156,6 @@ class ResizeNormalizer:
         out_hw: tuple[int, int],
         content: tuple[int, int, int, int],
     ) -> torch.Tensor:
-        if self._kernel is None:
-            raise RuntimeError("The fused preprocess requires the CUDA kernel")
         if frames_uint8_bchw.dtype is not torch.uint8:
             raise ValueError(f"Expected a uint8 batch, got {frames_uint8_bchw.dtype}")
         if frames_uint8_bchw.ndim != 4 or frames_uint8_bchw.shape[1] != 3:
@@ -145,9 +166,58 @@ class ResizeNormalizer:
         frames = frames_uint8_bchw
         if frames.device != self.device:
             frames = frames.to(self.device, non_blocking=True)
+        if self._kernel is None:
+            if self._backend == "torch":
+                return self._run_torch(frames, out_hw=out_hw, content=content)
+            raise RuntimeError("The fused preprocess requires the CUDA kernel")
 
         out = torch.empty(
             (frames.shape[0], 3, out_hw[0], out_hw[1]), dtype=self.dtype, device=self.device
         )
-        self._kernel.launch(frames, out, content, self._mean, self._std, self._fill)
+        try:
+            self._kernel.launch(frames, out, content, self._mean, self._std, self._fill)
+        except Exception:
+            if self._backend != "triton-rocm":
+                raise
+            logger.warning(
+                "ROCm fused resize-normalize failed; disabling it for this instance",
+                exc_info=True,
+            )
+            self._kernel = None
+            self._backend = "torch"
+            return self._run_torch(frames, out_hw=out_hw, content=content)
         return out
+
+    def _run_torch(
+        self,
+        frames: torch.Tensor,
+        *,
+        out_hw: tuple[int, int],
+        content: tuple[int, int, int, int],
+    ) -> torch.Tensor:
+        left, top, content_width, content_height = content
+        values = frames.to(device=self.device, dtype=self.dtype).div_(255.0)
+        values = F.interpolate(
+            values,
+            size=(content_height, content_width),
+            mode="bilinear",
+            align_corners=False,
+        )
+        mean = self._mean.to(dtype=self.dtype)[:, None, None]
+        std = self._std.to(dtype=self.dtype)[:, None, None]
+        values = (values - mean) / std
+        if content == (0, 0, out_hw[1], out_hw[0]):
+            return values
+        output = torch.empty(
+            (frames.shape[0], 3, out_hw[0], out_hw[1]),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        output[:] = self._fill.to(dtype=self.dtype)[None, :, None, None]
+        output[
+            :,
+            :,
+            top : top + content_height,
+            left : left + content_width,
+        ] = values
+        return output

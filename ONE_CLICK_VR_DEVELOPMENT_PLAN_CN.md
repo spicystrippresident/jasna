@@ -107,6 +107,79 @@ HEVC Main 10 整片当前明确延期。已有 62 帧 HEVC Main 10、20 秒 AV1 
 P010/10-bit 像素转换、codec 路由、rocDecode、时间基/mux，或准备发布候选版本时，
 才恢复 10-bit 定向或整片验收；普通 detector、tracker、恢复调度优化不触发它。
 
+## 第二轮 AMD/NVIDIA 对照优化任务
+
+2026-08-04 用户批准继续实现和短测，但要求所有候选完成并统一汇报后，才决定是否
+启动完整测试。因此本轮禁止 34 分钟整片、183 秒 E2E、Main 10 长片和 F 盘大矩阵；
+允许单元测试、合成张量微基准以及不产生视频输出的少量真实解码帧 A/B。F 盘继续只读，
+所有报告写 D 盘。
+
+本轮以 O1 后大 span 的同一次运行作为瓶颈依据：`decode=3410.3s`、
+`detect-track=5343.7s`、`primary restore=7993.5s`、第二 reader decode `3774.8s`、
+`blend=1464.8s`、`write=120.4s`。这些阶段并行执行，detect 和 restore 链几乎同时
+完成；任何单阶段收益都必须同时报告“转移后的下一瓶颈”，不能把微基准倍率直接写成
+整片倍率。
+
+NVIDIA 版只提供已测实现和候选边界，不具有方案优先权。每项任务必须同时考虑 Jasna
+现状、NVIDIA 做法、ROCm 原生能力以及范围更小的替代实现；即使 NVIDIA 已采用某方案，
+AMD 真机没有收益、维护成本过高或存在更优路线时也不移植。最终选择按输出正确性、
+端到端关键链收益、峰值内存、失败回退、冷启动和上游维护成本共同排序，不按单个算子
+的理论吞吐排序。
+
+| 任务 | 实现/评估范围 | 保留门槛 | 本轮验收（不跑完整视频） | 状态 |
+| --- | --- | --- | --- | --- |
+| O6：ROCm 融合 detector 预处理 | 将 NVIDIA `resize_normalize` 的单次 uint8 读取、bilinear resize、归一化思路移植到 AMD；失败时保留 Torch fallback | 输入数值满足明确误差界，真实 RF-DETR tracking 语义一致；8K 预处理和检测墙钟有稳定收益 | 单元等价性、8K 合成张量显存/耗时、少量真实帧检测 A/B | 完成，保留 |
+| O6A：AMD 可选检测器契约 | 复用 Jasna 全局和逐视频检测器选择，不建立一键 VR 专用 registry；只列出已有权重，扫描、投影、缓存和 render 使用同一选择 | RF-DETR VR/通用和 YOLO 均可被选择；切换模型必定失效旧扫描缓存，不能静默换回默认模型 | registry/GUI/Processor 单测，已安装模型各一次张量或少量帧 smoke | 完成，保留 |
+| O7：RF-DETR ROCm 后端 | 先评估固定 batch `torch.compile`/Inductor；只在可限定冷编译、无静默 fallback 且稳定加速时接入可选缓存 | steady-state 至少快 10%，检测/track 一致，首次构建可终止且不会消耗失控 RAM | 固定张量 compile smoke、短重复推理、资源采样 | 完成，否决 |
+| O8：BasicVSR++ 分段/Graph | 借鉴 NVIDIA 六子引擎边界，优先评估静态 loop body 的局部 compile/HIP Graph，不再重复已失败的整模型 fullgraph | 恢复 forward 至少快 10%，输出达到现有 FP16 门槛，缓存和冷启动成本可部署 | T=4/16 合成与真实 crop 微基准、数值比较 | 完成，否决 |
+| O9：独立 clip 合批 | 只合批不同 restoration item 的模型 batch 维，不合并 track、不删 temporal overlap；不同长度分桶，OOM 回退单 clip | 至少两个 clip 时吞吐提高 15%，单 clip 路径零回归，输出顺序和每 clip 上下文不变 | 同长/异长 clip 单测、batch 1/2/4 显存与吞吐 | 完成，条件保留 batch 2 |
+| O10：rocDecode 关键路径 | 不直接接入生产；根据 O6--O9 后的新瓶颈重新计算零回读 backend 的 E2E 上限 | 预测整片收益至少 8% 才进入后续实现，否则继续延期 | 使用已有 8/10-bit `88.3 fps`、像素/PTS 和长片阶段数据建上限模型 | 评估完成，进入独立后续实现 |
+| O11：AMD 融合通用内核 | 审计只在 NVIDIA 启用的 preprocess、RGB/YUV、blend、LUT、denoise；只实现当前一键 VR 默认路径上的关键项 | 单项关键链占比足够且微基准至少快 10%；不得为了对称移植未启用功能 | 调用路径审计、定向张量基准和等价性测试 | 完成，现状最优 |
+
+执行顺序固定为 O6/O6A -> O7 -> O8/O9 -> O10/O11。候选达不到门槛时撤除实验代码，只保留
+可复现脚本、数据和结论；达到门槛时才进入生产路径，并必须提供关闭/回退边界。全部任务
+收口后先运行定向测试和短微基准、更新架构文档并提交 Git，然后向用户汇报。只有用户在
+该汇报后明确说开始，才建立相同当前码控的完整基线和整片 A/B。
+
+### 第二轮结果与生产决策
+
+1. O6 保留。ROCm Triton 融合预处理在 8K half-eye 上由 `3.976ms` 降到
+   `0.106ms`，临时分配由 `799MiB` 降到 `16MiB`。真实 368 帧 RF-DETR 路径由
+   `9.748s` 降到 `9.139s`（`6.25%`），检测 `129/129`、mask 和 restoration item
+   `7/7` 均保持一致；第一次运行失败后永久回退 Torch，不影响 NVIDIA 路径。
+2. O6A 保留。检测器仍只有 Jasna registry 一个事实来源；已安装并可选
+   `rfdetr-vr-v1`、`rfdetr-v6`、`lada-yolo-v4`。回归测试证明同一个模型名和阈值同时
+   到达一键扫描和 render，切换模型进入既有扫描签名，不建立一键专用 registry。
+3. O7 否决。RF-DETR 严格 fullgraph 在第三方实现内失败，允许 graph break 后编译数分钟
+   仍失败；channels-last 慢 `0.26%`。真实 16 帧 TorchScript 约 `27.06s`，eager 约
+   `0.393s`，慢约 69 倍，即使语义一致也不能部署。
+4. O8 否决。局部 propagation body 的 compile/HIP Graph 微基准分别快 `31.3%/58.8%`，
+   但 HIP Graph 对 `deform_conv2d` 捕获后无报错却产生错误结果。完整 compile 原型
+   steady-state 在 T=4/16 快 `18.5%/22.0%`，但需要突破 Dynamo 默认重编译上限，换到
+   T=16 仍有 `5.5s` 新编译，输出仅 `70.3/64.2dB`。真实 clip 长度在 2--90 间变化，
+   冷编译、动态缓存和数值漂移均不满足部署门槛；生产继续用 FP16 eager。
+5. O9 条件保留。AMD 只对队列中相邻、同长度且每条至少 60 帧的 clip 使用 batch 2；
+   短片、异长片、NVIDIA/TensorRT 保持单片，OOM 清缓存后逐片重试。T=60/90 合成吞吐约
+   `1.93x/1.92x`；真实 480 帧窗口的可分桶上限由 `7.705s` 降到 `4.737s`
+   （`38.5%`），生产相邻规则覆盖其中 `540/1063` 个恢复帧。另一真实短窗 batch 2 慢
+   `16.3%`，因此禁止小于 60 帧合批。真实 FP16 batch 输出 PSNR `75--86dB`、uint8
+   最大差 `1--3`。batch 4 不进入生产。
+6. FP16 继续默认。Jasna 原生 FP32 使用同一 BasicVSR++ checkpoint，不存在另一份 FP32
+   模型。batch 1 的 T=16 两者等速，T=60/90 时 FP16 快 `2.6%/3.3%`；没有 ground truth
+   证明 FP32 有可见质量收益，速度优先时不改默认。
+7. O10 的旧流水线上限为主 span 已观测的 `760.4s` restore queue slack，即整片
+   `7.27%`。O9 的真实相邻覆盖率预计可再减少约 `24%` 恢复工作，瓶颈将转回
+   decode+detect；此时零回读 rocDecode 可能超过 `8%` 门槛。结论从“继续延期”改为
+   “单独立项”，但本轮不提交缺少 PyAV time-base、C++/HIP 生命周期和 GPU
+   NV12/P010→RGB 的半成品 backend，也不因此启动完整测试。
+8. O11 不新增生产内核。默认 denoise/LUT/secondary/sharpen 均关闭，RGB→YUV write 只占
+   整片约 `1.15%`。AMD 已用 prefix-sum blend mask；在 16--128 mask 上比 NVIDIA conv
+   路径快 `23.7--26.3%` 且逐值一致，保留 Jasna 当前分支。
+
+一次 batch 4、T=60/90 合成压力测试把 GPU hotspot 推到 `98C`，约一分钟后机器因
+Data Fabric sync flood/MCE 异常重启。此后生产候选固定为 batch 2，GPU 脚本默认使用
+结温门槛；本轮后续真实窗口峰值 `74C`，当前启动日志没有新增硬件错误。
+
 ## 当前真实状态
 
 ### 已完成
@@ -168,19 +241,20 @@ P010/10-bit 像素转换、codec 路由、rocDecode、时间基/mux，或准备�
   不是 AV1 重排或 rocDecode 核心丢时间戳。
 - 正式接入仍需 PyAV 保留原始 time-base 的 demux、rocDecode C++/HIP 生命周期管理，
   以及 GPU NV12/P010 surface 到 Torch RGB 的零回读转换。官方整数毫秒 demux 和
-  device-copy helper 均不能直接成为 Jasna backend。当前 AV1 sparse E2E 的 media
-  encoder 已达 89-98% 且占 60.8-80.6 秒关键路径，所以这项复杂度目前不会带来可测的
-  总墙钟收益；保留为后续独立优化，不替换已经验证稳定的 libdav1d + ROCm upload。
+  device-copy helper 均不能直接成为 Jasna backend。第二轮条件 batch 2 会把部分长 clip
+  的恢复瓶颈前移，rocDecode 的预测上限因此达到后续立项目槛；它改为独立 backend 任务，
+  但在完整生命周期和回退契约完成前不替换稳定的 AMF/software decode 路由。
 - Linux 10-bit H.264/HEVC 输入仍因 PyAV AMF P010 首包不可靠而在解包前选择软件
   解码。rocDecode 的帧数、PTS、8/10-bit 像素和原始吞吐已验证，尚缺正式 GPU
   surface 转换和真实 Jasna 墙钟验收，不能因为单项解码更快就直接替换现有链。
 - Windows AMD smart-render 尚未验收，继续明确拒绝。8-bit 整部真实长片已经完成；
   Main 10 整片按当前执行策略延期，不是开始性能优化的前置门槛。rocDecode 专用
-  backend 也继续延期；编译后端已完成可用性评估但没有优于 eager 的可部署项。
+  backend 尚未实现但已进入下一阶段；编译后端已完成可用性评估，没有优于 eager 的
+  可部署项。
 
 ### 当前验证证据
 
-- 完整测试集：`1889 passed, 119 skipped, 0 failed`；跳过项是当前 AMD 主机不适用或
+- 完整测试集：`1901 passed, 119 skipped, 0 failed`；跳过项是当前 AMD 主机不适用或
   缺少受保护资源的 TensorRT、NVENC/NVDEC、RTX、TVAI 等路径。
 - 独立 E2E：`6 passed, 17 skipped`；AMD 上执行元数据、解码和检测，NVIDIA 专用项
   按平台声明跳过。

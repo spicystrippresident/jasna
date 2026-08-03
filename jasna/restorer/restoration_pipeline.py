@@ -9,7 +9,7 @@ from jasna.crop_buffer import (
     RawCrop,
     prepare_crops_for_restoration,
 )
-from jasna.pipeline_items import PrimaryRestoreResult, SecondaryRestoreResult
+from jasna.pipeline_items import ClipRestoreItem, PrimaryRestoreResult, SecondaryRestoreResult
 from jasna.restorer.basicvsrpp_mosaic_restorer import BasicvsrppMosaicRestorer
 from jasna.restorer.denoise import DenoiseStep, DenoiseStrength, apply_denoise, apply_denoise_u8
 from jasna.restorer.secondary_restorer import SecondaryRestorer
@@ -49,6 +49,17 @@ class RestorationPipeline:
         if self.secondary_restorer is not None:
             return bool(getattr(self.secondary_restorer, "prefers_cpu_input", False))
         return False
+
+    @property
+    def independent_clip_batch_size(self) -> int:
+        return max(1, int(getattr(self.restorer, "independent_clip_batch_size", 1)))
+
+    @property
+    def independent_clip_batch_min_frames(self) -> int:
+        return max(
+            0,
+            int(getattr(self.restorer, "independent_clip_batch_min_frames", 0)),
+        )
 
     def _apply_denoise(self, frames: torch.Tensor) -> torch.Tensor:
         return apply_denoise(frames, self._denoise_strength)
@@ -118,6 +129,51 @@ class RestorationPipeline:
             pad_offsets=pad_offsets,
             resize_shapes=resize_shapes,
         )
+
+    def prepare_and_run_primary_batch(
+        self,
+        items: list[ClipRestoreItem],
+    ) -> list[PrimaryRestoreResult]:
+        if not items:
+            return []
+        frame_count = len(items[0].raw_crops)
+        if frame_count <= 0 or any(
+            len(item.raw_crops) != frame_count for item in items
+        ):
+            raise ValueError("primary restoration batches require equal clip lengths")
+
+        prepared = [
+            self._prepare_from_raw_crops(item.raw_crops) for item in items
+        ]
+        primary_batches = self.restorer.raw_process_batch(
+            [entry[0] for entry in prepared]
+        )
+        results: list[PrimaryRestoreResult] = []
+        for item, primary_raw, metadata in zip(
+            items, primary_batches, prepared, strict=True
+        ):
+            _resized, enlarged_bboxes, crop_shapes, pad_offsets, resize_shapes = metadata
+            if self._denoise_step is DenoiseStep.AFTER_PRIMARY:
+                primary_raw = self._apply_denoise(primary_raw)
+            results.append(
+                PrimaryRestoreResult(
+                    track_id=item.clip.track_id,
+                    start_frame=item.clip.start_frame,
+                    frame_count=len(item.raw_crops),
+                    frame_shape=item.frame_shape,
+                    frame_device=item.raw_crops[0].crop.device,
+                    masks=item.clip.masks,
+                    primary_raw=primary_raw,
+                    keep_start=item.keep_start,
+                    keep_end=item.keep_end,
+                    crossfade_weights=item.crossfade_weights,
+                    enlarged_bboxes=enlarged_bboxes,
+                    crop_shapes=crop_shapes,
+                    pad_offsets=pad_offsets,
+                    resize_shapes=resize_shapes,
+                )
+            )
+        return results
 
     def build_secondary_result(
         self,

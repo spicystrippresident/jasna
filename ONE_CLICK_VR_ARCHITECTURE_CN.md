@@ -161,6 +161,29 @@ JSON/CSV 默认写入
 `12.0%` 墙钟下降不能归因于 O1。下一次整片必须使用同一当前码控基线；此前不重跑，
 F 盘分层矩阵和 Main 10 继续延期。
 
+第二轮 O6--O11 已完成生产候选收口：
+
+1. AMD detector 预处理使用 ROCm Triton 融合 kernel，第一次失败后永久回退 Torch；
+   真实 368 帧 RF-DETR 快 `6.25%`，检测、mask 和恢复任务完全一致。
+2. 一键 VR 不拥有 detector registry。GUI 全局选择、逐视频 segment、扫描缓存和 render
+   共用 Jasna registry；当前 AMD 已安装 `rfdetr-vr-v1`、`rfdetr-v6`、
+   `lada-yolo-v4`。
+3. RF-DETR compile/TorchScript 和 BasicVSR++ 局部 compile/HIP Graph 均未进入生产。
+   前者编译失败或慢约 69 倍；后者虽有 `18.5--22.0%` steady-state 收益，但动态 clip
+   长度持续触发编译，HIP Graph 结果错误，compile 输出最低仅 `64.2dB`，继续使用 eager。
+4. AMD BasicVSR++ 支持独立 clip batch 2，但调度器只合并相邻、同长度且至少 60 帧的
+   clip。短片、异长片和 NVIDIA 路径保持原样；OOM 自动逐片重试。真实长窗口算子上限
+   快 `38.5%`，真实短窗口反而慢 `16.3%`，因此 60 帧门槛属于正确性之外的性能契约。
+5. FP16 继续默认。FP32 使用同一 checkpoint，在 T=60/90 慢 `2.6--3.3%`，没有
+   ground-truth 证据支持用速度换精度。batch 4 曾触发 `98C` 后的 Data Fabric/MCE
+   异常重启，生产上限固定为 2，基准脚本必须带结温保护。
+6. 默认 AMD blend mask 已是逐值等价且比 NVIDIA conv 快 `23.7--26.3%` 的 prefix-sum
+   路径；默认关闭的 denoise/LUT/secondary/sharpen 不为平台对称而移植。
+7. rocDecode 在旧流水线中只能暴露约整片 `7.27%` 的 restore 等待余量；条件 batch 2
+   预计让恢复工作再降约 `24%` 后，decode+detect 会成为下一瓶颈。因此 backend 从延期
+   改为独立后续任务，但在 PyAV 原始 time-base、C++/HIP surface 生命周期和 GPU
+   NV12/P010→RGB 全部完成前，不进入 `NvidiaVideoReader` 的生产路由。
+
 ## 上游同步纪律
 
 官方远端只作为 `upstream`。以后创建个人 GitHub fork 后将其添加为 `origin`。同步前保持工作树可恢复，并先运行定向测试：
@@ -181,7 +204,7 @@ git rebase upstream/main
 ## 当前验证
 
 - 内核：`6.17.0-41-generic`。
-- 完整测试集：`1889 passed, 119 skipped, 0 failed`。
+- 完整测试集：`1901 passed, 119 skipped, 0 failed`。
 - E2E：`6 passed, 17 skipped`；元数据、解码和检测在 AMD 上执行，NVENC/RTX/完整
   编码 E2E 明确按 NVIDIA 平台跳过。
 - 新增/修改 Python 文件和测试通过 `compileall`，`git diff --check` 通过。
