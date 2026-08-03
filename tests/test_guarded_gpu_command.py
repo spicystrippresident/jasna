@@ -115,3 +115,35 @@ def test_guard_stops_child_after_sensor_failures(tmp_path: Path) -> None:
     result = json.loads(report.read_text(encoding="utf-8"))
     assert result["status"] == "sensor-failure"
     assert result["return_code"] < 0
+
+
+def test_guard_stops_at_sustained_thermal_limit(tmp_path: Path) -> None:
+    sensor = tmp_path / "temp_input"
+    sensor.write_text("59000\n", encoding="ascii")
+    report = tmp_path / "report.json"
+    command = _guard_command(tmp_path, sensor, report) + [
+        "--max-junction-c",
+        "90",
+        "--sustained-junction-c",
+        "80",
+        "--sustained-seconds",
+        "0.05",
+        "--poll-interval",
+        "0.01",
+        "--",
+        sys.executable,
+        "-c",
+        (
+            "from pathlib import Path; import sys, time; "
+            "Path(sys.argv[1]).write_text('81000\\n'); time.sleep(30)"
+        ),
+        str(sensor),
+    ]
+
+    completed = subprocess.run(command, capture_output=True, text=True, timeout=5)
+
+    assert completed.returncode != 0
+    result = json.loads(report.read_text(encoding="utf-8"))
+    assert result["status"] == "thermal-stop"
+    assert result["thermal_trigger"] == "sustained-limit"
+    assert result["peak_junction_c"] == 81.0

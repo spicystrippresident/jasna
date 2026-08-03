@@ -102,9 +102,8 @@ Jasna GUI 队列
 ## 尚未完成
 
 - rocDecode `1.7.0` backend 已实现并在 Linux AMD 上对至少 3000 万像素的 HEVC/AV1
-  自动启用；本轮只做 8/10-bit 62 帧、AV1 60 帧和 seek/stride 短验收，尚未运行整片
-  E2E。系统必须安装与当前 ROCm 匹配的 `rocdecode-dev`；不可用时自动回退，不影响
-  原 AMF/software 路径。完整视频只在全部优化提交后由用户另行批准。
+  自动启用，已通过 183 秒和 34:23 8K HEVC Main 真实 E2E。系统必须安装与当前 ROCm
+  匹配的 `rocdecode-dev`；不可用时自动回退，不影响原 AMF/software 路径。
 - Windows AMD smart-render 尚未验收，继续保持严格保护；Linux AMD 的 AV1 8-bit
   和 Main 10 sparse smart-render 已通过，不再属于未完成项。
 - 8-bit HEVC 整部长片已通过，产品完整流程已经成立。有效马赛克 HEVC Main 10
@@ -193,6 +192,32 @@ F 盘分层矩阵和 Main 10 继续延期。
    改为独立后续任务，但在 PyAV 原始 time-base、C++/HIP surface 生命周期和 GPU
    NV12/P010→RGB 全部完成前，不进入 `NvidiaVideoReader` 的生产路由。
 
+最终真实验收已在提交 `65a5dea` 的核心代码上完成。183.13 秒 8K HEVC Main 窗口从
+全新工作区运行，使用 rocDecode、RF-DETR v6、FP16、detector batch 4 和生产恢复
+调度；在临时 283W 功耗限制下墙钟 `560.356s`，随后功耗墙恢复并确认是 `315W`。
+输出保持 `10977/10977` 视频包和 `8585/8585` 音频包，`3296/3296` 个 copy VCL
+payload 全同，`7681/7681` 个 render VCL payload 全部变化，音频 payload 逐包全同；
+独立 AMF 全片硬解为 `10977` 帧、`93.6 fps`、`dup=0/drop=0`。相对旧
+`1198.662s` 证据的实际墙钟下降 `53.25%`，但功耗条件不同，只能作为最终路径吞吐
+证据，不能当成单项优化 A/B。
+
+34:23 整片随后在原始 `315W` 功耗墙下走真实 GUI `Processor` 一键 VR 路径，复用
+签名一致的 44 段扫描证据，墙钟 `6063.103s`。输出保持 `123669/123669` 视频包和
+`96716/96716` 音频包，`45852/45852` 个 copy VCL payload 全同，`77817/77817`
+个 render VCL payload 全部变化，所有音频 payload 全同；视频 PTS 最大偏差仅一个
+输出 time-base tick（`11.1us`）。独立 AMF 硬解 `123669` 帧，墙钟 `1321.986s`、
+`93.56 fps`、`dup=0/drop=0`。处理期 CPU 中位 `216.7%`、系统 CPU 中位 `16.7%`、
+GPU gfx/media 中位 `92%/79%`、显存中位/峰值 `23.14/23.82 GiB`、功耗中位
+`281W`、hotspot 中位/峰值 `84/95C`。独立 watchdog 使用 `105C` 单点硬停和 `100C`
+连续 10 秒停止策略，整片未触发；零 offload、OOM、fallback、MCE、GPU reset、ring
+timeout 或 hardware error。两条进程退出时的 amdgpu VM memory stats 消息属于资源
+清理提示，没有 reset 或任务失败。
+
+该整片比上一次 `10455.988s` 完整运行少 `42.01%` 墙钟，但旧输出为
+`47.556 Mbps`、本次为当前源码率绑定的 `26.253 Mbps`，编码负载不可比；本片恢复
+调度还记录 `batched_invocations=0`。因此 `6063.103s` 是当前生产候选的新基线，不把
+表面 `1.725x` 倍率归因于 rocDecode、O9 或任一单独改动。
+
 ## 上游同步纪律
 
 官方远端只作为 `upstream`。以后创建个人 GitHub fork 后将其添加为 `origin`。同步前保持工作树可恢复，并先运行定向测试：
@@ -270,6 +295,10 @@ git rebase upstream/main
   中位 `67%/44%`、VRAM 中位/峰值 17.44/18.25 GiB、hotspot 峰值 `85C`，零运行错误。
   该运行跨越 `b4033ed` 码控修复，输出从 27.583 升至 47.556 Mbps，因此只作为完整
   稳定性和资源证据，不进入正式性能排名。
+- 最终生产候选同片运行墙钟 `6063.103s`，当前源码率绑定后输出视频码率
+  `26.253 Mbps`、文件 `6,841,082,840` bytes；完整媒体保真、AMF 硬解和资源证据位于
+  `/media/latiao/D/AI/lada/jasna_benchmarks/o14_full_final_65a5dea_20260804/`。该结果作为
+  后续同码控 A/B 的当前基线，不与上条 47.556 Mbps 输出做单项优化归因。
 - O1 检测等价性报告位于
   `/media/latiao/D/AI/lada/jasna_benchmarks/o1_detection_equivalence_20260804/`；368 帧
   与 1200 帧窗口的 restoration items 均完全一致，合批推理快 `6.78%/7.55%`。

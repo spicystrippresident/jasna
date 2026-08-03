@@ -245,9 +245,10 @@ T=16 稳态外部峰值 `89C`、程序末端 `90C`，无 MCE/GPU reset/ring time
   自动启用。小分辨率 H.264 和 2K AV1 正确性通过但固定初始化成本更慢，H.264/VP9
   和所有小视频继续使用 Jasna 原 reader。系统需安装与当前 ROCm 匹配的
   `rocdecode-dev`；缺失或运行异常时永久回退。
-- 本轮未跑 183 秒、34 分钟整片或 Main 10 长片。短验收报告位于
-  `/media/latiao/D/AI/lada/jasna_benchmarks/o10_rocdecode_20260804/`；完整当前码控
-  E2E A/B 仍必须等待全部优化提交后由用户明确批准。
+- 183 秒和 34:23 8-bit 整片最终 E2E 已通过；Main 10 长片与 F 盘多素材长期矩阵
+  继续延期。rocDecode 短验收位于
+  `/media/latiao/D/AI/lada/jasna_benchmarks/o10_rocdecode_20260804/`，最终整片证据位于
+  `/media/latiao/D/AI/lada/jasna_benchmarks/o14_full_final_65a5dea_20260804/`。
 - Windows AMD smart-render 尚未验收，继续明确拒绝。8-bit 整部真实长片已经完成；
   Main 10 整片按当前执行策略延期，不是开始性能优化的前置门槛。编译后端已完成
   可用性评估，没有优于 eager 的可部署项。
@@ -377,7 +378,7 @@ T=16 稳态外部峰值 `89C`、程序末端 `90C`，无 MCE/GPU reset/ring time
 - Linux AMD H.264/HEVC AMF sparse 真机 E2E 已完成；Windows AMD 和 AV1 不在
   本阶段验收范围，AV1 后续在 P4 独立完成。
 
-### P4：性能与长期稳定性（第一轮优化已收口，可比整片 A/B 待建立）
+### P4：性能与长期稳定性（生产候选整片已通过）
 
 - 已完成 detector/BasicVSR++ session 常驻和 8/10-bit 批量连续任务真机验收。
 - 已完成 Linux AMD AV1 8-bit/Main 10 sparse smart-render 正样本、码控、copy-span
@@ -399,6 +400,13 @@ T=16 稳态外部峰值 `89C`、程序末端 `90C`，无 MCE/GPU reset/ring time
   183 秒验收后撤除，O4/O5 因解码/编码边界不具备等价收益而不实现。O1 后整片已经
   完成但因跨越码控提交只能作为稳定性证据；不得把被拒候选分别升级为整片测试，也不
   在建立相同当前码控基线前重跑完整 8-bit 或提前启动大量素材矩阵。
+- 最终 183 秒当前路径墙钟 `560.356s`，媒体/AMF 硬解全部通过；最终 34:23 一键 VR
+  `Processor` 墙钟 `6063.103s`，`123669/96716` 视频/音频包、copy/render VCL、逐包
+  音频和 PTS 均通过，AMF 解码 `93.56 fps`、`dup=0/drop=0`。整片在 315W 下 hotspot
+  峰值 `95C`，显存峰值 `23.82 GiB`，未触发 `105C` 单点或 `100C` 连续 10 秒保护，
+  零 offload、OOM、fallback 或 GPU reset。
+  上一次完整运行输出码率为 `47.556 Mbps`，本次为 `26.253 Mbps`，所以表面
+  `42.01%` 墙钟下降只作为实际用户路径结果；本次数据是后续同码控比较的新基线。
 
 ## 测试素材矩阵
 

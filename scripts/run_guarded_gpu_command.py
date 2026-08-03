@@ -78,6 +78,8 @@ def main() -> None:
     parser.add_argument(
         "--max-junction-c", type=float, default=DEFAULT_MAX_JUNCTION_C
     )
+    parser.add_argument("--sustained-junction-c", type=float)
+    parser.add_argument("--sustained-seconds", type=float, default=1.0)
     parser.add_argument("--start-max-junction-c", type=float, default=60.0)
     parser.add_argument("--cooldown-timeout", type=float, default=600.0)
     parser.add_argument("--timeout", type=float, default=45.0)
@@ -92,6 +94,16 @@ def main() -> None:
         raise SystemExit("a command is required after --")
     if args.max_junction_c <= args.start_max_junction_c:
         raise SystemExit("max junction must be above the start temperature limit")
+    if args.sustained_junction_c is not None and not (
+        args.start_max_junction_c
+        < args.sustained_junction_c
+        < args.max_junction_c
+    ):
+        raise SystemExit(
+            "sustained junction must be between the start and hard limits"
+        )
+    if args.sustained_seconds <= 0:
+        raise SystemExit("--sustained-seconds must be positive")
     if args.timeout <= 0 or args.poll_interval <= 0:
         raise SystemExit("timeout and poll interval must be positive")
 
@@ -111,6 +123,8 @@ def main() -> None:
     samples = 0
     sensor_failures = 0
     stop_reason = None
+    thermal_trigger = None
+    sustained_started = None
     process = None
     with args.log.open("wb") as log_file, args.telemetry.open(
         "w", encoding="utf-8", buffering=1
@@ -161,8 +175,25 @@ def main() -> None:
                 )
                 if temperature >= args.max_junction_c:
                     stop_reason = "thermal-stop"
+                    thermal_trigger = "hard-limit"
                     _terminate_group(process)
                     break
+                if (
+                    args.sustained_junction_c is not None
+                    and temperature >= args.sustained_junction_c
+                ):
+                    if sustained_started is None:
+                        sustained_started = time.monotonic()
+                    elif (
+                        time.monotonic() - sustained_started
+                        >= args.sustained_seconds
+                    ):
+                        stop_reason = "thermal-stop"
+                        thermal_trigger = "sustained-limit"
+                        _terminate_group(process)
+                        break
+                else:
+                    sustained_started = None
                 time.sleep(args.poll_interval)
         except BaseException:
             _terminate_group(process)
@@ -181,6 +212,9 @@ def main() -> None:
         "initial_junction_c": initial_temperature,
         "peak_junction_c": peak_temperature,
         "max_junction_c": args.max_junction_c,
+        "sustained_junction_c": args.sustained_junction_c,
+        "sustained_seconds": args.sustained_seconds,
+        "thermal_trigger": thermal_trigger,
         "samples": samples,
         "log": str(args.log.resolve()),
         "telemetry": str(args.telemetry.resolve()),
