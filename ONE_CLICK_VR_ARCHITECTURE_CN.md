@@ -63,9 +63,12 @@ Jasna GUI 队列
 - `jasna/session_factory.py`：`RestorationSession` 持有并按完整检测契约复用 detector，
   与 BasicVSR++ 一起在连续视频完成后统一释放。
 - `jasna/os_utils.py`：源码模式优先使用项目内 FFmpeg/FFprobe 8。
-- `jasna/media/video_decoder.py`、`video_encoder.py`：Linux AMD 的 AMF 8-bit 解码、
-  P010/AV1 软件解码路由、H.264/HEVC/AV1 fragment 参数映射和源码率上限边界。
-  8K HEVC 低频扫描允许更快的软件解码，正式 render 管线继续使用稳定的 AMF reader；
+- `jasna/media/video_decoder.py`、`rocdecode.py`、`rocdecode_bridge.cpp`、`video_encoder.py`：
+  Linux AMD 大分辨率 HEVC/AV1 使用 PyAV 保留原始 packet PTS/time-base，再由
+  rocDecode 输出内部 GPU surface；surface 在释放前 D2D 拷入 Torch 自有 NV12/P010
+  张量并复用 Jasna YUV→RGB。构建、初始化或运行失败后永久回退原 AMF/software
+  reader；低于 3000 万像素及 H.264/VP9 不自动切换。编码侧继续负责
+  H.264/HEVC/AV1 fragment 参数映射和源码率上限边界。
   自动 HEVC 源码率上限使用 `vbr_peak + preanalysis=0` 并绑定 codec target bitrate；
   encoder 打开时记录最终 backend、frame format、target bitrate 和完整 options。
 - `jasna/mosaic/rfdetr.py`、`jasna/vr180.py`：Linux AMD RF-DETR 的 SBS 左右眼共用一次
@@ -76,6 +79,8 @@ Jasna GUI 队列
 - `scripts/compare_sbs_detection_paths.py`：同一批真实解码帧依次运行逐眼和合批 RF-DETR，
   比较逐帧框、mask、检测数、生产参数 ClipTracker 结果、耗时与完整 CPU/GPU 资源。
   源片只读，JSON 证据只写指定的 D 盘目录。
+- `scripts/compare_rocdecode_paths.py`：两个 backend 独立计时后再逐批核对全部 PTS/RGB；
+  采集 CPU、gfx/VCN、显存、功耗和 hotspot，零帧、帧数差、像素差或 85C 均失败。
 - `jasna/license_api.py`：私有 protection 子模块存在时原样转发；公开源码中让免费
   GUI/模型正常运行，并明确拒绝不可用的 supporter 激活。
 - `tests/test_one_click_vr.py`：规划、扫描适配、停止、无命中和 Processor 调度测试。
@@ -96,10 +101,10 @@ Jasna GUI 队列
 
 ## 尚未完成
 
-- rocDecode `1.7.0` 的 8/10-bit 帧数、PTS、像素和原始吞吐已经验证，但 Jasna 原生
-  backend 尚未实现。剩余边界是保留原始 time-base 的 demux、C++/HIP 生命周期和
-  NV12/P010 GPU surface 到 Torch RGB 的零回读转换；在真实 E2E 证明总墙钟收益前，
-  不替换当前稳定的 AMF/software decode 路由。
+- rocDecode `1.7.0` backend 已实现并在 Linux AMD 上对至少 3000 万像素的 HEVC/AV1
+  自动启用；本轮只做 8/10-bit 62 帧、AV1 60 帧和 seek/stride 短验收，尚未运行整片
+  E2E。系统必须安装与当前 ROCm 匹配的 `rocdecode-dev`；不可用时自动回退，不影响
+  原 AMF/software 路径。完整视频只在全部优化提交后由用户另行批准。
 - Windows AMD smart-render 尚未验收，继续保持严格保护；Linux AMD 的 AV1 8-bit
   和 Main 10 sparse smart-render 已通过，不再属于未完成项。
 - 8-bit HEVC 整部长片已通过，产品完整流程已经成立。有效马赛克 HEVC Main 10
@@ -204,7 +209,7 @@ git rebase upstream/main
 ## 当前验证
 
 - 内核：`6.17.0-41-generic`。
-- 完整测试集：`1901 passed, 119 skipped, 0 failed`。
+- 完整测试集：`1911 passed, 119 skipped, 0 failed`。
 - E2E：`6 passed, 17 skipped`；元数据、解码和检测在 AMD 上执行，NVENC/RTX/完整
   编码 E2E 明确按 NVIDIA 平台跳过。
 - 新增/修改 Python 文件和测试通过 `compileall`，`git diff --check` 通过。
@@ -235,10 +240,11 @@ git rebase upstream/main
 - AV1 8-bit/Main 10 sparse E2E 分别为 `104.03s/97.37s`；copy spans 逐帧 MD5
   全同、render span 的 300 帧全部变化，AMF 全片硬解约 `88.1 fps`。Main 10 输出
   `16.60 Mbps`，与 `16.75 Mbps` 源码率一致。
-- rocDecode device-memory 评估在 8/10-bit 上均输出 `1202/1202` 帧，最高
-  `88.3 fps`；完整 8-bit 像素 MD5 和 Main 10 前 60 帧 MD5 与软件参考一致。
-  官方 copied-buffer helper 的槽位 PTS 刷新缺陷已在隔离评估副本中确认和修正，
-  不属于 rocDecode 核心时间戳丢失。
+- rocDecode 原始 device-memory 评估在 8/10-bit 上均输出 `1202/1202` 帧，最高
+  `88.3 fps`。正式 Jasna RGB 路径的 8-bit HEVC 62 帧为 `61.20 fps`，对 AMF
+  `23.03 fps` 快 `62.37%`；10-bit HEVC 为 `57.80 vs 14.79 fps`，快 `74.41%`；
+  8-bit 8K AV1 为 `65.88 vs 34.99 fps`，快 `46.89%`。三组全部 PTS/RGB 逐值相等，
+  seek+stride 8 帧也逐值相等。小分辨率 H.264/AV1 因初始化成本不自动启用。
 - BasicVSR++ FP16 eager 为当前生产路径。TorchInductor/Triton fullgraph 首次编译
   10 分钟未完成，MIGraphX T=4 smoke 在 180 秒内未完成；两者均不静默回退，也没有
   得到优于 eager 的可部署结果。
@@ -255,4 +261,4 @@ git rebase upstream/main
 - O1 检测等价性报告位于
   `/media/latiao/D/AI/lada/jasna_benchmarks/o1_detection_equivalence_20260804/`；368 帧
   与 1200 帧窗口的 restoration items 均完全一致，合批推理快 `6.78%/7.55%`。
-- 当前完整回归 `1889 passed, 119 skipped`；对应功能基线提交为 `b4033ed`。
+- O1 功能基线提交为 `b4033ed`；当前完整回归见本节顶部，不再用历史测试数冒充现状。

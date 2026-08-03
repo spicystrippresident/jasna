@@ -195,9 +195,9 @@ first packet fails unreliably. AV1 has a separate measured guard: PyAV AMF
 decodes the 8K 8-bit source at only 11.8 fps while consuming about 7.2 GiB VRAM,
 versus 39.9 fps and about 3.7 GiB for libdav1d plus ROCm upload. Direct FFmpeg
 AMF GPU-surface decode reaches 88.1 fps with the media engine at 100%, so the
-hardware is not the blocker; the PyAV surface transfer is. Linux AV1 therefore
-uses the measured faster software path until a direct rocDecode backend passes
-frame-count, PTS, depth, GPU-surface conversion and performance acceptance.
+hardware is not the blocker; the PyAV surface transfer is. Large Linux AV1 now
+uses the accepted rocDecode route documented below; small AV1 retains the
+measured faster software fallback because rocDecode initialization dominates.
 
 rocDecode 1.7 device-memory evaluation output all 1202 frames of both the 8-bit
 and Main 10 sources at up to 88.3 fps. The complete 8-bit decoded-pixel MD5
@@ -375,11 +375,39 @@ change: the earlier run used QVBR while the later run used stable
 47.556 Mbps. A future whole-title comparison requires the same current
 rate-control policy on both sides.
 
+## Native rocDecode reader for large AMD inputs
+
+Linux AMD now keeps container demux and integer packet timestamps in PyAV while
+feeding H.264/HEVC Annex B or AV1 packets to a minimal rocDecode 1.7 C++ bridge.
+The bridge never lends an internal decoder surface to Python: it copies luma and
+chroma device-to-device into Torch-owned packed NV12/P010 memory, releases the
+surface, and then uses Jasna's existing YUV-to-RGB conversion. Build,
+initialization or runtime failure disables the candidate for that reader and
+resumes through the established AMF/software path.
+
+Automatic selection is deliberately limited to Linux AMD HEVC/AV1 inputs with
+at least 30 million pixels. A 640x360 H.264 and 2048x1024 AV1 sample were pixel
+correct but slower because initialization dominated, so small inputs, H.264 and
+VP9 retain their existing backend. The explicit `rocdecode` benchmark toggle
+remains available for bounded codec evaluation.
+
+On the RX 7900 XTX, 62-frame 8192x4096 HEVC Main output ran at 61.20 fps versus
+23.03 fps through PyAV AMF, a 62.37% wall-time reduction; Main 10 ran at 57.80
+fps versus 14.79 fps through software decode, a 74.41% reduction. Sixty 8K AV1
+frames ran at 65.88 versus 34.99 fps, 46.89% faster. Every compared RGB value
+and PTS matched, including an eight-frame seek/stride case. Peak junction
+temperature across accepted runs was 79 C. No whole-title video was run.
+
+Sparse stride decoding releases unselected rocDecode surfaces without copying
+them into Torch. On the 62-frame 8K HEVC sample, stride 60 preserved the two
+selected PTS/RGB frames and took 0.925 seconds versus 1.434 seconds through the
+software path.
+
 ## Current source-tree verification
 
 On kernel `6.17.0-41-generic`, RX 7900 XTX and ROCm 7.2.1:
 
-- complete suite: `1889 passed, 119 skipped, 0 failed`;
+- complete suite: `1911 passed, 119 skipped, 0 failed`;
 - E2E suite: `6 passed, 17 skipped`;
 - `python -m compileall -q jasna tests scripts` and `git diff --check`: passed;
 - every entry in `RUNTIME_ASSETS.sha256`: passed.
@@ -401,6 +429,5 @@ The complete 34:23 title then passed the whole-title acceptance above, including
 payloads for every copy span.
 
 The skips correspond to inapplicable TensorRT, protected-model, NVENC/NVDEC,
-RTX and TVAI paths. Remaining work is native rocDecode GPU-surface integration,
-Windows AMD smart rendering, and Main 10 plus broader-source whole-title testing;
-none is reported as complete.
+RTX and TVAI paths. Remaining work is Windows AMD smart rendering and Main 10
+plus broader-source whole-title testing; neither is reported as complete.
