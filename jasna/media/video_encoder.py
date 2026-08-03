@@ -696,6 +696,14 @@ class NvidiaVideoEncoder:
             "rate": self.output_fps,
             "options": dict(self.encoder_options),
         }
+        logger.info(
+            "Opening encoder %s for %s (frame_format=%s, target_bit_rate=%s, options=%s)",
+            self.encoder_name,
+            self.output_path,
+            self.spec.frame_format,
+            self._target_bit_rate,
+            dict(sorted(self.encoder_options.items())),
+        )
         if self.vendor is AcceleratorVendor.AMD and not self.software_reference:
             stream_kwargs["hwaccel"] = HWAccel(
                 "amf",

@@ -353,11 +353,33 @@ segmentation fault or sustained memory growth. The successful version-2
 workspace cleaned itself; after packet-level validation, the invalidated
 version-1 high-bitrate workspace was removed to reclaim disk space.
 
+## AMD SBS detector batching
+
+Linux AMD RF-DETR now combines the left and right SBS eyes into one dynamic
+inference batch, then splits the detections back into Jasna's existing per-eye
+tracking and restoration flow. An allocation failure disables batching for the
+rest of that detector session and retries through the original per-eye path;
+NVIDIA and TensorRT behavior is unchanged.
+
+On 368 real frames the batched path preserved all 129 detections and seven
+restoration items, with a maximum box drift of 0.0913 pixels and one differing
+mask pixel. A separate 1200-frame window preserved all 34 restoration items;
+five frames had a detection-count difference, with 30 differing mask pixels in
+total. This is FP16 batch-shape drift rather than bitwise equivalence, while the
+measured tracking/restoration semantics remained the same. Detector wall time
+improved by 6.78% and 7.55% on the two windows.
+
+The apparent 12.0% whole-title wall-time improvement is not attributed to this
+change: the earlier run used QVBR while the later run used stable
+`vbr_peak + preanalysis=0`, and their output video bitrates were 27.583 and
+47.556 Mbps. A future whole-title comparison requires the same current
+rate-control policy on both sides.
+
 ## Current source-tree verification
 
 On kernel `6.17.0-41-generic`, RX 7900 XTX and ROCm 7.2.1:
 
-- complete suite: `1863 passed, 119 skipped, 0 failed`;
+- complete suite: `1889 passed, 119 skipped, 0 failed`;
 - E2E suite: `6 passed, 17 skipped`;
 - `python -m compileall -q jasna tests scripts` and `git diff --check`: passed;
 - every entry in `RUNTIME_ASSETS.sha256`: passed.

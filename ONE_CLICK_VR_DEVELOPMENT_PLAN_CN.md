@@ -1,6 +1,6 @@
 # Jasna One-click VR 开发路线与功能确认
 
-日期：2026-08-02
+日期：2026-08-04
 
 ## 已确认的产品定义
 
@@ -47,6 +47,65 @@
 | HEVC 边界处理 | 先用 Jasna；真实失败后才移植具体 guard | 避免复制旧项目复杂桥接状态机 |
 | 批量与停止 | Jasna 队列 | 不建立第二套 batch/controller |
 | 性能优化 | 先优化 Jasna session/pipeline | 同性能优先 Jasna；新后端必须有 A/B 数据 |
+
+## 当前执行策略与第一轮结果
+
+8-bit 一键 VR 已完成 GUI、自动扫描、投影、smart-render、停止/恢复、整片 mux、
+音视频/PTS/VCL 保真、资源监控和全片硬解，当前不存在必须先补做的流程测试。用户已于
+2026-08-03 批准开始优化，O1--O5 第一轮现已完成实现、证据分析和候选收口；只保留
+画面结果等价且有明确收益的 O1，O2/O4/O5 不为完成计划而强行改变 Jasna 语义，O3
+实验代码因未达到性能和资源门槛已经撤除。
+
+34:23 长片的现有证据已足够确定第一轮方向。最终大 render span 的累计计时中，
+两个 decode reader 分别约 `4046--4742s`，detect-track 约 `5962s`，restore 约
+`6770s`，blend 约 `1103s`，write/encode 约 `1176s`。这些线程有重叠，不能把数字
+直接相加，但排序足以说明第一轮不应先投入 AMF 码控或新编译后端。
+
+优化按批次集中实施，不在每个小改动后启动真实视频测试：
+
+| 批次 | 集中修改范围 | 不改变的契约 | 批次结束后的唯一验收 |
+| --- | --- | --- | --- |
+| O1：检测与调度 | SBS 左右眼合批推理、消除重复预处理/临时分配、检查 detect/restore 队列和 GPU 调度空洞 | 模型、阈值、tracker、投影和检测质量不变；允许不改变 track 结果的 FP16 批形状数值漂移 | 定向单测 + 真实连续窗口检测/track A/B |
+| O2：恢复工作量 | 统计并减少短 track/clip 碎片和 temporal overlap 重复恢复；只合并语义与边界完全兼容的任务 | Jasna BasicVSR++、mask、crossfade、最大 clip 和画面结果不变 | 183 秒 8-bit 窗口一次，比较逐帧结果、阶段墙钟和资源 |
+| O3：重复解码 | 评估带硬内存上限的单次解码 original-frame 交接；只有实测优于双 reader 且不增加 offload/失稳才保留 | PTS、原始帧精度、停止/恢复、显存/RAM 上限和稳定回退 | 与 O2 合并做一次 183 秒阶段验收，不单独跑长片 |
+| O4：冷扫描 | 使用 keyframe-aware sparse seek/抽样减少未选帧解码；继续复用同一 detector 和 scan cache | 采样时间、分数、mask、区间和投影证据一致 | 分层短窗口 scan A/B 一次 |
+| O5：阶段收口 | 仅在前四批完成后分析 blend/encode；rocDecode 只有预测总墙钟收益明确时才进入正式 backend | 不以单项吞吐替代 E2E 收益 | 一次完整 8-bit 真实 A/B，然后才扩大素材矩阵 |
+
+第一轮实际结论：
+
+- O1 已保留：Linux AMD RF-DETR 将 SBS 左右眼放入一次 dynamic inference；OOM 时永久
+  回退到原有逐眼推理，NVIDIA/TensorRT 路径不变。早期固定批次中位从 `0.1190s`
+  降到 `0.1045s`，快约 `12.2%`。后续真实连续帧严格 A/B 证明 FP16 在 batch 4/8
+  间存在微小数值漂移，但未改变已测窗口的 restoration item 数，详见下文。
+- O2 不修改核心：158 个真实检测帧形成 9 个 track，其中 1 个只有 1 帧并按现有
+  `min_detection_duration=2` 正确丢弃；两对长 track 中间各有 3 帧无检测，超过允许
+  跨越的 2 帧。强行合并会改变处理帧，复用 temporal overlap 输出又会改变
+  BasicVSR++ 双向时序上下文，因此没有画面完全等价的删减。
+- O3 已撤除：96 帧有界单 decode 交接在 183 秒 8K 验收中正确输出
+  `10977/10977` 视频帧和 `8585/8585` 音频包，AMF 全片解码 PTS 严格递增且
+  `dup=0/drop=0`；但墙钟 `1198.662s`，比双 reader 基线 `1193.108s` 慢
+  `5.554s`（`0.47%`），RAM/VRAM 峰值达到 `13372.7/14139 MiB`，不满足保留门槛。
+- O4 不实现逐样本 keyframe seek：该 HEVC 素材安全关键帧约每 `5.005s`，而 GUI
+  扫描间隔最多 `2s`、默认 `1s`。逐样本 seek 会重复解码同一 GOP，并改变分段 reader
+  的采样相位；当前顺序软件解码已经是保持相同采样时间和 detector 结果的合理路径。
+- O5 不引入新编码或 rocDecode backend：主 span 的 AMF media engine 已接近饱和，
+  编码 worker 也已有有界异步队列；并行 pinned-host 缓冲会扩大 AMF 输入生命周期风险，
+  关闭预分析或更改质量档会改变画质/码控。现有证据不支持以复杂度换取不可测收益。
+
+候选优化已经收口。O1 后的 34:23 SAVR-1058 运行已经完成，但旧基线结束于
+`b4033ed` 码控修复之前，因此两次不是相同编码设置，不能把墙钟差直接归因于 O1。
+下一次大型验收只有在同一当前 encoder/options/target bitrate 的基线已经建立后才运行；
+在此之前不重跑三小时整片，也不启动 Main 10 或 F 盘大矩阵。
+
+如果某批需要改变模型结果、tracking 语义、BasicVSR++ 核心或 smart-render 媒体契约，
+该改动必须从当前批次剥离，单独评审，不能借性能优化名义改变画质。每个批次可以进行
+语法检查和小型单测，但真实 GPU/视频验收只在批次结束运行一次；整片长测只在全部
+候选优化收口且 183 秒门槛通过后运行一次。
+
+HEVC Main 10 整片当前明确延期。已有 62 帧 HEVC Main 10、20 秒 AV1 Main 10、
+连续 8/10-bit session 和 sparse smart-render 证据足以守住现阶段位深契约。只有修改
+P010/10-bit 像素转换、codec 路由、rocDecode、时间基/mux，或准备发布候选版本时，
+才恢复 10-bit 定向或整片验收；普通 detector、tracker、恢复调度优化不触发它。
 
 ## 当前真实状态
 
@@ -115,12 +174,13 @@
 - Linux 10-bit H.264/HEVC 输入仍因 PyAV AMF P010 首包不可靠而在解包前选择软件
   解码。rocDecode 的帧数、PTS、8/10-bit 像素和原始吞吐已验证，尚缺正式 GPU
   surface 转换和真实 Jasna 墙钟验收，不能因为单项解码更快就直接替换现有链。
-- Windows AMD smart-render 尚未验收，继续明确拒绝。整部真实长片和 rocDecode
-  专用 backend 矩阵仍未完成；编译后端已完成可用性评估但没有优于 eager 的可部署项。
+- Windows AMD smart-render 尚未验收，继续明确拒绝。8-bit 整部真实长片已经完成；
+  Main 10 整片按当前执行策略延期，不是开始性能优化的前置门槛。rocDecode 专用
+  backend 也继续延期；编译后端已完成可用性评估但没有优于 eager 的可部署项。
 
 ### 当前验证证据
 
-- 完整测试集：`1863 passed, 119 skipped, 0 failed`；跳过项是当前 AMD 主机不适用或
+- 完整测试集：`1889 passed, 119 skipped, 0 failed`；跳过项是当前 AMD 主机不适用或
   缺少受保护资源的 TensorRT、NVENC/NVDEC、RTX、TVAI 等路径。
 - 独立 E2E：`6 passed, 17 skipped`；AMD 上执行元数据、解码和检测，NVIDIA 专用项
   按平台声明跳过。
@@ -176,6 +236,21 @@
 - 整片渲染期间进程 CPU、GPU gfx/media、显存和功耗中位分别为 `227.3%`、
   `61%/85%`、17.94 GiB、`153W`；显存峰值 19.44 GiB、hotspot 峰值 `86C`，无
   offload、GPU reset、VBV 错误、段错误或持续内存增长。
+- O1 后同源、同扫描缓存的完整运行墙钟为 `10455.988s`（约 2 小时 54 分），表面比
+  上述旧运行快 `12.0%`；RAM 中位/峰值 `10213.3/10406.0 MiB`，VRAM 中位/峰值
+  `17857.3/18687.3 MiB`，GPU gfx/media 中位 `67%/44%`，hotspot 峰值 `85C`，无
+  offload、reset、OOM 或运行错误。视频/音频包仍为 `123669/96716`。
+- 该 `12.0%` 不是正式 A/B：旧运行在 `b4033ed` 前使用 QVBR，新运行使用稳定的
+  `vbr_peak + preanalysis=0`。新旧视频码率为 `47.556/27.583 Mbps`，文件大小为
+  `12,335,034,970/7,184,192,769` bytes，write/media 关键路径已被改变。当前 encoder
+  会在每次打开时记录 encoder、frame format、target bitrate 和完整 options，后续
+  benchmark 必须把该日志作为可比性前置证据。
+- 新旧整片 restoration clips 为 `2677/2632`。前 21 个较短 render span 中 20 个完全
+  一致，1 个 600 帧 span 仅多 1 个；其余 45 个来自最后 63733 帧的大 span。真实
+  368 帧 A/B 为 `129/129` 个检测、`7/7` 个 restoration items，框最大差 `0.0913`
+  像素、全部 mask 只差 1 像素；1500 秒处的 1200 帧窗口为 `2360/2361` 个检测、
+  `34/34` 个 items，5 帧数量不同、mask 共差 30 像素。两窗合批分别快 `6.78%/7.55%`，
+  资源峰值不超过 3.03 GiB RAM、9.60 GiB VRAM 和 `84C`。
 - 同一 Processor 连续处理 8-bit 和 10-bit 两个 8K 62 帧任务耗时 `27.283s`；
   detector 构建 1 次、Pipeline 自建 0 次，BasicVSR++ 加载/卸载各 1 次。输出分别
   保持 HEVC Main 8-bit 和 Main 10，均为 `62/62` 帧并完整解码。
@@ -228,7 +303,7 @@
 - Linux AMD H.264/HEVC AMF sparse 真机 E2E 已完成；Windows AMD 和 AV1 不在
   本阶段验收范围，AV1 后续在 P4 独立完成。
 
-### P4：性能与长期稳定性（部分完成）
+### P4：性能与长期稳定性（第一轮优化已收口，可比整片 A/B 待建立）
 
 - 已完成 detector/BasicVSR++ session 常驻和 8/10-bit 批量连续任务真机验收。
 - 已完成 Linux AMD AV1 8-bit/Main 10 sparse smart-render 正样本、码控、copy-span
@@ -245,7 +320,11 @@
   工作区算法同步升为 v2，旧码控生成的高码率片段不会被复用。
 - 已完成 183 秒真实长片窗口、停止/跨进程恢复和尾帧回归，并完成 34:23 的 8-bit
   整部长片渲染、音视频/PTS/VCL 保真、资源监控和 AMF 全片硬解；Main 10 与其他片源
-  的长期矩阵仍待后续验收。
+  的长期矩阵按当前策略延期。
+- O1--O5 第一轮已经收口：保留 SBS 合批，拒绝会改变恢复语义的 O2 合并，O3 在一次
+  183 秒验收后撤除，O4/O5 因解码/编码边界不具备等价收益而不实现。O1 后整片已经
+  完成但因跨越码控提交只能作为稳定性证据；不得把被拒候选分别升级为整片测试，也不
+  在建立相同当前码控基线前重跑完整 8-bit 或提前启动大量素材矩阵。
 
 ## 测试素材矩阵
 
@@ -262,10 +341,19 @@
 | 8-bit 长片 | `/media/latiao/D/AI/lada/lada_work/489155.com@SAVR-1058_1_8K_f04e1c233a/489155.com@SAVR-1058_1_8K.mp4` | HEVC Main，8192x4096，约 2063 秒，含 B 帧和音频 |
 | 10-bit 长片 | `/media/latiao/F/VR1/亚洲/骑兵/savr-1057/4k2.me@savr01057_1_8k.mp4` | HEVC Main 10，8192x4096，约 2292 秒，含 B 帧和音频 |
 | Raw/Fisheye 扩展集 | `/media/latiao/E`、`/media/latiao/F`、`/media/latiao/G`、`/media/latiao/H` | 多厂商完整 VR 源片，P4 长期矩阵再抽取固定窗口 |
+| 旧项目 A/B 原片 | `/media/latiao/F/VR1/亚洲/骑兵` | 只读；40 个源视频，当前按相同目录和精确 stem 可与旧成片组成 33 组 |
+| 旧项目 A/B 成片 | `/media/latiao/F/VR1/亚洲/转好的步兵` | 只读；比较旧项目画质、媒体完整性、日志墙钟和资源记录 |
 
 AV1 两份正样本来自同一个已确认有码的 10-bit SAVR-1057 窗口；8-bit 版本用于
 bit-depth 对照，10-bit 版本用于 Main 10 生产契约。HEVC 的 62 帧 10-bit 短样本仍只
-用于编解码契约，不替代上述 AV1 去码正样本。
+用于编解码契约，不替代上述 AV1 去码正样本。Main 10 长片保留为延期验收素材，不在
+O1--O4 优化阶段运行。
+
+F 盘两套 A/B 目录永远只读，新 Jasna 输出、manifest、截图和资源报告统一写入
+`/media/latiao/D/AI/lada/jasna_benchmarks/`。`scripts/build_legacy_vr_ab_manifest.py`
+负责精确配对和媒体/旧日志元数据采集。用户已经批准开始；当前先保留 manifest 和
+分层计划，不与可比基线建立争用磁盘和 CPU。正式大矩阵先用 manifest
+分层选择短/中/长、8/10-bit、低/中/高扫描覆盖率，不对 33 组全部直接跑整片。
 
 ## 上游同步纪律
 
