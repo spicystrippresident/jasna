@@ -24,6 +24,8 @@ if str(REPO_ROOT) not in sys.path:
 from jasna.restorer.basicvsrpp_mosaic_restorer import BasicvsrppMosaicRestorer
 from scripts.bench_memory import MemorySampler
 
+DEFAULT_MAX_JUNCTION_C = 92.0
+
 
 def _sync(device: torch.device) -> None:
     if device.type == "cuda":
@@ -61,7 +63,9 @@ def main() -> None:
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--telemetry-interval", type=float, default=0.25)
     parser.add_argument("--no-fp16", action="store_true")
-    parser.add_argument("--max-junction-c", type=float, default=90.0)
+    parser.add_argument(
+        "--max-junction-c", type=float, default=DEFAULT_MAX_JUNCTION_C
+    )
     args = parser.parse_args()
 
     checkpoint = args.checkpoint.resolve(strict=True)
@@ -101,6 +105,16 @@ def main() -> None:
                 for batch in args.batches:
                     values = base.expand(batch, -1, -1, -1, -1).contiguous()
                     case = {"clip_length": length, "batch_size": batch}
+                    print(
+                        json.dumps(
+                            {
+                                "event": "case-start",
+                                "clip_length": length,
+                                "batch_size": batch,
+                            }
+                        ),
+                        flush=True,
+                    )
                     temperature = _junction_temperature_c()
                     if (
                         temperature is not None
@@ -119,12 +133,24 @@ def main() -> None:
                         for _ in range(args.warmup):
                             _run_model(restorer, values)
                         _sync(device)
+                        print(
+                            json.dumps(
+                                {
+                                    "event": "warmup-complete",
+                                    "clip_length": length,
+                                    "batch_size": batch,
+                                    "junction_temperature_c": _junction_temperature_c(),
+                                }
+                            ),
+                            flush=True,
+                        )
                         torch.cuda.empty_cache()
                         allocated_before = torch.cuda.memory_allocated(device)
                         torch.cuda.reset_peak_memory_stats(device)
 
                         samples = []
                         result = None
+                        thermal_stop = False
                         for _ in range(args.repeats):
                             _sync(device)
                             started = time.perf_counter()
@@ -132,10 +158,23 @@ def main() -> None:
                             _sync(device)
                             samples.append(time.perf_counter() - started)
                             temperature = _junction_temperature_c()
+                            print(
+                                json.dumps(
+                                    {
+                                        "event": "repeat-complete",
+                                        "clip_length": length,
+                                        "batch_size": batch,
+                                        "seconds": samples[-1],
+                                        "junction_temperature_c": temperature,
+                                    }
+                                ),
+                                flush=True,
+                            )
                             if (
                                 temperature is not None
                                 and temperature >= args.max_junction_c
                             ):
+                                thermal_stop = True
                                 break
                         assert result is not None
                         peak_allocated = torch.cuda.max_memory_allocated(device)
@@ -164,7 +203,7 @@ def main() -> None:
                             )
                         case.update(
                             {
-                                "status": "ok",
+                                "status": "thermal-stop" if thermal_stop else "ok",
                                 "median_seconds": median,
                                 "samples_seconds": samples,
                                 "clips_per_second": batch / median,
@@ -212,6 +251,8 @@ def main() -> None:
     }
     output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(result, indent=2), flush=True)
+    if any(case.get("status") == "thermal-stop" for case in cases):
+        raise SystemExit("BasicVSR++ batch benchmark reached the thermal limit")
 
 
 if __name__ == "__main__":

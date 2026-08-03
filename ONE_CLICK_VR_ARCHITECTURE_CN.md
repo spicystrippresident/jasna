@@ -179,9 +179,13 @@ F 盘分层矩阵和 Main 10 继续延期。
 4. AMD BasicVSR++ 支持独立 clip batch 2，但调度器只合并相邻、同长度且至少 60 帧的
    clip。短片、异长片和 NVIDIA 路径保持原样；OOM 自动逐片重试。真实长窗口算子上限
    快 `38.5%`，真实短窗口反而慢 `16.3%`，因此 60 帧门槛属于正确性之外的性能契约。
+   batch 3 在 283W 的 T=60/90 稳态虽达到 batch 1 的 `2.71x/2.79x`，但 hotspot 都到
+   `92C`；正式 315W 的 T=90 在首个正式 repeat 内触发 `93C` 看门狗，不能固定启用。
 5. FP16 继续默认。FP32 使用同一 checkpoint，在 T=60/90 慢 `2.6--3.3%`，没有
    ground-truth 证据支持用速度换精度。batch 4 曾触发 `98C` 后的 Data Fabric/MCE
-   异常重启，生产上限固定为 2，基准脚本必须带结温保护。
+   异常重启；受控 T=16 稳态虽通过且比 batch 3 快约 `36%`，却不覆盖至少 60 帧的
+   生产调度条件。生产上限仍固定为 2，基准程序/独立看门狗使用 `92/93C` 双层结温保护，
+   明显低于本机 VBIOS 的 `110C` 降频和 `115C` 关机阈值。
 6. 默认 AMD blend mask 已是逐值等价且比 NVIDIA conv 快 `23.7--26.3%` 的 prefix-sum
    路径；默认关闭的 denoise/LUT/secondary/sharpen 不为平台对称而移植。
 7. rocDecode 在旧流水线中只能暴露约整片 `7.27%` 的 restore 等待余量；条件 batch 2
@@ -248,6 +252,14 @@ git rebase upstream/main
 - BasicVSR++ FP16 eager 为当前生产路径。TorchInductor/Triton fullgraph 首次编译
   10 分钟未完成，MIGraphX T=4 smoke 在 180 秒内未完成；两者均不静默回退，也没有
   得到优于 eager 的可部署结果。
+- 受控 batch 4、T=16 稳态为 `284.76 fps`，GPU 利用率/功耗峰值 `100%/282W`，
+  外部 hotspot 峰值 `89C`、程序末端 `90C`；batch 1/4 的 uint8 最大差为 3，和同形状
+  batch 3 一致。内核没有 MCE、GPU reset 或 ring timeout，脚本退出后功耗上限从临时
+  283W 恢复为原始 315W。该证据只证明短形状保护有效，不改变生产 batch 2 上限。
+- batch 3 在 283W 下通过 T=60/90 稳态，分别为 `212.42/215.86 fps`，外部 hotspot
+  峰值均为 `92C`；315W 的 T=90 稳态在 batch 3 warmup 后、首个正式 repeat 内到达
+  `93C` 并由独立看门狗终止。内核只记录被终止进程的 queue eviction，未出现 MCE、
+  GPU reset、ring timeout 或 hardware error，功耗上限保持原始 315W。
 - 完整 34:23 SAVR-1058 8K HEVC Main 长片墙钟 `11881.316s`，输出
   `123669/123669` 视频帧、`96716/96716` 音频包。copy spans 的 `45852/45852`
   个 VCL NAL payload 全同，render spans 的 `77817/77817` 个包全部变化；独立 AMF
