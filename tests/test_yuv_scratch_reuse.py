@@ -88,7 +88,9 @@ def test_rgb_to_yuv_allocates_nothing_per_frame(variant, eager_on_cuda):
         converter.convert_into(frame, luma, chroma)
     torch.cuda.synchronize()
 
-    assert torch.cuda.memory_allocated(device) == baseline
+    # Other test-owned CUDA objects can be collected during this loop. A lower
+    # value is harmless; this invariant only rejects new retained allocations.
+    assert torch.cuda.memory_allocated(device) <= baseline
 
 
 @cuda_only

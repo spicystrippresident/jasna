@@ -241,6 +241,34 @@ class _FakeDetector:
         return scores, masks
 
 
+class _FakeBatchedDetector(_FakeDetector):
+    supports_sbs_eye_batching = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.detect_sbs_calls = []
+        self.scan_sbs_calls = []
+
+    def detect_sbs_eyes(self, left, right, *, target_hw):
+        self.detect_sbs_calls.append((left.clone(), right.clone(), target_hw))
+        return (
+            super().__call__(left, target_hw=target_hw),
+            super().__call__(right, target_hw=target_hw),
+        )
+
+    def scan_sbs_eyes(self, left, right, *, mask_hw):
+        self.scan_sbs_calls.append((left.clone(), right.clone(), mask_hw))
+        return (
+            super().scan_scores_masks(left, mask_hw=mask_hw),
+            super().scan_scores_masks(right, mask_hw=mask_hw),
+        )
+
+
+class _FakeOomBatchedDetector(_FakeBatchedDetector):
+    def detect_sbs_eyes(self, left, right, *, target_hw):
+        raise torch.OutOfMemoryError("test")
+
+
 def test_sbs_detection_adapter_merges_boxes_and_full_canvas_masks() -> None:
     detector = _FakeDetector()
     adapter = SbsDetectionAdapter(detector)
@@ -281,6 +309,57 @@ def test_sbs_scan_adapter_uses_each_eye_and_merges_scores_masks() -> None:
     assert scores.tolist() == [7.0, 8.0]
     assert masks.shape == (2, 5, 9)
     assert masks.all()
+
+
+def test_sbs_detection_adapter_uses_detector_eye_batching() -> None:
+    detector = _FakeBatchedDetector()
+    adapter = SbsDetectionAdapter(detector)
+    frames = torch.zeros((2, 3, 6, 8), dtype=torch.uint8)
+    frames[:, :, :, 4:] = 9
+
+    result = adapter(frames, target_hw=(6, 8))
+
+    assert len(detector.detect_sbs_calls) == 1
+    left, right, target_hw = detector.detect_sbs_calls[0]
+    assert left.shape == right.shape == (2, 3, 6, 4)
+    assert target_hw == (6, 4)
+    np.testing.assert_array_equal(
+        result.boxes_xyxy[0],
+        np.array(
+            [[1.0, 2.0, 3.0, 4.0], [5.0, 2.0, 7.0, 4.0]],
+            dtype=np.float32,
+        ),
+    )
+
+
+def test_sbs_scan_adapter_batches_eyes_for_even_mask_width() -> None:
+    detector = _FakeBatchedDetector()
+    adapter = SbsDetectionAdapter(detector)
+    frames = torch.zeros((2, 3, 6, 8), dtype=torch.uint8)
+    frames[0, :, :, :4] = 3
+    frames[0, :, :, 4:] = 7
+    frames[1, :, :, :4] = 8
+    frames[1, :, :, 4:] = 2
+
+    scores, masks = adapter.scan_scores_masks(frames, mask_hw=(5, 10))
+
+    assert len(detector.scan_sbs_calls) == 1
+    assert detector.scan_sbs_calls[0][2] == (5, 5)
+    assert scores.tolist() == [7.0, 8.0]
+    assert masks.shape == (2, 5, 10)
+
+
+def test_sbs_detection_adapter_falls_back_after_batched_oom() -> None:
+    detector = _FakeOomBatchedDetector()
+    adapter = SbsDetectionAdapter(detector)
+    frames = torch.zeros((2, 3, 6, 8), dtype=torch.uint8)
+    frames[:, :, :, 4:] = 9
+
+    result = adapter(frames, target_hw=(6, 8))
+
+    assert detector.supports_sbs_eye_batching is False
+    assert len(detector.detect_calls) == 2
+    assert len(result.boxes_xyxy) == 2
 
 
 def test_sbs_adapter_rejects_odd_source_width() -> None:

@@ -200,6 +200,14 @@ class SbsDetectionAdapter:
             )
         return width // 2
 
+    def _disable_eye_batching_after_oom(self) -> None:
+        self.detector.supports_sbs_eye_batching = False
+        log.warning(
+            "RF-DETR SBS eye batching exhausted VRAM; using separate eye inference"
+        )
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def __call__(
         self,
         frames: torch.Tensor,
@@ -213,14 +221,29 @@ class SbsDetectionAdapter:
                 f"VR SBS processing requires an even target width, got {target_w}"
             )
         target_eye_width = target_w // 2
-        left = self.detector(
-            frames[:, :, :, :eye_width],
-            target_hw=(target_h, target_eye_width),
-        )
-        right = self.detector(
-            frames[:, :, :, eye_width:],
-            target_hw=(target_h, target_eye_width),
-        )
+        left_frames = frames[:, :, :, :eye_width]
+        right_frames = frames[:, :, :, eye_width:]
+        if bool(getattr(self.detector, "supports_sbs_eye_batching", False)):
+            try:
+                left, right = self.detector.detect_sbs_eyes(
+                    left_frames,
+                    right_frames,
+                    target_hw=(target_h, target_eye_width),
+                )
+            except torch.OutOfMemoryError:
+                self._disable_eye_batching_after_oom()
+                left = right = None
+        else:
+            left = right = None
+        if left is None or right is None:
+            left = self.detector(
+                left_frames,
+                target_hw=(target_h, target_eye_width),
+            )
+            right = self.detector(
+                right_frames,
+                target_hw=(target_h, target_eye_width),
+            )
 
         boxes: list[np.ndarray] = []
         masks: list[torch.Tensor] = []
@@ -267,14 +290,30 @@ class SbsDetectionAdapter:
         mask_h, mask_w = map(int, mask_hw)
         left_mask_w = mask_w // 2
         right_mask_w = mask_w - left_mask_w
-        left_scores, left_masks = self.detector.scan_scores_masks(
-            frames[:, :, :, :eye_width],
-            mask_hw=(mask_h, left_mask_w),
-        )
-        right_scores, right_masks = self.detector.scan_scores_masks(
-            frames[:, :, :, eye_width:],
-            mask_hw=(mask_h, right_mask_w),
-        )
+        can_batch = bool(
+            getattr(self.detector, "supports_sbs_eye_batching", False)
+        ) and left_mask_w == right_mask_w
+        if can_batch:
+            try:
+                left, right = self.detector.scan_sbs_eyes(
+                    frames[:, :, :, :eye_width],
+                    frames[:, :, :, eye_width:],
+                    mask_hw=(mask_h, left_mask_w),
+                )
+                left_scores, left_masks = left
+                right_scores, right_masks = right
+            except torch.OutOfMemoryError:
+                self._disable_eye_batching_after_oom()
+                can_batch = False
+        if not can_batch:
+            left_scores, left_masks = self.detector.scan_scores_masks(
+                frames[:, :, :, :eye_width],
+                mask_hw=(mask_h, left_mask_w),
+            )
+            right_scores, right_masks = self.detector.scan_scores_masks(
+                frames[:, :, :, eye_width:],
+                mask_hw=(mask_h, right_mask_w),
+            )
         return torch.maximum(left_scores, right_scores), torch.cat(
             (left_masks, right_masks),
             dim=-1,

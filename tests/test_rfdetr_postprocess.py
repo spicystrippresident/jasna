@@ -297,6 +297,38 @@ class TestRfDetrCall:
         fed = next(iter(mock_runner.infer.call_args.args[0].values()))
         assert fed.shape[0] == 1
 
+    def test_sbs_eyes_share_one_dynamic_inference(self):
+        model, mock_runner = _build_rfdetr_model()
+        model.input_dtype = torch.float32
+        pred_boxes = torch.tensor(
+            [[[0.5, 0.5, 0.2, 0.2]]] * 4,
+            dtype=torch.float32,
+        )
+        pred_logits = torch.tensor(
+            [[[5.0]], [[-10.0]], [[4.0]], [[-10.0]]],
+            dtype=torch.float32,
+        )
+        pred_masks = torch.ones(4, 1, 8, 8)
+        mock_runner.infer.return_value = {
+            "pred_boxes": pred_boxes,
+            "pred_logits": pred_logits,
+            "pred_masks": pred_masks,
+        }
+        left_frames = torch.randint(0, 256, (2, 3, 32, 32), dtype=torch.uint8)
+        right_frames = torch.randint(0, 256, (2, 3, 32, 32), dtype=torch.uint8)
+
+        left, right = model.detect_sbs_eyes(
+            left_frames,
+            right_frames,
+            target_hw=(32, 32),
+        )
+
+        fed = next(iter(mock_runner.infer.call_args.args[0].values()))
+        assert fed.shape[0] == 4
+        assert mock_runner.infer.call_count == 1
+        assert [boxes.shape[0] for boxes in left.boxes_xyxy] == [1, 0]
+        assert [boxes.shape[0] for boxes in right.boxes_xyxy] == [1, 0]
+
 
 class TestCompileRfdetrEngine:
     @pytest.mark.skipif(find_spec("tensorrt") is None, reason="needs TensorRT")
