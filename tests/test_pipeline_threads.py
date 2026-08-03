@@ -305,6 +305,176 @@ class TestDecodeDetectLoop:
 # ---------------------------------------------------------------------------
 
 class TestPrimaryRestoreLoop:
+    @staticmethod
+    def _clip_item(track_id: int, frame_count: int = 2) -> ClipRestoreItem:
+        clip = TrackedClip(
+            track_id=track_id,
+            start_frame=track_id * 10,
+            mask_resolution=(2, 2),
+            bboxes=[np.array([1, 1, 5, 5], dtype=np.float32)] * frame_count,
+            masks=[torch.zeros((2, 2), dtype=torch.bool)] * frame_count,
+        )
+        raw_crops = [
+            RawCrop(
+                crop=torch.zeros(3, 4, 4, dtype=torch.uint8),
+                enlarged_bbox=(1, 1, 5, 5),
+                crop_shape=(4, 4),
+            )
+            for _ in range(frame_count)
+        ]
+        return ClipRestoreItem(
+            clip=clip,
+            raw_crops=raw_crops,
+            frame_shape=(8, 8),
+            keep_start=0,
+            keep_end=frame_count,
+            crossfade_weights=None,
+        )
+
+    @staticmethod
+    def _primary_result(track_id: int, frame_count: int = 2):
+        result = MagicMock()
+        result.track_id = track_id
+        result.keep_start = 0
+        result.keep_end = frame_count
+        result.primary_raw = torch.zeros(frame_count, 3, 8, 8)
+        return result
+
+    def test_batches_adjacent_equal_length_clips(self):
+        clip_queue = FrameQueue(max_frames=999)
+        secondary_queue = FrameQueue(max_frames=999)
+        first = self._clip_item(1, 60)
+        second = self._clip_item(2, 60)
+        clip_queue.put(first)
+        clip_queue.put(second)
+        clip_queue.put(_SENTINEL)
+
+        pipeline = MagicMock()
+        pipeline.independent_clip_batch_size = 4
+        pipeline.independent_clip_batch_min_frames = 60
+        pipeline.secondary_prefers_cpu_input = False
+        pipeline.prepare_and_run_primary_batch.return_value = [
+            self._primary_result(1),
+            self._primary_result(2),
+        ]
+
+        with patch("jasna.pipeline_threads.torch.cuda.set_device"):
+            primary_restore_loop(
+                device=torch.device("cpu"),
+                restoration_pipeline=pipeline,
+                clip_queue=clip_queue,
+                secondary_queue=secondary_queue,
+                error_holder=[],
+                primary_idle_event=threading.Event(),
+            )
+
+        pipeline.prepare_and_run_primary_batch.assert_called_once_with(
+            [first, second]
+        )
+        assert secondary_queue.get().track_id == 1
+        assert secondary_queue.get().track_id == 2
+        assert secondary_queue.get() is _SENTINEL
+
+    def test_short_equal_length_clips_stay_individual(self):
+        clip_queue = FrameQueue(max_frames=999)
+        secondary_queue = FrameQueue(max_frames=999)
+        clip_queue.put(self._clip_item(1, 9))
+        clip_queue.put(self._clip_item(2, 9))
+        clip_queue.put(_SENTINEL)
+
+        pipeline = MagicMock()
+        pipeline.independent_clip_batch_size = 2
+        pipeline.independent_clip_batch_min_frames = 60
+        pipeline.secondary_prefers_cpu_input = False
+        pipeline.prepare_and_run_primary.side_effect = [
+            self._primary_result(1, 9),
+            self._primary_result(2, 9),
+        ]
+
+        with patch("jasna.pipeline_threads.torch.cuda.set_device"):
+            primary_restore_loop(
+                device=torch.device("cpu"),
+                restoration_pipeline=pipeline,
+                clip_queue=clip_queue,
+                secondary_queue=secondary_queue,
+                error_holder=[],
+                primary_idle_event=threading.Event(),
+            )
+
+        pipeline.prepare_and_run_primary_batch.assert_not_called()
+        assert secondary_queue.get().track_id == 1
+        assert secondary_queue.get().track_id == 2
+        assert secondary_queue.get() is _SENTINEL
+
+    def test_batch_oom_retries_long_clips_individually(self):
+        clip_queue = FrameQueue(max_frames=999)
+        secondary_queue = FrameQueue(max_frames=999)
+        clip_queue.put(self._clip_item(1, 60))
+        clip_queue.put(self._clip_item(2, 60))
+        clip_queue.put(_SENTINEL)
+
+        pipeline = MagicMock()
+        pipeline.independent_clip_batch_size = 2
+        pipeline.independent_clip_batch_min_frames = 60
+        pipeline.secondary_prefers_cpu_input = False
+        pipeline.prepare_and_run_primary_batch.side_effect = torch.OutOfMemoryError(
+            "batch allocation failed"
+        )
+        pipeline.prepare_and_run_primary.side_effect = [
+            self._primary_result(1, 60),
+            self._primary_result(2, 60),
+        ]
+
+        with (
+            patch("jasna.pipeline_threads.torch.cuda.set_device"),
+            patch("jasna.pipeline_threads.torch.cuda.empty_cache") as empty_cache,
+        ):
+            primary_restore_loop(
+                device=torch.device("cpu"),
+                restoration_pipeline=pipeline,
+                clip_queue=clip_queue,
+                secondary_queue=secondary_queue,
+                error_holder=[],
+                primary_idle_event=threading.Event(),
+            )
+
+        empty_cache.assert_called_once_with()
+        assert pipeline.prepare_and_run_primary.call_count == 2
+        assert secondary_queue.get().track_id == 1
+        assert secondary_queue.get().track_id == 2
+        assert secondary_queue.get() is _SENTINEL
+
+    def test_different_lengths_stay_individual_and_ordered(self):
+        clip_queue = FrameQueue(max_frames=999)
+        secondary_queue = FrameQueue(max_frames=999)
+        clip_queue.put(self._clip_item(1, 2))
+        clip_queue.put(self._clip_item(2, 3))
+        clip_queue.put(_SENTINEL)
+
+        pipeline = MagicMock()
+        pipeline.independent_clip_batch_size = 4
+        pipeline.independent_clip_batch_min_frames = 0
+        pipeline.secondary_prefers_cpu_input = False
+        pipeline.prepare_and_run_primary.side_effect = [
+            self._primary_result(1, 2),
+            self._primary_result(2, 3),
+        ]
+
+        with patch("jasna.pipeline_threads.torch.cuda.set_device"):
+            primary_restore_loop(
+                device=torch.device("cpu"),
+                restoration_pipeline=pipeline,
+                clip_queue=clip_queue,
+                secondary_queue=secondary_queue,
+                error_holder=[],
+                primary_idle_event=threading.Event(),
+            )
+
+        pipeline.prepare_and_run_primary_batch.assert_not_called()
+        assert secondary_queue.get().track_id == 1
+        assert secondary_queue.get().track_id == 2
+        assert secondary_queue.get() is _SENTINEL
+
     def test_cancel_event_stops_loop(self):
         cancel = threading.Event()
         clip_queue = FrameQueue(max_frames=999)

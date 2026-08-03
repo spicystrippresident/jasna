@@ -292,6 +292,47 @@ def test_processor_one_click_mode_scans_then_uses_native_segments(tmp_path) -> N
     assert job.status is JobStatus.COMPLETED
 
 
+def test_processor_one_click_uses_the_selected_detector_for_scan_and_render(
+    tmp_path,
+) -> None:
+    source = tmp_path / "video.mp4"
+    source.touch()
+    plan = build_one_click_vr_plan(
+        (1.0,),
+        (0.9,),
+        threshold=0.5,
+        scan_interval_seconds=1.0,
+        duration_seconds=5.0,
+        completed_until_seconds=5.0,
+    )
+    job = JobItem(
+        source,
+        detection_model="rfdetr-vr-v1",
+        detection_score_threshold=0.4,
+    )
+    processor = Processor()
+    processor._settings = AppSettings(
+        processing_mode="one_click_vr",
+        detection_model="rfdetr-v6",
+        detection_score_threshold=0.35,
+    )
+    processor._output_pattern = "{original}_restored.mp4"
+
+    with (
+        patch.object(processor, "_scan_one_click_vr", return_value=plan) as scan,
+        patch.object(processor, "_run_pipeline") as run_pipeline,
+        patch("jasna.gui.processor._cleanup_torch"),
+    ):
+        processor._process_job(job)
+
+    scan_settings = scan.call_args.args[3]
+    render_settings = run_pipeline.call_args.kwargs["settings"]
+    assert scan_settings.detection_model == "rfdetr-vr-v1"
+    assert scan_settings.detection_score_threshold == 0.4
+    assert render_settings.detection_model == "rfdetr-vr-v1"
+    assert render_settings.detection_score_threshold == 0.4
+
+
 def test_processor_applies_image_projection_evidence_only_to_auto_mode(tmp_path) -> None:
     source = tmp_path / "video.mp4"
     source.touch()

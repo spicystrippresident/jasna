@@ -143,6 +143,47 @@ def test_raw_process_produces_contiguous_nchw_input(monkeypatch) -> None:
     assert inp.is_contiguous(), f"model input must be contiguous NCHW, got stride {inp.stride()}"
 
 
+def test_raw_process_batch_uses_independent_model_batch(monkeypatch) -> None:
+    import jasna.restorer.basicvsrpp_mosaic_restorer as br
+
+    model = _CaptureIdentityModel()
+    restorer = _make_restorer(monkeypatch, model)
+    videos = [
+        [
+            torch.full(
+                (3, br.INFERENCE_SIZE, br.INFERENCE_SIZE),
+                fill_value=clip * 40 + frame,
+                dtype=torch.uint8,
+            )
+            for frame in range(3)
+        ]
+        for clip in range(2)
+    ]
+
+    results = restorer.raw_process_batch(videos)
+
+    assert model.captured_inputs is not None
+    assert model.captured_inputs.shape == (
+        2, 3, 3, br.INFERENCE_SIZE, br.INFERENCE_SIZE
+    )
+    assert len(results) == 2
+    assert torch.equal(results[0], model.captured_inputs[0])
+    assert torch.equal(results[1], model.captured_inputs[1])
+
+
+def test_raw_process_batch_rejects_different_lengths(monkeypatch) -> None:
+    import pytest
+    import jasna.restorer.basicvsrpp_mosaic_restorer as br
+
+    restorer = _make_restorer(monkeypatch, _CaptureIdentityModel())
+    frame = torch.zeros(
+        (3, br.INFERENCE_SIZE, br.INFERENCE_SIZE), dtype=torch.uint8
+    )
+
+    with pytest.raises(ValueError, match="equal non-empty clip lengths"):
+        restorer.raw_process_batch([[frame], [frame, frame]])
+
+
 def test_split_forward_path_used_when_available(monkeypatch) -> None:
     import jasna.restorer.basicvsrpp_mosaic_restorer as br
 
