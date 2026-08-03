@@ -192,6 +192,12 @@ per-model engine precompile step. NVIDIA builds keep the ONNX → TensorRT path
 handle the source. Secondary restoration and segment smart rendering remain
 NVIDIA-only.
 
+On ROCm, detector resize/letterbox/normalization uses a fused Triton kernel and
+falls back to the equivalent Torch expression if Triton is unavailable. Equal,
+long BasicVSR++ clips may also share a model batch; an out-of-memory retry runs
+the clips individually. Both optimizations are AMD-gated, so CUDA/TensorRT
+behavior and batch sizes are unchanged.
+
 `--device cuda:N` selects the PyTorch GPU (ROCm reuses the CUDA device API).
 FFmpeg 8's Linux AMF device context currently ignores its adapter
 argument, so AMF decode/encode can use the default Vulkan adapter on a multi-GPU
