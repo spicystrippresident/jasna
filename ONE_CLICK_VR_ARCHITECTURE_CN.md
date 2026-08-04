@@ -173,7 +173,7 @@ F 盘分层矩阵和 Main 10 继续延期。
    真实 368 帧 RF-DETR 快 `6.25%`，检测、mask 和恢复任务完全一致。
 2. 一键 VR 不拥有 detector registry。GUI 全局选择、逐视频 segment、扫描缓存和 render
    共用 Jasna registry；当前 AMD 已安装 `rfdetr-vr-v1`、`rfdetr-v6`、
-   `lada-yolo-v4`。
+   `lada-yolo-v4`、`zelefans-vr-yolo-v2`。
 3. RF-DETR compile/TorchScript 和 BasicVSR++ 局部 compile/HIP Graph 均未进入生产。
    前者编译失败或慢约 69 倍；后者虽有 `18.5--22.0%` steady-state 收益，但动态 clip
    长度持续触发编译，HIP Graph 结果错误，compile 输出最低仅 `64.2dB`，继续使用 eager。
@@ -328,6 +328,35 @@ git rebase upstream/main
 - 陌生 50 秒 8K 首次扫描墙钟 `37.987s`，51 个采样中 37 次确认命中，hotspot 峰值
   `74C`；证据位于
   `/home/latiao/vr_toolbox_jasna_linux/benchmarks/o17_first_scan_20260804/`。
+- 最终定向优化没有改变生产架构：`rfdetr-v6`、`rfdetr-vr-v1` 和 `lada-yolo-v4`
+  在真实逐帧窗口上产生 `31/21/16` 个 restoration items。v6 的 20 个 2--9 帧短片段
+  经全帧复核，前 17 条全程没有可见马赛克，最后 3 条是真实马赛克但完全位于 YOLO 已有
+  的左右眼连续主轨迹内。按实际恢复时间并集，YOLO/RF 覆盖 `400/422` 帧，ROI-frame
+  工作量为 `717/890`；共同覆盖 392 帧。逐帧复核双方独有区间后，YOLO 漏 2 个真实帧、
+  RF 漏 8 个真实帧且额外覆盖 28 个无码帧。该窗口显示 YOLO 快约 `42%`、误检更少且
+  轨迹更连续，但默认暂仍为 rfdetr-v6；这是 O19 的中间结论，后续 O23 人工标注矩阵
+  已确认 Lada 在困难 VR180 场景漏检严重，不再作为默认候选。
+  以双方共同覆盖为真并人工标注全部独有帧时，真实有码共 402 帧；YOLO/RF 分别覆盖
+  400/394 帧，时间召回约 `99.50%/98.01%`。扩大矩阵时必须改用全量人工标签。
+- 检测器质量对比使用 render 的模型生产阈值 `rfdetr-v6=0.35`、`lada-yolo-v4=0.25`；
+  一键 VR 的 `0.70` 是每秒采样粗扫描阈值，不参与上述逐帧 detect-track。模型间 score
+  不同标，默认候选评估必须分别校准阈值，再比较 precision/recall 和实际恢复时间并集。
+- 首次扫描 batch 8 相对 batch 4 的两轮中位收益仅 `1.85%`，显存峰值约从
+  `6.4 GiB` 增至 `9.8 GiB`，且 GPU media 中位均为 `100%`；生产保持 detector batch 4。
+- restoration lookahead 的三个 30 秒 E2E 均为 `batched_invocations=0`，候选峰值只有 1；
+  生产保持相邻、同长、至少 60 帧的 BasicVSR++ batch 2，不引入等待或乱序结果缓冲。
+- rocDecode 扫描专用 `1536x768` 硬件缩放比原尺寸慢 `0.42%`，并使同一 51 个 PTS 的
+  检测命中从 37 降至 0；缩放桥接已撤除，扫描保持原尺寸 surface。定向证据位于 Ubuntu
+  ext4 的 `o19_targeted_optimization_20260804/` 和 `o22_scan_decode_resize_20260804/`。
+- O23 四检测器困难 VR180 矩阵确认 `rfdetr-vr-v1` 是质量优先选择：四条持续正样本宏平均
+  召回 100%，每条始终只有左右眼各 1 条新轨迹；`rfdetr-v6` 为 99.90%，但鱼眼底缘碎成
+  27 条新轨迹；`zelefans-vr-yolo-v2` 为 98.02%，onset 召回只有 74.38%；
+  `lada-yolo-v4` 为 45.89%，远小目标和鱼眼边缘漏检严重。
+- 相同 2.002 秒生产 E2E 中 vr-v1 平均 `28.56s`，只比 v6 的 `26.04s` 慢约 9.7%，因为
+  连续轨迹能形成恢复 batch；但峰值显存约 `24.2GB`。因此全局默认仍为兼容性更好的
+  `rfdetr-v6`，VR180 质量优先在 GUI/文档中推荐 vr-v1，不静默替换用户模型选择。
+  16/16 输出通过包数、相对 PTS 和音频 payload 校验；完整证据位于
+  `/home/latiao/vr_toolbox_jasna_linux/benchmarks/o23_detector_quality_matrix_20260804/`。
 - O1 检测等价性报告位于
   `/media/latiao/D/AI/lada/jasna_benchmarks/o1_detection_equivalence_20260804/`；368 帧
   与 1200 帧窗口的 restoration items 均完全一致，合批推理快 `6.78%/7.55%`。

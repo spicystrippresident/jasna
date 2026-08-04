@@ -11,6 +11,8 @@ import subprocess
 import sys
 import time
 
+import psutil
+
 
 # This host throttles at 110C, but previously logged an MCE after a 98C stress run.
 DEFAULT_MAX_JUNCTION_C = 93.0
@@ -32,22 +34,59 @@ def _read_temperature_c(path: Path) -> float:
     return float(path.read_text(encoding="ascii").strip()) / 1000.0
 
 
-def _terminate_group(process: subprocess.Popen, grace_seconds: float = 2.0) -> None:
-    if process.poll() is not None:
-        return
+def _process_tree(process: subprocess.Popen) -> list[psutil.Process]:
     try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        process.wait()
+        root = psutil.Process(process.pid)
+        return [*root.children(recursive=True), root]
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return []
+
+
+def _signal_tree(processes: list[psutil.Process], signum: int) -> None:
+    own_group = os.getpgrp()
+    groups = set()
+    for target in processes:
+        try:
+            group = os.getpgid(target.pid)
+        except (ProcessLookupError, PermissionError):
+            continue
+        if group != own_group:
+            groups.add(group)
+    for group in groups:
+        try:
+            os.killpg(group, signum)
+        except ProcessLookupError:
+            continue
+    # A descendant may have changed session between the snapshot and killpg.
+    for target in reversed(processes):
+        try:
+            target.send_signal(signum)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+
+def _terminate_group(process: subprocess.Popen, grace_seconds: float = 2.0) -> None:
+    targets = _process_tree(process)
+    if process.poll() is not None and not targets:
         return
+    _signal_tree(targets, signal.SIGTERM)
+    descendants = [target for target in targets if target.pid != process.pid]
     try:
         process.wait(timeout=grace_seconds)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        # Include descendants created while the graceful shutdown was running.
+        known = {target.pid: target for target in descendants}
+        known.update({target.pid: target for target in _process_tree(process)})
+        remaining = list(known.values())
+        _signal_tree(remaining, signal.SIGKILL)
+        if process.poll() is None:
+            process.kill()
         process.wait(timeout=grace_seconds)
+        descendants = [target for target in remaining if target.pid != process.pid]
+    _gone, alive = psutil.wait_procs(descendants, timeout=grace_seconds)
+    if alive:
+        _signal_tree(alive, signal.SIGKILL)
+        psutil.wait_procs(alive, timeout=grace_seconds)
 
 
 def _wait_until_cool(

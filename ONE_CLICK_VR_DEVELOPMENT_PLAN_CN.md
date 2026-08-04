@@ -148,8 +148,9 @@ AMD 真机没有收益、维护成本过高或存在更优路线时也不移植�
    `9.748s` 降到 `9.139s`（`6.25%`），检测 `129/129`、mask 和 restoration item
    `7/7` 均保持一致；第一次运行失败后永久回退 Torch，不影响 NVIDIA 路径。
 2. O6A 保留。检测器仍只有 Jasna registry 一个事实来源；已安装并可选
-   `rfdetr-vr-v1`、`rfdetr-v6`、`lada-yolo-v4`。回归测试证明同一个模型名和阈值同时
-   到达一键扫描和 render，切换模型进入既有扫描签名，不建立一键专用 registry。
+   `rfdetr-vr-v1`、`rfdetr-v6`、`lada-yolo-v4`、`zelefans-vr-yolo-v2`。回归测试证明
+   同一个模型名和阈值同时到达一键扫描和 render，切换模型进入既有扫描签名，不建立
+   一键专用 registry。
 3. O7 否决。RF-DETR 严格 fullgraph 在第三方实现内失败，允许 graph break 后编译数分钟
    仍失败；channels-last 慢 `0.26%`。真实 16 帧 TorchScript 约 `27.06s`，eager 约
    `0.393s`，慢约 69 倍，即使语义一致也不能部署。
@@ -453,6 +454,122 @@ Windows 分区中的源片、旧成片和既有证据永远只读；新 Jasna �
 分层选择短/中/长、8/10-bit、低/中/高扫描覆盖率，不对 33 组全部直接跑整片。
 表中位于 `/home/latiao/vr_toolbox_jasna_linux/work/` 的历史短样本已在最终验收后清理，
 需要回归时从只读长片重新抽取；`o17/o18` 最终证据和成片永久保留。
+
+## O19--O22：最终整片后的定向优化（已完成）
+
+这一轮只使用 Ubuntu ext4 写入新证据，Windows D/F 盘素材保持只读。在四个方向完成
+短真实片段的实现与 A/B 前，不启动新的 34 分钟整片验收。
+
+### O19：检测器性能与质量分层
+
+- 在相同 negative、onset 和持续 positive 真实 8K 窗口上比较 `rfdetr-v6`、
+  `rfdetr-vr-v1` 和 `lada-yolo-v4`。
+- 扫描层记录墙钟、采样分数、命中、区间、资源和温度；逐帧 render 层还必须比较
+  detection/tracking 数量、restoration item 数量与长度分布，不能只按扫描速度排名。
+- 保留 Jasna 的模型选择契约。不同模型导致的漏检/误检或 mask 变化属于用户可见语义，
+  不允许一键 VR 在后台把用户选择的模型替换为更快模型。
+- 只有同一模型内部的等价加速才可修改默认执行路径；不同模型的结果用于 GUI 选择建议，
+  不自动改变默认模型。
+- 同一 600 帧真实 onset 窗口的逐帧 detect-track 为：`rfdetr-v6 45.51s/31 items`、
+  `rfdetr-vr-v1 58.50s/21 items`、`lada-yolo-v4 26.25s/16 items`。YOLO 比 v6 快
+  约 `42%`。v6 的 31 项中有 20 个仅 2--9 帧的短片段，而 YOLO 只有 3 个短片段。
+  全帧联系图复核确认：v6 前 17 条短轨迹的每一帧都没有可见马赛克，属于衣物、皮肤、
+  手指等区域的误检；最后 3 条每帧都有马赛克，但分别完全落在 YOLO 已连续覆盖的右眼
+  `545--599` 帧和左眼 `556--599` 帧主轨迹内，是 v6 自己的断轨碎片。因此
+  `31 vs 16` 不是 YOLO 漏掉 15 个目标；该窗口中 YOLO 更快、误检更少且主轨迹更连续。
+- 上述逐帧对比没有使用一键扫描阈值 `0.70`。`0.70` 只用于每秒采样的粗区间扫描；
+  detect-track 使用各模型生产阈值 `rfdetr-v6=0.35`、`lada-yolo-v4=0.25`，不同模型的
+  score 不能按同一数值直接比较。
+- 按最终 `keep_start:keep_end` 计算实际恢复时间并集，而不是按 item 数量：YOLO 覆盖
+  `400/600` 帧（`6.673s`），RF-DETR 覆盖 `422/600` 帧（`7.040s`），共同覆盖 392 帧；
+  YOLO 独有 8 帧，RF 独有 30 帧。计入左右眼独立 ROI 的恢复工作量为 YOLO 717
+  ROI-frames、RF 890 ROI-frames，RF 多 `24.1%`，远小于 item 数量暗示的 `93.8%`。
+- 对全部 38 个独有帧逐帧复核：RF 独有的 30 帧中 28 帧实际无码，2 帧真实有码；
+  YOLO 独有的 8 帧全部真实有码。因此该窗口中 YOLO 漏 2 帧（`0.033s`），RF 漏 8 帧
+  （`0.133s`），同时 RF 多误处理 28 帧（`0.467s`）。这仍是单窗口结果，默认模型决策
+  必须扩展到人工标注矩阵并做阈值校准。
+- 在“双方共同覆盖视为真阳性、全部独有帧已人工逐帧复核”的当前标注口径下，真实有码
+  时间轴为相对帧 `178--180`、`185--452`、`469--599`，共 402 帧（`6.707s`）。YOLO
+  覆盖 400 帧，时间召回约 `99.50%`；RF 覆盖 394 帧，时间召回约 `98.01%`。该口径仍需
+  在扩大样本时用全量人工标签替代“共同覆盖视为真”的假设。
+- 单个 onset 窗口仍不足以直接更换全局默认模型。O19 阶段保留 `rfdetr-v6` 默认值和 GUI
+  检测器选择，并把 `lada-yolo-v4` 列为待验证候选；后续 O23 已完成困难持续 positive
+  与完整 onset 人工标注矩阵，确认 Lada 在远小目标和鱼眼边缘漏检严重，因此不再作为
+  默认候选。全局默认与 VR180 推荐以 O23 最终决策为准。
+
+### O20：首次扫描批处理
+
+- 当前生产扫描已经使用 detector batch 4，并在 AMD RF-DETR 上合并 SBS 双眼推理；
+  新候选是仅扫描阶段的 batch 8，而不是重新实现已有批处理。
+- 使用同一个陌生 50 秒 8K onset 片段比较 batch 4/8。采样时间、sample score、命中、
+  区间和投影证据必须一致或仅有已解释的浮点误差。
+- 候选必须缩短墙钟且不出现 OOM、fallback、GPU reset、MCE 或不可接受的显存/温度；
+  尾 batch padding 不得计入有效样本。
+- 若 batch 8 无稳定收益，保持 batch 4，不增加 GUI 控件或新的长期缓存签名。
+- 正序/反序两轮核心扫描墙钟分别为 batch 4 `39.454s/38.030s`、batch 8
+  `38.104s/37.943s`；两轮中位收益仅 `1.85%`，反序单轮仅 `0.23%`，而显存峰值
+  由约 `6.4 GiB` 增至 `9.8 GiB`。51 个采样、37 个命中、区间和时间相同，GPU media
+  中位均为 `100%`；保持 batch 4。
+
+### O21：提高 restoration batch 2 触发率
+
+- 在 AMD BasicVSR++ 生产上限仍为 batch 2、至少 60 帧、最大 padding 4 帧和既有显存
+  门槛不变的前提下，引入小型有界 lookahead。
+- 调度器可从后续候选中选择长度差最小的兼容 clip，但必须按原始 clip 序号向 secondary
+  队列提交结果；被越过的 clip 不得丢失、重复或改变最终视频帧顺序。
+- lookahead、已完成但等待顺序提交的结果和 queue 总量都必须有界；OOM 继续逐 clip 回退，
+  取消和 sentinel 必须完整释放。
+- 单测覆盖非相邻配对、顺序提交、无匹配回退、sentinel、OOM 和取消。短真实 E2E 比较
+  `batched_invocations`、padding、显存、hotspot、墙钟、输出帧/PTS、copy VCL 和音频。
+- 若短片触发率提高但墙钟无收益或资源明显恶化，撤除候选，不升级为整片测试。
+- lookahead 2/4 和 lookahead 4 + `0.25s` 候选等待的 30 秒真实 E2E Processor 墙钟为
+  `150.85s/149.56s/151.23s`，三次均为 49 clips、`batched_invocations=0`，实时候选
+  峰值始终只有 1。瓶颈是 detect-track 生成 clip 慢于恢复消费，不是窗口过小；等待还会
+  破坏流水线并行。候选实现和测试已完整撤除，保留现有相邻 batch 2。
+
+### O22：扫描专用 rocDecode 缩放探索
+
+- ROCm 7.2.1 底层支持 `target_width/target_height`，但 SDK helper 未暴露。曾在项目桥接层
+  使用官方 `rocDecReconfigureDecoder` 做扫描专用 `8192x4096 -> 1536x768`，不修改
+  正式 render reader。4 帧 smoke 输出形状、PTS 和像素范围正常。
+- 同一 50 秒 onset 的全尺寸/缩放核心墙钟为 `37.859s/38.020s`，缩放慢 `0.42%`；
+  51 个 PTS 完全一致，但命中从 `37` 降为 `0`，score 绝对差中位 `0.796`，最终区间
+  全部丢失。VCN 仍需完整解码 8K，后处理缩放没有解除 media 100% 瓶颈且破坏检测语义。
+- 该实现、参数和测试已完整撤除，生产仍使用原尺寸 rocDecode。O19--O22 没有产生可安全
+  合入且有稳定收益的新生产优化，因此不启动新的 34 分钟整片测试。
+- O19--O21 证据位于
+  `/home/latiao/vr_toolbox_jasna_linux/benchmarks/o19_targeted_optimization_20260804/`，O22
+  证据位于 `/home/latiao/vr_toolbox_jasna_linux/benchmarks/o22_scan_decode_resize_20260804/`。
+  O19 的逐轨迹 JSON 和联系图为 `rfdetr_tracks.json`、`yolo_tracks.json`、
+  `rfdetr_short_tracks.jpg`、`yolo_short_tracks.jpg` 和逐轨迹全帧证据
+  `rfdetr_all_short_tracks.jpg`；双方独有帧全量证据为 `exclusive_frames_all.jpg`。
+
+## O23：四检测器 VR180 困难场景质量矩阵（已完成）
+
+- 新增并校验官方 `zelefans-vr-yolo-v2` 权重：90,054,557 字节，SHA-256
+  `91fe7a48b0e9edf51361918c8a30f752c64511005e643343a7382d951f3fe0f8`；4 帧 smoke 通过。
+- 使用强倾斜、远距离小目标、鱼眼底缘和中等对照四条持续有码 8K 短片，每条统一取
+  480 帧；另用 600 帧 onset 的 402 帧完整人工真值比较 precision/recall。所有模型使用
+  各自 render 生产阈值、batch 4、FP16 和相同 tracker 参数。
+- 持续正样本宏平均时间召回为：`lada-yolo-v4 45.89%`、`rfdetr-v6 99.90%`、
+  `rfdetr-vr-v1 100%`、`zelefans-vr-yolo-v2 98.02%`。Lada 远小目标只有 32.71%、
+  鱼眼底缘为 0%；Zelefans 鱼眼底缘为 92.08%。
+- onset 的 precision/recall 为 Lada `100%/99.50%`、v6 `93.36%/98.01%`、vr-v1
+  `95.69%/99.50%`、Zelefans `99.01%/74.38%`。单个容易 onset 不能代表困难 VR 质量。
+- vr-v1 四条始终只有左右眼各 1 条新轨迹。v6 在鱼眼样本碎成 27 条新轨迹，Zelefans
+  18 条，Lada 完全漏检；最终贴底 ROI A/B 与时间轴统计一致。
+- 相同四条 2.002 秒生产 E2E 的平均墙钟为 Lada `14.98s`、v6 `26.04s`、vr-v1
+  `28.56s`、Zelefans `21.18s`。vr-v1 虽然纯检测比 v6 慢约 34%，但因轨迹连续且能批量
+  恢复，完整 E2E 只慢约 9.7%；代价是峰值显存约 `24.2GB`，不适合静默升级所有设备。
+- 16/16 输出通过视频/音频包数、相对 PTS 和音频 payload 校验。较长探索曾在 93--94C
+  被 watchdog 终止；统一 2 秒矩阵最高 91C，本轮无 MCE、GPU reset、OOM。
+- 首次 thermal-stop 暴露外层 watchdog 只终止直接进程组，未覆盖监控器再次创建的 session，
+  留下一个持有约 10GB VRAM 的孤立测试进程。该进程已精确终止，守卫改为快照并清理完整
+  后代树和所有新进程组；新增嵌套 `start_new_session` 回归测试，防止再次残留 GPU 任务。
+- 最终决策：全局默认继续 `rfdetr-v6`，保持通用、显存和既有配置兼容；VR180 质量优先
+  明确推荐 `rfdetr-vr-v1`；Zelefans 保持 VR 备用；Lada 只用于速度优先。不得在一键流程
+  内静默替换用户选择。完整报告与结构化证据位于 Ubuntu ext4 的
+  `/home/latiao/vr_toolbox_jasna_linux/benchmarks/o23_detector_quality_matrix_20260804/`。
 
 ## 上游同步纪律
 
