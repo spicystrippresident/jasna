@@ -38,6 +38,13 @@ def main() -> None:
     parser.add_argument("--working-directory", required=True, type=Path)
     parser.add_argument("--report", required=True, type=Path)
     parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument(
+        "--restoration-batch-size",
+        type=int,
+        choices=(1, 2),
+        default=2,
+        help="Benchmark override for AMD independent-clip restoration batching",
+    )
     parser.add_argument("--detection-model", default="rfdetr-v6")
     parser.add_argument("--detection-score-threshold", type=float, default=0.35)
     parser.add_argument("--max-clip-size", type=int, default=90)
@@ -45,9 +52,21 @@ def main() -> None:
     parser.add_argument("--max-detection-gap", type=int, default=2)
     parser.add_argument("--min-detection-duration", type=int, default=2)
     parser.add_argument("--scan-interval", type=float, default=1.0)
+    parser.add_argument("--scan-threshold", type=float, default=0.70)
+    parser.add_argument("--scan-consecutive-hits", type=int, default=2)
+    parser.add_argument(
+        "--segments",
+        help="Optional manual START-END ranges; skips the one-click pre-scan",
+    )
     parser.add_argument("--codec", default="hevc")
     parser.add_argument("--encoder-cq", type=int, default=28)
     args = parser.parse_args()
+
+    from jasna.restorer import basicvsrpp_mosaic_restorer as restorer_module
+
+    restorer_module.AMD_INDEPENDENT_CLIP_BATCH_SIZE = int(
+        args.restoration_batch_size
+    )
 
     source = args.input.resolve(strict=True)
     output = args.output.resolve()
@@ -57,6 +76,8 @@ def main() -> None:
     settings = AppSettings(
         processing_mode="one_click_vr",
         one_click_scan_interval=args.scan_interval,
+        one_click_scan_threshold=args.scan_threshold,
+        one_click_min_consecutive_hits=args.scan_consecutive_hits,
         batch_size=args.batch_size,
         max_clip_size=args.max_clip_size,
         temporal_overlap=args.temporal_overlap,
@@ -115,7 +136,15 @@ def main() -> None:
             update.message,
         )
 
-    job = JobItem(source)
+    if args.segments:
+        from jasna.media import get_video_meta_data
+        from jasna.segments import parse_segments
+
+        duration = float(get_video_meta_data(str(source)).duration)
+        segments = parse_segments(args.segments, duration=duration)
+    else:
+        segments = ()
+    job = JobItem(source, segments=segments)
     processor = Processor(on_progress=on_progress, on_log=on_log)
     stopped_by_signal = [None]
 

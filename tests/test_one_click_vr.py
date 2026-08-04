@@ -73,6 +73,21 @@ def test_plan_rejects_invalid_scan_contract() -> None:
         )
 
 
+def test_plan_filters_isolated_hits_when_confirmation_is_enabled() -> None:
+    plan = build_one_click_vr_plan(
+        (0.0, 1.0, 2.0, 3.0, 4.0, 7.0),
+        (0.9, 0.1, 0.8, 0.9, 0.1, 0.95),
+        threshold=0.8,
+        scan_interval_seconds=1.0,
+        duration_seconds=9.0,
+        completed_until_seconds=9.0,
+        minimum_consecutive_hits=2,
+    )
+
+    assert plan.detection_hits == 2
+    assert plan.segments == (SegmentRange(1.5, 4.5),)
+
+
 class _FakeScanWorker:
     terminal_stopped = False
     result_stride = 1.0
@@ -131,7 +146,7 @@ def test_scan_adapter_returns_plan_and_progress(tmp_path) -> None:
         )
 
     assert progress == [(0.5, 20.0, 3.0)]
-    assert plan.segments == (SegmentRange(0.5, 2.5),)
+    assert plan.segments == ()
 
 
 def test_scan_adapter_uses_effective_worker_stride(tmp_path) -> None:
@@ -153,7 +168,7 @@ def test_scan_adapter_uses_effective_worker_stride(tmp_path) -> None:
         )
 
     assert plan.scan_interval_seconds == 0.5
-    assert plan.segments == (SegmentRange(0.75, 1.75),)
+    assert plan.segments == ()
 
 
 def test_scan_adapter_collects_conservative_projection_evidence(tmp_path) -> None:

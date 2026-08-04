@@ -90,12 +90,13 @@ def _video_packets(path: Path) -> tuple[list[dict[str, object]], Fraction]:
         length_size, length_prefixed = _hevc_layout(
             bytes(stream.codec_context.extradata or b"")
         )
-        for packet in container.demux(stream):
+        for decode_index, packet in enumerate(container.demux(stream)):
             if packet.pts is None:
                 continue
             data = bytes(packet)
             packets.append(
                 {
+                    "decode_index": decode_index,
                     "pts": int(packet.pts),
                     "dts": None if packet.dts is None else int(packet.dts),
                     "duration": int(packet.duration or 0),
@@ -165,6 +166,47 @@ def _max_pts_delta_seconds(
     )
 
 
+def _timestamp_step_stats(
+    values: list[int],
+    time_base: Fraction,
+    expected_step: Fraction,
+) -> tuple[float, float, float]:
+    if len(values) < 2:
+        return float("inf"), float("inf"), float("inf")
+    steps = [
+        (current - previous) * time_base
+        for previous, current in zip(values, values[1:])
+    ]
+    return (
+        float(min(steps)),
+        float(max(steps)),
+        max(abs(float(step - expected_step)) for step in steps),
+    )
+
+
+def _timestamp_steps_within_reference(
+    candidate: list[int],
+    candidate_time_base: Fraction,
+    reference: list[int],
+    reference_time_base: Fraction,
+    *,
+    tolerance: Fraction,
+) -> bool:
+    if len(candidate) < 2 or len(reference) < 2:
+        return False
+    candidate_steps = [
+        (current - previous) * candidate_time_base
+        for previous, current in zip(candidate, candidate[1:])
+    ]
+    reference_steps = [
+        (current - previous) * reference_time_base
+        for previous, current in zip(reference, reference[1:])
+    ]
+    return min(candidate_steps) > 0 and max(candidate_steps) <= (
+        max(reference_steps) + tolerance
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", required=True, type=Path)
@@ -190,6 +232,16 @@ def main() -> None:
     output_video_pts = [int(packet["pts"]) for packet in output_video]
     source_audio_pts = [int(packet["pts"]) for packet in source_audio]
     output_audio_pts = [int(packet["pts"]) for packet in output_audio]
+    output_decode_order = sorted(
+        output_video,
+        key=lambda packet: int(packet["decode_index"]),
+    )
+    output_dts_present = all(packet["dts"] is not None for packet in output_decode_order)
+    output_video_dts = [
+        int(packet["dts"])
+        for packet in output_decode_order
+        if packet["dts"] is not None
+    ]
 
     copy_vcl_equal = 0
     copy_vcl_different = 0
@@ -240,12 +292,39 @@ def main() -> None:
         output_audio_pts,
         output_audio_tb,
     )
+    expected_video_step = Fraction(1, 1) / source_metadata.video_fps_exact
+    dts_step_min, dts_step_max, dts_step_max_error = _timestamp_step_stats(
+        output_video_dts,
+        output_video_tb,
+        expected_video_step,
+    )
+    source_pts_step_min, source_pts_step_max, source_pts_step_max_error = (
+        _timestamp_step_stats(
+            source_video_pts,
+            source_video_tb,
+            expected_video_step,
+        )
+    )
+    dts_step_tolerance = max(source_video_tb, output_video_tb)
 
     checks = {
         "video_packet_count_equal": len(source_video) == len(output_video),
         "audio_packet_count_equal": len(source_audio) == len(output_audio),
         "source_video_pts_unique_strict": _strictly_increasing(source_video_pts),
         "output_video_pts_unique_strict": _strictly_increasing(output_video_pts),
+        "output_video_dts_present": output_dts_present,
+        "output_video_dts_unique_strict": _strictly_increasing(output_video_dts),
+        # DTS need not be constant when the source presentation timeline itself
+        # contains a larger interval (for example a clipped B-frame GOP tail).
+        # PTS alignment above protects playback timing; this check rejects only
+        # an additional decode-timeline gap introduced by the output.
+        "output_video_dts_cadence": _timestamp_steps_within_reference(
+            output_video_dts,
+            output_video_tb,
+            source_video_pts,
+            source_video_tb,
+            tolerance=dts_step_tolerance,
+        ),
         "source_audio_pts_unique_strict": _strictly_increasing(source_audio_pts),
         "output_audio_pts_unique_strict": _strictly_increasing(output_audio_pts),
         "video_pts_all_aligned": video_pts_max_delta <= video_pts_tolerance,
@@ -269,6 +348,13 @@ def main() -> None:
         "output_video_tail_seconds": float(output_video_end),
         "video_pts_max_delta_seconds": video_pts_max_delta,
         "audio_pts_max_delta_seconds": audio_pts_max_delta,
+        "source_video_pts_step_min_seconds": source_pts_step_min,
+        "source_video_pts_step_max_seconds": source_pts_step_max,
+        "source_video_pts_step_max_error_seconds": source_pts_step_max_error,
+        "output_video_dts_step_min_seconds": dts_step_min,
+        "output_video_dts_step_max_seconds": dts_step_max,
+        "output_video_dts_step_max_error_seconds": dts_step_max_error,
+        "output_video_dts_step_tolerance_seconds": float(dts_step_tolerance),
         "copy_vcl_equal": copy_vcl_equal,
         "copy_vcl_different": copy_vcl_different,
         "render_vcl_equal": render_vcl_equal,

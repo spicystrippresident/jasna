@@ -242,6 +242,10 @@ def primary_restore_loop(
     restored_track_ids: set[int] = set()
     restoration_clips = 0
     batched_invocations = 0
+    batch_candidates = 0
+    padded_batch_invocations = 0
+    padded_frames = 0
+    vram_skipped_batches = 0
     pending_item: ClipRestoreItem | object | None = None
     reached_sentinel = False
     try:
@@ -278,18 +282,32 @@ def primary_restore_loop(
             batch_min_frames = (
                 batch_min_frames if isinstance(batch_min_frames, int) else 0
             )
+            max_padding_frames = getattr(
+                restoration_pipeline,
+                "independent_clip_batch_max_padding_frames",
+                0,
+            )
+            max_padding_frames = (
+                max_padding_frames if isinstance(max_padding_frames, int) else 0
+            )
             while (
                 len(clip_items[0].raw_crops) >= max(0, batch_min_frames)
                 and len(clip_items) < max(1, batch_limit)
             ):
                 try:
-                    candidate = clip_queue.get_nowait()
+                    candidate = clip_queue.get(timeout=0.01)
                 except Empty:
                     break
                 if candidate is _SENTINEL:
                     reached_sentinel = True
                     break
-                if len(candidate.raw_crops) != len(clip_items[0].raw_crops):
+                first_frames = len(clip_items[0].raw_crops)
+                candidate_frames = len(candidate.raw_crops)
+                if (
+                    candidate_frames < max(0, batch_min_frames)
+                    or abs(candidate_frames - first_frames)
+                    > max(0, max_padding_frames)
+                ):
                     pending_item = candidate
                     break
                 clip_items.append(candidate)
@@ -299,17 +317,49 @@ def primary_restore_loop(
             restoration_clips += len(clip_items)
             with timer.measure("restore"):
                 if len(clip_items) > 1:
-                    try:
-                        results = restoration_pipeline.prepare_and_run_primary_batch(
-                            clip_items
-                        )
-                        batched_invocations += 1
-                    except torch.cuda.OutOfMemoryError:
-                        log.warning(
-                            "Primary clip batch of %d exceeded VRAM; retrying individually",
-                            len(clip_items),
-                        )
-                        torch.cuda.empty_cache()
+                    batch_candidates += 1
+                    min_free_bytes = getattr(
+                        restoration_pipeline,
+                        "independent_clip_batch_min_free_bytes",
+                        0,
+                    )
+                    min_free_bytes = (
+                        min_free_bytes if isinstance(min_free_bytes, int) else 0
+                    )
+                    enough_vram = True
+                    if device.type == "cuda" and min_free_bytes > 0:
+                        free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
+                        enough_vram = int(free_bytes) >= min_free_bytes
+                    if enough_vram:
+                        try:
+                            results = restoration_pipeline.prepare_and_run_primary_batch(
+                                clip_items
+                            )
+                            batched_invocations += 1
+                            lengths = [len(entry.raw_crops) for entry in clip_items]
+                            padding = max(lengths) * len(lengths) - sum(lengths)
+                            if padding > 0:
+                                padded_batch_invocations += 1
+                                padded_frames += padding
+                        except torch.cuda.OutOfMemoryError:
+                            log.warning(
+                                "Primary clip batch of %d exceeded VRAM; retrying individually",
+                                len(clip_items),
+                            )
+                            torch.cuda.empty_cache()
+                            results = [
+                                restoration_pipeline.prepare_and_run_primary(
+                                    clip_item.clip,
+                                    clip_item.raw_crops,
+                                    clip_item.frame_shape,
+                                    clip_item.keep_start,
+                                    clip_item.keep_end,
+                                    clip_item.crossfade_weights,
+                                )
+                                for clip_item in clip_items
+                            ]
+                    else:
+                        vram_skipped_batches += 1
                         results = [
                             restoration_pipeline.prepare_and_run_primary(
                                 clip_item.clip,
@@ -356,10 +406,17 @@ def primary_restore_loop(
     finally:
         log.info(timer.summary())
         log.info(
-            "[activity] restoration_clips=%d unique_tracks=%d batched_invocations=%d",
+            "[activity] restoration_clips=%d unique_tracks=%d "
+            "batch_candidates=%d batched_invocations=%d "
+            "padded_batch_invocations=%d padded_frames=%d "
+            "vram_skipped_batches=%d",
             restoration_clips,
             len(restored_track_ids),
+            batch_candidates,
             batched_invocations,
+            padded_batch_invocations,
+            padded_frames,
+            vram_skipped_batches,
         )
         log.debug("[primary] thread exiting")
         secondary_queue.put(_SENTINEL)

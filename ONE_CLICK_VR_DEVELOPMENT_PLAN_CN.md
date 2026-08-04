@@ -246,16 +246,16 @@ T=16 稳态外部峰值 `89C`、程序末端 `90C`，无 MCE/GPU reset/ring time
   和所有小视频继续使用 Jasna 原 reader。系统需安装与当前 ROCm 匹配的
   `rocdecode-dev`；缺失或运行异常时永久回退。
 - 183 秒和 34:23 8-bit 整片最终 E2E 已通过；Main 10 长片与 F 盘多素材长期矩阵
-  继续延期。rocDecode 短验收位于
-  `/media/latiao/D/AI/lada/jasna_benchmarks/o10_rocdecode_20260804/`，最终整片证据位于
-  `/media/latiao/D/AI/lada/jasna_benchmarks/o14_full_final_65a5dea_20260804/`。
+  继续延期。旧 rocDecode 与同码控基线证据保留在只读 Windows D 盘；当前首次扫描、
+  最终整片输出和完整验收证据统一位于 Ubuntu ext4 的
+  `/home/latiao/vr_toolbox_jasna_linux/benchmarks/`。
 - Windows AMD smart-render 尚未验收，继续明确拒绝。8-bit 整部真实长片已经完成；
   Main 10 整片按当前执行策略延期，不是开始性能优化的前置门槛。编译后端已完成
   可用性评估，没有优于 eager 的可部署项。
 
 ### 当前验证证据
 
-- 完整测试集：`1911 passed, 119 skipped, 0 failed`；跳过项是当前 AMD 主机不适用或
+- 完整测试集：`1927 passed, 119 skipped, 0 failed`；跳过项是当前 AMD 主机不适用或
   缺少受保护资源的 TensorRT、NVENC/NVDEC、RTX、TVAI 等路径。
 - 独立 E2E：`6 passed, 17 skipped`；AMD 上执行元数据、解码和检测，NVIDIA 专用项
   按平台声明跳过。
@@ -344,6 +344,19 @@ T=16 稳态外部峰值 `89C`、程序末端 `90C`，无 MCE/GPU reset/ring time
   MIGraphX fullgraph 连 4 帧 smoke 也未在 180 秒内完成。两者均未回退，但冷启动和
   shape 专用缓存成本不可接受；加上真实 E2E 已受 AV1 media encoder 限制，生产路径
   保持 eager。
+- 陌生 50 秒 8K 片段首次扫描使用 rfdetr-v6、阈值 `0.70`、连续 2 次命中和 detector
+  batch 4；51 个样本中 37 次确认命中，形成 2 个区间，墙钟 `37.987s`、hotspot 峰值
+  `74C`。扫描阈值只负责预扫描区间规划；逐帧 render 检测阈值仍为 `0.35`。
+- workspace v3 最终 34:23 整片 `Processor` 墙钟 `5058.768s`，相对同码控
+  `6061.135s` 基线节省 `1002.367s`、下降 `16.54%`。两个 render span 共 2536 个
+  restoration clips；其中长 span 的 2343 个 clips 触发 92 次 batch 2，padding、显存
+  跳过和 fallback 均为 0。处理期系统 CPU 中位 `19.4%`、GPU gfx/media 中位
+  `92%/62%`、显存中位/峰值 `12.71/13.73 GiB`、hotspot 峰值 `97C`。
+- 最终输出保持 `123669/123669` 视频包和 `96716/96716` 音频包，copy VCL
+  `60836/60836` 全同、render VCL `62833/62833` 全部变化，音频 payload 逐包全同；
+  PTS 最大偏差约 `5.6us`，DTS cadence 通过。独立 AMF 硬解返回码 0、约
+  `93.54 fps`、`dup=0/drop=0`。输出视频码率 `25.673 Mbps`，只比同码控基线
+  `26.253 Mbps` 低 `2.21%`；没有 MCE、Data Fabric、GPU reset、ring timeout 或 OOM。
 
 ## 分阶段实施与门槛
 
@@ -392,7 +405,8 @@ T=16 稳态外部峰值 `89C`、程序末端 `90C`，无 MCE/GPU reset/ring time
 - 8K HEVC 正式编码已排除失控的 QVBR 和会在 AMF 原生预分析线程崩溃的
   `vbr_peak + preanalysis=1`；Linux AMD 在存在自动源码率上限且用户未显式选择
   码控时改用 `vbr_peak + preanalysis=0`，并由 codec context 绑定目标码率。
-  工作区算法同步升为 v2，旧码控生成的高码率片段不会被复用。
+  工作区算法先随码控升为 v2，随后因检测与恢复调度契约升为 v3；旧策略生成的片段
+  不会被错误复用。
 - 已完成 183 秒真实长片窗口、停止/跨进程恢复和尾帧回归，并完成 34:23 的 8-bit
   整部长片渲染、音视频/PTS/VCL 保真、资源监控和 AMF 全片硬解；Main 10 与其他片源
   的长期矩阵按当前策略延期。
@@ -400,13 +414,13 @@ T=16 稳态外部峰值 `89C`、程序末端 `90C`，无 MCE/GPU reset/ring time
   183 秒验收后撤除，O4/O5 因解码/编码边界不具备等价收益而不实现。O1 后整片已经
   完成但因跨越码控提交只能作为稳定性证据；不得把被拒候选分别升级为整片测试，也不
   在建立相同当前码控基线前重跑完整 8-bit 或提前启动大量素材矩阵。
-- 最终 183 秒当前路径墙钟 `560.356s`，媒体/AMF 硬解全部通过；最终 34:23 一键 VR
-  `Processor` 墙钟 `6063.103s`，`123669/96716` 视频/音频包、copy/render VCL、逐包
-  音频和 PTS 均通过，AMF 解码 `93.56 fps`、`dup=0/drop=0`。整片在 315W 下 hotspot
-  峰值 `95C`，显存峰值 `23.82 GiB`，未触发 `105C` 单点或 `100C` 连续 10 秒保护，
-  零 offload、OOM、fallback 或 GPU reset。
-  上一次完整运行输出码率为 `47.556 Mbps`，本次为 `26.253 Mbps`，所以表面
-  `42.01%` 墙钟下降只作为实际用户路径结果；本次数据是后续同码控比较的新基线。
+- 最终 183 秒当前路径墙钟 `560.356s`，媒体/AMF 硬解全部通过。首个同码控 34:23
+  基线 `Processor` 墙钟 `6061.135s`；workspace v3 最终验收降至 `5058.768s`，下降
+  `16.54%`，并首次在真实整片触发 92 次 restoration batch 2。最终视频/音频包、
+  copy/render VCL、逐包音频、PTS/DTS 和 AMF 硬解全部通过；315W 下 hotspot 峰值
+  `97C`、显存峰值 `13.73 GiB`，零 offload、OOM、fallback、MCE 或 GPU reset。
+  最终证据和输出位于
+  `/home/latiao/vr_toolbox_jasna_linux/benchmarks/o18_full_final_20260804/`。
 
 ## 测试素材矩阵
 
@@ -431,11 +445,14 @@ bit-depth 对照，10-bit 版本用于 Main 10 生产契约。HEVC 的 62 帧 10
 用于编解码契约，不替代上述 AV1 去码正样本。Main 10 长片保留为延期验收素材，不在
 O1--O4 优化阶段运行。
 
-F 盘两套 A/B 目录永远只读，新 Jasna 输出、manifest、截图和资源报告统一写入
-`/media/latiao/D/AI/lada/jasna_benchmarks/`。`scripts/build_legacy_vr_ab_manifest.py`
+Windows 分区中的源片、旧成片和既有证据永远只读；新 Jasna 输出、工作缓存、manifest、
+截图和资源报告统一写入 Ubuntu ext4 的
+`/home/latiao/vr_toolbox_jasna_linux/benchmarks/`。`scripts/build_legacy_vr_ab_manifest.py`
 负责精确配对和媒体/旧日志元数据采集。用户已经批准开始；当前先保留 manifest 和
 分层计划，不与可比基线建立争用磁盘和 CPU。正式大矩阵先用 manifest
 分层选择短/中/长、8/10-bit、低/中/高扫描覆盖率，不对 33 组全部直接跑整片。
+表中位于 `/home/latiao/vr_toolbox_jasna_linux/work/` 的历史短样本已在最终验收后清理，
+需要回归时从只读长片重新抽取；`o17/o18` 最终证据和成片永久保留。
 
 ## 上游同步纪律
 

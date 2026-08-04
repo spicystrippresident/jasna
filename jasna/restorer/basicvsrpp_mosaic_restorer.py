@@ -11,6 +11,8 @@ from jasna.models.basicvsrpp.inference import load_model
 INFERENCE_SIZE = 256
 AMD_INDEPENDENT_CLIP_BATCH_SIZE = 2
 AMD_INDEPENDENT_CLIP_BATCH_MIN_FRAMES = 60
+AMD_INDEPENDENT_CLIP_BATCH_MAX_PADDING_FRAMES = 4
+AMD_INDEPENDENT_CLIP_BATCH_MIN_FREE_BYTES = 768 * 1024 * 1024
 
 
 class BasicvsrppMosaicRestorer:
@@ -60,9 +62,17 @@ class BasicvsrppMosaicRestorer:
             self.independent_clip_batch_min_frames = (
                 AMD_INDEPENDENT_CLIP_BATCH_MIN_FRAMES
             )
+            self.independent_clip_batch_max_padding_frames = (
+                AMD_INDEPENDENT_CLIP_BATCH_MAX_PADDING_FRAMES
+            )
+            self.independent_clip_batch_min_free_bytes = (
+                AMD_INDEPENDENT_CLIP_BATCH_MIN_FREE_BYTES
+            )
         else:
             self.independent_clip_batch_size = 1
             self.independent_clip_batch_min_frames = 0
+            self.independent_clip_batch_max_padding_frames = 0
+            self.independent_clip_batch_min_free_bytes = 0
 
     def close(self) -> None:
         if self._split_forward is not None:

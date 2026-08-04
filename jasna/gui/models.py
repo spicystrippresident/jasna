@@ -125,6 +125,8 @@ class AppSettings:
     # Processing mode
     processing_mode: str = "standard"  # standard, one_click_vr
     one_click_scan_interval: float = 1.0
+    one_click_scan_threshold: float = 0.70
+    one_click_min_consecutive_hits: int = 2
 
     # Basic processing
     batch_size: int = 4
@@ -268,6 +270,16 @@ def _migrate_preset_dict(preset_dict: dict) -> dict:
         migrated["encoder_custom_args"] = _migrate_encoder_custom_args(custom_args)
     if "codec" in migrated:
         migrated["codec"] = _normalize_preset_codec(migrated["codec"])
+    if "one_click_scan_threshold" not in preset_dict:
+        from jasna.mosaic.detection_registry import (
+            recommended_one_click_score_threshold,
+        )
+
+        migrated["one_click_scan_threshold"] = (
+            recommended_one_click_score_threshold(
+                migrated.get("detection_model", "rfdetr-v6")
+            )
+        )
     return migrated
 
 

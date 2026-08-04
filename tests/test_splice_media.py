@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from fractions import Fraction
 import subprocess
 from pathlib import Path
 
@@ -72,7 +73,7 @@ def test_h264_probe_resolves_source_compatible_smart_settings(tmp_path: Path) ->
     ("codec", "encoder", "source_options", "render_options"),
     [
         ("h264", "libx264", ["-g", "12", "-keyint_min", "12", "-sc_threshold", "0"], ["-g", "12", "-bf", "3", "-flags", "+cgop"]),
-        ("hevc", "libx265", ["-x265-params", "keyint=12:min-keyint=12:scenecut=0:open-gop=0"], ["-x265-params", "keyint=12:bframes=4:open-gop=0"]),
+        ("hevc", "libx265", ["-x265-params", "keyint=12:min-keyint=12:scenecut=0:open-gop=0"], ["-x265-params", "keyint=12:bframes=0:open-gop=0"]),
         ("av1", "libsvtav1", ["-preset", "10", "-g", "12", "-svtav1-params", "scd=0"], ["-preset", "10", "-g", "12"]),
     ],
 )
@@ -97,9 +98,25 @@ def test_mixed_encoder_splice_decodes_with_exact_duration_and_audio(
     index = probe_keyframes(source, metadata)
     assert len(index.pts) >= 3
 
-    raw_parts = [tmp_path / f"raw-{i}.nut" for i in range(3)]
-    create_copy_fragment(source, SpliceSpan("copy", index.start_pts, index.pts[1]), index, raw_parts[0])
-    create_copy_fragment(source, SpliceSpan("copy", index.pts[2], index.end_pts), index, raw_parts[2])
+    suffix = ".ts" if codec in {"h264", "hevc"} else ".mkv"
+    normalized_parts = [tmp_path / f"part-{i}{suffix}" for i in range(3)]
+    create_copy_fragment(
+        source,
+        SpliceSpan("copy", index.start_pts, index.pts[1]),
+        index,
+        normalized_parts[0],
+        codec=codec,
+        normalized=True,
+    )
+    create_copy_fragment(
+        source,
+        SpliceSpan("copy", index.pts[2], index.end_pts),
+        index,
+        normalized_parts[2],
+        codec=codec,
+        normalized=True,
+    )
+    raw_render = tmp_path / "raw-render.nut"
     _ffmpeg(
         "-ss", "1",
         "-i", str(source),
@@ -110,15 +127,16 @@ def test_mixed_encoder_splice_decodes_with_exact_duration_and_audio(
         "-c:v", encoder,
         *render_options,
         "-f", "nut",
-        str(raw_parts[1]),
+        str(raw_render),
     )
 
-    suffix = ".ts" if codec in {"h264", "hevc"} else ".mkv"
-    fragments = []
-    for part_index, raw in enumerate(raw_parts):
-        normalized = tmp_path / f"part-{part_index}{suffix}"
-        normalize_fragment(raw, normalized, codec=codec)
-        fragments.append((normalized, 1.0))
+    normalize_fragment(
+        raw_render,
+        normalized_parts[1],
+        codec=codec,
+        decode_delay=index.decode_delay_pts * index.time_base,
+    )
+    fragments = [(part, 1.0) for part in normalized_parts]
     assembled = tmp_path / f"assembled{suffix}"
     concatenate_fragments(
         fragments,
@@ -136,6 +154,19 @@ def test_mixed_encoder_splice_decodes_with_exact_duration_and_audio(
         output_frames = [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
         assert len(output_frames) == 36
         assert float(container.duration / av.time_base) == pytest.approx(3.0, abs=0.01)
+    with av.open(str(output)) as container:
+        stream = container.streams.video[0]
+        dts_seconds = [
+            Fraction(packet.dts) * Fraction(packet.time_base)
+            for packet in container.demux(stream)
+            if packet.dts is not None
+        ]
+    dts_steps = [
+        current - previous
+        for previous, current in zip(dts_seconds, dts_seconds[1:])
+    ]
+    assert dts_steps
+    assert max(abs(float(step - Fraction(1, 12))) for step in dts_steps) <= 0.001
     with av.open(str(source)) as container:
         source_frames = [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
     for frame_index in [*range(12), *range(24, 36)]:

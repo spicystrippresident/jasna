@@ -7,6 +7,8 @@ from scripts.validate_smart_render_output import (
     _max_pts_delta_seconds,
     _relative_seconds,
     _strictly_increasing,
+    _timestamp_step_stats,
+    _timestamp_steps_within_reference,
     _vcl_digest,
 )
 
@@ -43,6 +45,44 @@ def test_pts_helpers() -> None:
         [0, 1502, 3003],
         Fraction(1, 90_000),
     ) == pytest.approx(1 / 180_000)
+    assert _timestamp_step_stats(
+        [0, 1501, 3003, 4504],
+        Fraction(1, 90_000),
+        Fraction(1001, 60_000),
+    ) == pytest.approx(
+        (
+            1501 / 90_000,
+            1502 / 90_000,
+            0.5 / 90_000,
+        )
+    )
+
+
+def test_dts_cadence_allows_source_quantization_and_existing_tail_gap() -> None:
+    assert _timestamp_steps_within_reference(
+        [0, 1501, 3003, 4504],
+        Fraction(1, 90_000),
+        [0, 17, 33, 50],
+        Fraction(1, 1000),
+        tolerance=Fraction(1, 1000),
+    )
+    assert _timestamp_steps_within_reference(
+        [0, 1530, 3060, 7560, 10_530],
+        Fraction(1, 90_000),
+        [0, 17, 34, 84, 117],
+        Fraction(1, 1000),
+        tolerance=Fraction(1, 1000),
+    )
+
+
+def test_dts_cadence_rejects_gap_not_present_in_source() -> None:
+    assert not _timestamp_steps_within_reference(
+        [0, 1530, 3060, 12_600],
+        Fraction(1, 90_000),
+        [0, 17, 34, 84],
+        Fraction(1, 1000),
+        tolerance=Fraction(1, 1000),
+    )
 
 
 def test_invalid_length_prefixed_packet_is_rejected() -> None:

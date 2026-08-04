@@ -24,7 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SOURCE_ROOT = Path("/media/latiao/F/VR1/亚洲/骑兵")
 DEFAULT_LEGACY_ROOT = Path("/media/latiao/F/VR1/亚洲/转好的步兵")
 DEFAULT_OUTPUT = Path(
-    "/media/latiao/D/AI/lada/jasna_benchmarks/legacy_vr_ab/manifest.json"
+    "/home/latiao/vr_toolbox_jasna_linux/benchmarks/legacy_vr_ab/manifest.json"
 )
 VIDEO_EXTENSIONS = {".m4v", ".mkv", ".mov", ".mp4", ".webm"}
 RESTORED_SUFFIX = re.compile(

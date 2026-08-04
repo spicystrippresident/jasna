@@ -13,9 +13,29 @@ from jasna.pipeline import Pipeline
 from jasna.segments import SegmentRange
 
 
-def _write_normalized(_source, destination, *, codec) -> None:
-    del codec
+def _write_normalized(
+    _source,
+    destination,
+    *,
+    codec,
+    decode_delay=Fraction(0, 1),
+) -> None:
+    del codec, decode_delay
     Path(destination).write_bytes(b"verified fragment")
+
+
+def _write_copy_fragment(
+    _source,
+    _span,
+    _index,
+    destination,
+    *,
+    codec,
+    normalized=False,
+) -> None:
+    del codec
+    assert normalized
+    Path(destination).write_bytes(b"verified copy fragment")
 
 
 def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_path) -> None:
@@ -66,7 +86,10 @@ def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_pat
         patch("jasna.pipeline.probe_keyframes") as probe_keyframes,
         patch("jasna.pipeline.build_splice_plan") as build_splice_plan,
         patch("jasna.pipeline.NvidiaVideoEncoder") as encoder,
-        patch("jasna.pipeline.create_copy_fragment") as copy_fragment,
+        patch(
+            "jasna.pipeline.create_copy_fragment",
+            side_effect=_write_copy_fragment,
+        ) as copy_fragment,
         patch("jasna.pipeline.normalize_fragment", side_effect=_write_normalized),
         patch("jasna.pipeline.concatenate_fragments") as concatenate,
         patch("jasna.pipeline.mux_final_output") as mux,
@@ -131,7 +154,10 @@ def test_smart_run_uses_working_dir_for_temp_files(tmp_path) -> None:
     with (
         patch("jasna.pipeline.validate_smart_render", return_value="h264"),
         patch("jasna.pipeline.NvidiaVideoEncoder"),
-        patch("jasna.pipeline.create_copy_fragment"),
+        patch(
+            "jasna.pipeline.create_copy_fragment",
+            side_effect=_write_copy_fragment,
+        ),
         patch("jasna.pipeline.normalize_fragment", side_effect=_write_normalized),
         patch("jasna.pipeline.concatenate_fragments"),
         patch("jasna.pipeline.mux_final_output") as mux,
@@ -182,9 +208,18 @@ def test_smart_run_reuses_verified_spans_after_mux_failure(tmp_path) -> None:
         Path(path).write_bytes(b"render raw")
         return MagicMock()
 
-    def copy_fragment(_source, _span, _index, destination, *, codec):
+    def copy_fragment(
+        _source,
+        _span,
+        _index,
+        destination,
+        *,
+        codec,
+        normalized=False,
+    ):
         del codec
-        Path(destination).write_bytes(b"copy raw")
+        assert normalized
+        Path(destination).write_bytes(b"copy fragment")
 
     with (
         patch("jasna.pipeline.validate_smart_render", return_value="h264"),
@@ -199,7 +234,7 @@ def test_smart_run_reuses_verified_spans_after_mux_failure(tmp_path) -> None:
 
     assert encoder.call_count == 1
     assert copy.call_count == 2
-    assert normalize.call_count == 3
+    assert normalize.call_count == 1
     assert len(list(pipeline.working_dir.glob(".output.segments-*"))) == 1
 
     pipeline._run_pass.reset_mock()

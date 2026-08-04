@@ -66,6 +66,10 @@ def _fake_section_widgets() -> dict:
         "one_click_scan_interval": _FakeValueMenu(
             {"0.5": "每半秒", "1.0": "每秒"}, "0.5"
         ),
+        "one_click_scan_threshold": _FakeWidget(0.7),
+        "one_click_min_consecutive_hits": _FakeValueMenu(
+            {"1": "一次", "2": "两次", "3": "三次"}, "2"
+        ),
         "max_clip_size": _FakeWidget(90),
         "fp16_mode": _FakeWidget(1),
         "detection_model": _FakeWidget("rfdetr-v6"),
@@ -132,6 +136,8 @@ def test_sections_collect_internal_values_without_translation_lookups() -> None:
     assert values["file_conflict"] == "skip"
     assert values["processing_mode"] == "one_click_vr"
     assert values["one_click_scan_interval"] == 0.5
+    assert values["one_click_scan_threshold"] == 0.7
+    assert values["one_click_min_consecutive_hits"] == 2
     assert values["vr_mode"] == "off"
     assert values["denoise_strength"] == "high"
     assert values["denoise_step"] == "after_secondary"

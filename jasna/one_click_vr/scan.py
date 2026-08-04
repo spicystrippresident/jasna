@@ -93,16 +93,21 @@ def scan_video_for_one_click_vr(
                 plan = build_one_click_vr_plan(
                     result.times,
                     result.scores,
-                    threshold=float(settings.detection_score_threshold),
+                    threshold=float(settings.one_click_scan_threshold),
                     scan_interval_seconds=result.stride,
                     duration_seconds=result.duration,
                     completed_until_seconds=result.completed_until,
+                    minimum_consecutive_hits=int(
+                        settings.one_click_min_consecutive_hits
+                    ),
                 )
                 if str(settings.vr_projection) != "auto":
                     return plan
+                if not plan.segments:
+                    return plan
                 candidates = candidates_from_scan(
                     result,
-                    threshold=float(settings.detection_score_threshold),
+                    threshold=float(settings.one_click_scan_threshold),
                     video_width=int(getattr(metadata, "video_width", 0)),
                     video_height=int(getattr(metadata, "video_height", 0)),
                 )

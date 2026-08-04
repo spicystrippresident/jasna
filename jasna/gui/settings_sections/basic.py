@@ -183,11 +183,20 @@ class BasicSection:
         self._on_max_clip_size_change(max_clip_size)
 
     def _on_detection_model_changed(self, value: str):
-        from jasna.mosaic.detection_registry import recommended_score_threshold
+        from jasna.mosaic.detection_registry import (
+            recommended_one_click_score_threshold,
+            recommended_score_threshold,
+        )
 
         threshold = recommended_score_threshold(value)
         self._widgets["detection_score_threshold"].set(threshold)
         self._widgets["detection_threshold_val"].configure(text=f"{threshold:.2f}")
+        if "one_click_scan_threshold" in self._widgets:
+            scan_threshold = recommended_one_click_score_threshold(value)
+            self._widgets["one_click_scan_threshold"].set(scan_threshold)
+            self._widgets["one_click_scan_threshold_val"].configure(
+                text=f"{scan_threshold:.2f}"
+            )
         self._on_modified()
 
     def _on_file_conflict_changed(self, value: str):
@@ -218,10 +227,16 @@ class BasicSection:
         if det_model not in choices:
             from jasna.mosaic.detection_registry import (
                 DEFAULT_DETECTION_MODEL_NAME,
+                recommended_one_click_score_threshold,
                 recommended_score_threshold,
             )
             det_model = DEFAULT_DETECTION_MODEL_NAME if DEFAULT_DETECTION_MODEL_NAME in choices else choices[0]
             det_threshold = recommended_score_threshold(det_model)
+            scan_threshold = recommended_one_click_score_threshold(det_model)
+            self._widgets["one_click_scan_threshold"].set(scan_threshold)
+            self._widgets["one_click_scan_threshold_val"].configure(
+                text=f"{scan_threshold:.2f}"
+            )
         self._widgets["detection_model"].set(det_model)
         self._widgets["detection_score_threshold"].set(det_threshold)
         self._widgets["detection_threshold_val"].configure(text=f"{det_threshold:.2f}")

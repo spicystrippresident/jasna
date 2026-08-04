@@ -167,10 +167,13 @@ def load_scan_cache(
         plan = build_one_click_vr_plan(
             evidence["sample_times"],
             evidence["sample_scores"],
-            threshold=float(settings.detection_score_threshold),
+            threshold=float(settings.one_click_scan_threshold),
             scan_interval_seconds=float(evidence["effective_interval_seconds"]),
             duration_seconds=float(evidence["duration_seconds"]),
             completed_until_seconds=float(evidence["completed_until_seconds"]),
+            minimum_consecutive_hits=int(
+                settings.one_click_min_consecutive_hits
+            ),
         )
         projection_payload = evidence.get("projection_evidence")
         if projection_payload is not None:

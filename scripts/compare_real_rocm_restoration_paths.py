@@ -179,6 +179,33 @@ def _pairs_by_length(items: list[ClipRestoreItem]):
     return pairs
 
 
+def _window_pair_count(
+    lengths: list[int],
+    *,
+    window: int,
+    minimum_frames: int,
+    maximum_padding: int,
+) -> int:
+    remaining = list(enumerate(lengths))
+    pairs = 0
+    while remaining:
+        _first_index, first_length = remaining.pop(0)
+        if first_length < minimum_frames:
+            continue
+        candidates = [
+            (offset, abs(length - first_length))
+            for offset, (_index, length) in enumerate(remaining[: max(0, window - 1)])
+            if length >= minimum_frames
+            and abs(length - first_length) <= maximum_padding
+        ]
+        if not candidates:
+            continue
+        offset, _difference = min(candidates, key=lambda value: (value[1], value[0]))
+        remaining.pop(offset)
+        pairs += 1
+    return pairs
+
+
 def _run_single(pipeline: RestorationPipeline, item: ClipRestoreItem):
     return pipeline.prepare_and_run_primary(
         item.clip,
@@ -347,6 +374,11 @@ def main() -> None:
     parser.add_argument("--min-detection-duration", type=int, default=2)
     parser.add_argument("--max-junction-c", type=float, default=90.0)
     parser.add_argument("--telemetry-interval", type=float, default=0.25)
+    parser.add_argument(
+        "--extract-only",
+        action="store_true",
+        help="Write clip-length scheduling evidence without running restoration",
+    )
     args = parser.parse_args()
 
     output = args.output.resolve()
@@ -359,6 +391,35 @@ def main() -> None:
     items, extraction = _extract_items(args, device)
     gc.collect()
     torch.cuda.empty_cache()
+    if args.extract_only:
+        lengths = extraction["item_lengths"]
+        eligible = sum(length >= 60 for length in lengths)
+        result = {
+            "source": str(args.input.resolve()),
+            "settings": {
+                "model": args.model,
+                "score_threshold": args.score_threshold,
+                "detection_batch_size": args.detection_batch_size,
+                "max_frames": args.max_frames,
+                "max_clip_size": args.max_clip_size,
+                "temporal_overlap": args.temporal_overlap,
+            },
+            "extraction": extraction,
+            "eligible_clips": eligible,
+            "window_pairing": {
+                f"window_{window}_padding_{padding}": _window_pair_count(
+                    lengths,
+                    window=window,
+                    minimum_frames=60,
+                    maximum_padding=padding,
+                )
+                for window in (2, 4, 8)
+                for padding in (0, 4, 8)
+            },
+        }
+        output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(result, indent=2), flush=True)
+        return
     pairs = _pairs_by_length(items)
     if not pairs:
         raise SystemExit(

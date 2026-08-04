@@ -17,6 +17,7 @@ from jasna.mosaic.detection_registry import (
     is_rfdetr_model,
     is_yolo_model,
     precompile_detection_engine,
+    recommended_one_click_score_threshold,
     recommended_score_threshold,
     rfdetr_model_config,
     require_detection_model_weights,
@@ -93,6 +94,9 @@ def test_recommended_score_threshold() -> None:
     assert recommended_score_threshold("rfdetr-v6-large") == 0.40
     assert recommended_score_threshold("rfdetr-v5") == 0.25
     assert recommended_score_threshold("lada-yolo-v4") == 0.25
+    assert recommended_one_click_score_threshold("rfdetr-v6") == 0.70
+    assert recommended_one_click_score_threshold("rfdetr-vr-v1") == 0.40
+    assert recommended_one_click_score_threshold("lada-yolo-v4") == 0.25
 
 
 def test_lada_yolo_v4_weights_path() -> None:

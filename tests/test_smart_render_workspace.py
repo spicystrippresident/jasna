@@ -107,7 +107,7 @@ def test_encoder_policy_version_is_part_of_workspace_signature(
 ) -> None:
     import jasna.smart_render_workspace as module
 
-    assert WORKSPACE_ALGORITHM_VERSION == "jasna-smart-render-workspace-v2"
+    assert WORKSPACE_ALGORITHM_VERSION == "jasna-smart-render-workspace-v3"
     first = SmartRenderWorkspace.open(
         tmp_path / "work",
         output=tmp_path / "output.mp4",

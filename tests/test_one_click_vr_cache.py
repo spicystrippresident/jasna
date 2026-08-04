@@ -34,6 +34,8 @@ def test_scan_cache_round_trip_and_rethreshold(tmp_path) -> None:
         processing_mode="one_click_vr",
         detection_model="rfdetr-v6",
         detection_score_threshold=0.5,
+        one_click_scan_threshold=0.5,
+        one_click_min_consecutive_hits=1,
         working_directory=str(tmp_path / "work"),
     )
     cache_path = scan_cache_path(source, tmp_path / "output.mp4", settings)
@@ -47,7 +49,7 @@ def test_scan_cache_round_trip_and_rethreshold(tmp_path) -> None:
         stricter = load_scan_cache(
             cache_path,
             source,
-            replace(settings, detection_score_threshold=0.9),
+            replace(settings, one_click_scan_threshold=0.9),
         )
 
     assert cache_path.parent == tmp_path / "work" / ".jasna-one-click-vr"

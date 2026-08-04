@@ -55,7 +55,8 @@ Jasna GUI 队列
 - `jasna/gui/processor.py`：自动扫描后直接调用现有 `build_pipeline`，不启动外部 CLI worker。
 - `jasna/smart_render_workspace.py`：源片、splice、模型、处理与编码契约绑定的 span
   manifest；原子写入、哈希复用、损坏留档和安全清理。workspace 算法版本独立于
-  manifest schema，编码策略变化会失效旧片段；当前 Linux AMD HEVC 使用 v2。
+  manifest schema，编码、检测及恢复调度契约变化会失效旧片段；当前 Linux AMD
+  HEVC 使用 v3。
 - `jasna/pipeline.py`：在原生 smart-render span 边界接入 workspace；复用片段仍由
   Jasna 原生 assembly/mux 组装，恢复进度不污染 FPS 统计。
 - `jasna/media/splice.py`：用最大 packet 排他结束点补强容器 duration，确保最后
@@ -78,7 +79,7 @@ Jasna GUI 队列
   decode/scan backend A/B 的资源采样。
 - `scripts/compare_sbs_detection_paths.py`：同一批真实解码帧依次运行逐眼和合批 RF-DETR，
   比较逐帧框、mask、检测数、生产参数 ClipTracker 结果、耗时与完整 CPU/GPU 资源。
-  源片只读，JSON 证据只写指定的 D 盘目录。
+  Windows 源片只读，JSON 证据只写 Ubuntu ext4 的 benchmark 目录。
 - `scripts/compare_rocdecode_paths.py`：两个 backend 独立计时后再逐批核对全部 PTS/RGB；
   采集 CPU、gfx/VCN、显存、功耗和 hotspot，零帧、帧数差、像素差或 85C 均失败。
 - `jasna/license_api.py`：私有 protection 子模块存在时原样转发；公开源码中让免费
@@ -99,11 +100,11 @@ Jasna GUI 队列
 `/home/latiao/vr_toolbox_jasna_linux/migration_archive_vr_remove_mosaic_linux_20260802.tar.zst`
 （SHA-256：`0b9794d17ac6de0789142b6e19f8f2cfaba2344aba74be13aa63227ce82f4555`）。
 
-## 尚未完成
+## 已知限制与后续
 
 - rocDecode `1.7.0` backend 已实现并在 Linux AMD 上对至少 3000 万像素的 HEVC/AV1
-  自动启用，已通过 183 秒和 34:23 8K HEVC Main 真实 E2E。系统必须安装与当前 ROCm
-  匹配的 `rocdecode-dev`；不可用时自动回退，不影响原 AMF/software 路径。
+  自动启用，已通过 183 秒和 34:23 8K HEVC Main 真实 E2E。部署机必须安装与当前
+  ROCm 匹配的 `rocdecode-dev`；不可用时自动回退，不影响原 AMF/software 路径。
 - Windows AMD smart-render 尚未验收，继续保持严格保护；Linux AMD 的 AV1 8-bit
   和 Main 10 sparse smart-render 已通过，不再属于未完成项。
 - 8-bit HEVC 整部长片已通过，产品完整流程已经成立。有效马赛克 HEVC Main 10
@@ -111,7 +112,8 @@ Jasna GUI 队列
   优化的前置门槛。
 - 旧项目 A/B 已固定使用 F 盘只读数据集：`/media/latiao/F/VR1/亚洲/骑兵` 为原片，
   `/media/latiao/F/VR1/亚洲/转好的步兵` 为旧项目成片。新 Jasna 的输出、资源采样和
-  对比报告只能写入 D 盘独立目录，不复制、删除或改写 F 盘素材。
+  对比报告只能写入 Ubuntu ext4 的
+  `/home/latiao/vr_toolbox_jasna_linux/benchmarks/`，不复制、删除或改写 Windows 分区素材。
 - 当前只有本地开发分支和 `upstream`；个人 `origin`、上游 rebase 后的回归、推送和
   正式发布尚未执行。
 
@@ -122,7 +124,7 @@ Jasna GUI 队列
 FFprobe 记录 codec/profile/bit depth、分辨率、fps、时长、帧/包数、音频流、码率和
 文件大小，并解析旧日志的完成标记、墙钟、扫描覆盖率、阶段耗时和 CPU/GPU 记录。
 JSON/CSV 默认写入
-`/media/latiao/D/AI/lada/jasna_benchmarks/legacy_vr_ab/`。
+`/home/latiao/vr_toolbox_jasna_linux/benchmarks/legacy_vr_ab/`。
 
 长期矩阵从精确配对集中分层选取，不以单条最快或最慢结果代替整体结论：
 
@@ -202,7 +204,8 @@ payload 全同，`7681/7681` 个 render VCL payload 全部变化，音频 payloa
 证据，不能当成单项优化 A/B。
 
 34:23 整片随后在原始 `315W` 功耗墙下走真实 GUI `Processor` 一键 VR 路径，复用
-签名一致的 44 段扫描证据，墙钟 `6063.103s`。输出保持 `123669/123669` 视频包和
+签名一致的 44 段扫描证据，`Processor` 墙钟 `6061.135s`、外层墙钟 `6063.103s`。
+输出保持 `123669/123669` 视频包和
 `96716/96716` 音频包，`45852/45852` 个 copy VCL payload 全同，`77817/77817`
 个 render VCL payload 全部变化，所有音频 payload 全同；视频 PTS 最大偏差仅一个
 输出 time-base tick（`11.1us`）。独立 AMF 硬解 `123669` 帧，墙钟 `1321.986s`、
@@ -215,8 +218,30 @@ timeout 或 hardware error。两条进程退出时的 amdgpu VM memory stats 消
 
 该整片比上一次 `10455.988s` 完整运行少 `42.01%` 墙钟，但旧输出为
 `47.556 Mbps`、本次为当前源码率绑定的 `26.253 Mbps`，编码负载不可比；本片恢复
-调度还记录 `batched_invocations=0`。因此 `6063.103s` 是当前生产候选的新基线，不把
+调度还记录 `batched_invocations=0`。因此 `6061.135s` 是后续同码控比较基线，不把
 表面 `1.725x` 倍率归因于 rocDecode、O9 或任一单独改动。
+
+workspace v3、灵活同长 clip 配对和最终扫描策略完成后，以同一源片、CQ 28、315W
+功耗墙再次从 Ubuntu 工作目录执行整片验收。rfdetr-v6 的一键预扫描使用 `0.70` 阈值
+和连续 2 次命中，逐帧 render 检测保持 Jasna 推荐的 `0.35`；detector batch 4，
+BasicVSR++ 生产上限 batch 2。陌生 50 秒 8K 片段首次扫描 51 个采样、37 个确认命中、
+2 个区间，墙钟 `37.987s`，hotspot 峰值 `74C`。
+
+最终 34:23 整片的 `Processor` 墙钟为 `5058.768s`、外层墙钟 `5062.669s`；相对同码控
+基线节省 `1002.367s`，下降 `16.54%`（`1.198x`）。两个 render span 共生成 2536 个
+restoration clips，其中长 span 的 2343 个 clips 产生 92 个 batch 2 调用，padding、
+显存跳过和回退均为 0，证明条件合批首次在真实整片上产生收益。新旧视频码率分别为
+`25.673/26.253 Mbps`，只差 `2.21%`，比跨码控历史运行具有更强可比性。
+
+最终媒体验收保持 `123669/123669` 视频包和 `96716/96716` 音频包；`60836` 个 copy
+VCL 全同、`62833` 个 render VCL 全部变化、全部音频 payload 全同，PTS 最大偏差约
+`5.6us`，DTS 存在、唯一、严格递增且 cadence 通过。独立 AMF 硬解 `123669` 帧，
+约 `93.54 fps`、`dup=0/drop=0`、返回码 0。处理期系统 CPU 中位 `19.4%`、GPU
+gfx/media 中位 `92%/62%`、显存中位/峰值 `12.71/13.73 GiB`、功耗中位 `288.5W`、
+hotspot 峰值 `97C`；没有 MCE、Data Fabric、GPU reset、ring timeout 或 OOM。
+最终证据位于
+`/home/latiao/vr_toolbox_jasna_linux/benchmarks/o17_first_scan_20260804/` 和
+`/home/latiao/vr_toolbox_jasna_linux/benchmarks/o18_full_final_20260804/`。
 
 ## 上游同步纪律
 
@@ -238,7 +263,7 @@ git rebase upstream/main
 ## 当前验证
 
 - 内核：`6.17.0-41-generic`。
-- 完整测试集：`1911 passed, 119 skipped, 0 failed`。
+- 完整测试集：`1927 passed, 119 skipped, 0 failed`。
 - E2E：`6 passed, 17 skipped`；元数据、解码和检测在 AMD 上执行，NVENC/RTX/完整
   编码 E2E 明确按 NVIDIA 平台跳过。
 - 新增/修改 Python 文件和测试通过 `compileall`，`git diff --check` 通过。
@@ -295,10 +320,14 @@ git rebase upstream/main
   中位 `67%/44%`、VRAM 中位/峰值 17.44/18.25 GiB、hotspot 峰值 `85C`，零运行错误。
   该运行跨越 `b4033ed` 码控修复，输出从 27.583 升至 47.556 Mbps，因此只作为完整
   稳定性和资源证据，不进入正式性能排名。
-- 最终生产候选同片运行墙钟 `6063.103s`，当前源码率绑定后输出视频码率
-  `26.253 Mbps`、文件 `6,841,082,840` bytes；完整媒体保真、AMF 硬解和资源证据位于
-  `/media/latiao/D/AI/lada/jasna_benchmarks/o14_full_final_65a5dea_20260804/`。该结果作为
-  后续同码控 A/B 的当前基线，不与上条 47.556 Mbps 输出做单项优化归因。
+- 同码控基线的 `Processor` 墙钟为 `6061.135s`，输出视频码率 `26.253 Mbps`、文件
+  `6,841,082,840` bytes；其只读历史证据位于 Windows D 盘。workspace v3 最终整片
+  降至 `5058.768s`，输出视频码率 `25.673 Mbps`、文件 `6,691,642,265` bytes，实际
+  墙钟下降 `16.54%`。新媒体、硬解、资源和 batch 2 证据统一位于 Ubuntu 的
+  `/home/latiao/vr_toolbox_jasna_linux/benchmarks/o18_full_final_20260804/`。
+- 陌生 50 秒 8K 首次扫描墙钟 `37.987s`，51 个采样中 37 次确认命中，hotspot 峰值
+  `74C`；证据位于
+  `/home/latiao/vr_toolbox_jasna_linux/benchmarks/o17_first_scan_20260804/`。
 - O1 检测等价性报告位于
   `/media/latiao/D/AI/lada/jasna_benchmarks/o1_detection_equivalence_20260804/`；368 帧
   与 1200 帧窗口的 restoration items 均完全一致，合批推理快 `6.78%/7.55%`。
