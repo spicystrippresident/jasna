@@ -210,6 +210,7 @@ class Processor:
                 overrides["detection_model"] = snapshot.detection_model
             if snapshot.detection_score_threshold is not None:
                 overrides["detection_score_threshold"] = snapshot.detection_score_threshold
+                overrides["one_click_scan_threshold"] = snapshot.detection_score_threshold
             if snapshot.vr_projection is not None:
                 overrides["vr_projection"] = snapshot.vr_projection
             if overrides:

@@ -133,7 +133,7 @@ AMD 真机没有收益、维护成本过高或存在更优路线时也不移植�
 | O7：RF-DETR ROCm 后端 | 先评估固定 batch `torch.compile`/Inductor；只在可限定冷编译、无静默 fallback 且稳定加速时接入可选缓存 | steady-state 至少快 10%，检测/track 一致，首次构建可终止且不会消耗失控 RAM | 固定张量 compile smoke、短重复推理、资源采样 | 完成，否决 |
 | O8：BasicVSR++ 分段/Graph | 借鉴 NVIDIA 六子引擎边界，优先评估静态 loop body 的局部 compile/HIP Graph，不再重复已失败的整模型 fullgraph | 恢复 forward 至少快 10%，输出达到现有 FP16 门槛，缓存和冷启动成本可部署 | T=4/16 合成与真实 crop 微基准、数值比较 | 完成，否决 |
 | O9：独立 clip 合批 | 只合批不同 restoration item 的模型 batch 维，不合并 track、不删 temporal overlap；不同长度分桶，OOM 回退单 clip | 至少两个 clip 时吞吐提高 15%，单 clip 路径零回归，输出顺序和每 clip 上下文不变 | 同长/异长 clip 单测、batch 1/2/4 显存与吞吐 | 完成，条件保留 batch 2 |
-| O10：rocDecode 关键路径 | 不直接接入生产；根据 O6--O9 后的新瓶颈重新计算零回读 backend 的 E2E 上限 | 预测整片收益至少 8% 才进入后续实现，否则继续延期 | 使用已有 8/10-bit `88.3 fps`、像素/PTS 和长片阶段数据建上限模型 | 评估完成，进入独立后续实现 |
+| O10：rocDecode 关键路径 | PyAV 原始 PTS demux、rocDecode/HIP 原生桥、Torch-owned NV12/P010 和失败回退；只自动覆盖大分辨率 HEVC/AV1 | 短真实 RGB/PTS 全等且比原 reader 快；小视频、缺 SDK、异常均回退 | 8/10-bit HEVC 62 帧、8K AV1 60 帧、seek/stride、资源与温度 | 完成，受限保留 |
 | O11：AMD 融合通用内核 | 审计只在 NVIDIA 启用的 preprocess、RGB/YUV、blend、LUT、denoise；只实现当前一键 VR 默认路径上的关键项 | 单项关键链占比足够且微基准至少快 10%；不得为了对称移植未启用功能 | 调用路径审计、定向张量基准和等价性测试 | 完成，现状最优 |
 
 执行顺序固定为 O6/O6A -> O7 -> O8/O9 -> O10/O11。候选达不到门槛时撤除实验代码，只保留
@@ -163,22 +163,35 @@ AMD 真机没有收益、维护成本过高或存在更优路线时也不移植�
    `1.93x/1.92x`；真实 480 帧窗口的可分桶上限由 `7.705s` 降到 `4.737s`
    （`38.5%`），生产相邻规则覆盖其中 `540/1063` 个恢复帧。另一真实短窗 batch 2 慢
    `16.3%`，因此禁止小于 60 帧合批。真实 FP16 batch 输出 PSNR `75--86dB`、uint8
-   最大差 `1--3`。batch 4 不进入生产。
+   最大差 `1--3`。受控 batch 4、T=16 稳态虽达到 `284.76 fps`，比同轮 batch 3
+   的 `209.55 fps` 高约 `36%`，但该短形状不满足生产的 60 帧门槛；不能据此放宽
+   已被真实短窗否决的调度规则，batch 4 不进入生产。batch 3 在 283W 下的 T=60/90
+   稳态达到 `212.42/215.86 fps`，分别为同轮 batch 1 的 `2.71x/2.79x`，且数值误差
+   与 batch 2 相同；但外部 hotspot 均达到 `92C`。恢复正式 315W 后，T=90 在首个
+   batch 3 正式 repeat 内触发 `93C` 独立看门狗，因此固定 batch 3 同样不进入生产。
 6. FP16 继续默认。Jasna 原生 FP32 使用同一 BasicVSR++ checkpoint，不存在另一份 FP32
    模型。batch 1 的 T=16 两者等速，T=60/90 时 FP16 快 `2.6%/3.3%`；没有 ground truth
    证明 FP32 有可见质量收益，速度优先时不改默认。
-7. O10 的旧流水线上限为主 span 已观测的 `760.4s` restore queue slack，即整片
-   `7.27%`。O9 的真实相邻覆盖率预计可再减少约 `24%` 恢复工作，瓶颈将转回
-   decode+detect；此时零回读 rocDecode 可能超过 `8%` 门槛。结论从“继续延期”改为
-   “单独立项”，但本轮不提交缺少 PyAV time-base、C++/HIP 生命周期和 GPU
-   NV12/P010→RGB 的半成品 backend，也不因此启动完整测试。
+7. O10 受限保留。PyAV 继续拥有 demux 和原始整数 PTS/time-base；原生桥拥有
+   rocDecode/parser/HIP 生命周期，内部 surface 在释放前 D2D 拷入 Torch 自有
+   NV12/P010，再走 Jasna 同一 YUV→RGB。8-bit HEVC 对 AMF 快 `62.37%`，10-bit
+   HEVC 对软件快 `74.41%`，8K AV1 对软件快 `46.89%`；短段全部 PTS/RGB 逐值相等。
+   自动路由只覆盖 Linux AMD、HEVC/AV1 和至少 3000 万像素；小 H.264/AV1 的固定
+   初始化成本会退化，因此保留 PyAV。SDK/构建/初始化/运行失败永久回退原 reader。
 8. O11 不新增生产内核。默认 denoise/LUT/secondary/sharpen 均关闭，RGB→YUV write 只占
    整片约 `1.15%`。AMD 已用 prefix-sum blend mask；在 16--128 mask 上比 NVIDIA conv
    路径快 `23.7--26.3%` 且逐值一致，保留 Jasna 当前分支。
 
 一次 batch 4、T=60/90 合成压力测试把 GPU hotspot 推到 `98C`，约一分钟后机器因
-Data Fabric sync flood/MCE 异常重启。此后生产候选固定为 batch 2，GPU 脚本默认使用
-结温门槛；本轮后续真实窗口峰值 `74C`，当前启动日志没有新增硬件错误。
+Data Fabric sync flood/MCE 异常重启。本机 VBIOS/驱动报告 hotspot 在 `110C` 降频、
+`115C` 紧急关机；AMD 对 RX 7900 系列的公开口径同样以 `110C` 为规格内工作上限，
+但该上限不是本项目的持续目标。独立看门狗因此固定在 `93C`，基准程序在 `92C` 先行
+退出，测试时把功耗从 315W 临时限制到 283W 并在所有退出路径恢复。受控 batch 4、
+T=16 稳态外部峰值 `89C`、程序末端 `90C`，无 MCE/GPU reset/ring timeout；由于只剩
+2C 程序余量且不代表 60 帧生产形状，不再扩大 batch 4 的 T=30/60 压测。batch 3
+补测覆盖 283W 的 T=60/90 稳态和 315W 的 T=90 稳态；后者在 `93C` 被独立看门狗
+安全终止，内核只有进程终止后的 queue eviction，没有 MCE、GPU reset 或 ring timeout，
+功耗上限恢复 315W。生产候选因此仍固定为 batch 2。
 
 ## 当前真实状态
 
@@ -209,10 +222,9 @@ Data Fabric sync flood/MCE 异常重启。此后生产候选固定为 batch 2，
 - Linux AMD 的 H.264/HEVC/AV1 smart fragment 已完成真机验收并开放；Windows AMD
   仍保持严格保护。Jasna 的 `b_ref_mode` 在 Linux AMD H.264 fragment 边界映射为
   AMF `bf_ref`，forced IDR 使用 AMF 原生 `forced_idr` 参数。
-- Linux AMD 8K HEVC 已按用途分流解码：低频自动扫描显式允许 FFmpeg 软件解码，
-  正式检测、恢复、blend 和编码管线继续使用 Jasna 的 AMF reader。该边界只作用于
-  Linux AMD、HEVC、约 3000 万像素以上的扫描，不改变预览、小分辨率、Windows 或
-  NVIDIA 路径。
+- Linux AMD 大分辨率 HEVC/AV1 已按像素门槛分流解码：至少 3000 万像素时自动使用
+  rocDecode，低于门槛、H.264/VP9 或初始化/运行失败时保留 Jasna 原 AMF/software
+  reader。该边界不改变预览、小分辨率、Windows 或 NVIDIA 路径。
 - 公开源码缺少私有 protection 子模块时，`jasna.license_api` 让免费模型和 GUI 正常
   运行；只有主动激活 supporter 功能时才返回明确错误。
 
@@ -224,37 +236,26 @@ Data Fabric sync flood/MCE 异常重启。此后生产候选固定为 batch 2，
 - Linux AMD H.264 8-bit、HEVC 8-bit、HEVC 10-bit、AV1 8-bit 和 AV1 Main 10
   sparse smart-render 已验证 closed GOP、forced IDR、PTS/DTS、音频 mux、帧数、
   时长和全片解码；H.264/HEVC 还覆盖 B 帧结构。
-- 已安装 `rocdecode 1.7.0`，`librocdecode.so.1` 可由动态链接器解析。
+- 已安装 `rocdecode 1.7.0` 与匹配的 `rocdecode-dev 1.7.0`，系统 SDK 和
+  `librocdecode.so.1` 已完成 bridge 构建、加载及无环境变量 smoke 验证。
 
 ### 当前剩余限制
 
-- rocDecode 目前只有 runtime，Jasna 尚未接入专用 backend。Linux PyAV AMF AV1
-  虽能打开，但 8K surface 回读只有 `11.8 fps`、约 7.2 GiB VRAM；libdav1d 加 ROCm
-  上传为 `39.9 fps`、约 3.7 GiB VRAM，因此 Linux AV1 暂时显式使用软件解码。
-  rocDecode 1.7 的 device-memory sample 在 8/10-bit 上均输出 `1202/1202` 帧，最佳
-  `88.3 fps`；完整 8-bit 像素 MD5 与 libdav1d 相同，10-bit 前 60 帧 MD5 也相同。
-  加入 250ms 资源采样后两路约 `85.7 fps`、media 中位 `100%`，8/10-bit 显存中位
-  分别约 3.86/4.62 GiB，功耗中位 89/103W，热点峰值均 66C。
-- 官方 `RocVideoDecoder` copied-buffer helper 复用槽位时未刷新 PTS 元数据，原始输出
-  因而出现 1200 次相邻重复。评估副本修复元数据刷新后，8/10-bit 均为严格递增的
-  1202 个 PTS，FNV-1a 哈希 `8763091125427738767` 与 PyAV demux 期望完全相同；这
-  不是 AV1 重排或 rocDecode 核心丢时间戳。
-- 正式接入仍需 PyAV 保留原始 time-base 的 demux、rocDecode C++/HIP 生命周期管理，
-  以及 GPU NV12/P010 surface 到 Torch RGB 的零回读转换。官方整数毫秒 demux 和
-  device-copy helper 均不能直接成为 Jasna backend。第二轮条件 batch 2 会把部分长 clip
-  的恢复瓶颈前移，rocDecode 的预测上限因此达到后续立项目槛；它改为独立 backend 任务，
-  但在完整生命周期和回退契约完成前不替换稳定的 AMF/software decode 路由。
-- Linux 10-bit H.264/HEVC 输入仍因 PyAV AMF P010 首包不可靠而在解包前选择软件
-  解码。rocDecode 的帧数、PTS、8/10-bit 像素和原始吞吐已验证，尚缺正式 GPU
-  surface 转换和真实 Jasna 墙钟验收，不能因为单项解码更快就直接替换现有链。
+- rocDecode 正式 backend 已完成，但只在 Linux AMD、HEVC/AV1、至少 3000 万像素时
+  自动启用。小分辨率 H.264 和 2K AV1 正确性通过但固定初始化成本更慢，H.264/VP9
+  和所有小视频继续使用 Jasna 原 reader。系统需安装与当前 ROCm 匹配的
+  `rocdecode-dev`；缺失或运行异常时永久回退。
+- 183 秒和 34:23 8-bit 整片最终 E2E 已通过；Main 10 长片与 F 盘多素材长期矩阵
+  继续延期。旧 rocDecode 与同码控基线证据保留在只读 Windows D 盘；当前首次扫描、
+  最终整片输出和完整验收证据统一位于 Ubuntu ext4 的
+  `/home/latiao/vr_toolbox_jasna_linux/benchmarks/`。
 - Windows AMD smart-render 尚未验收，继续明确拒绝。8-bit 整部真实长片已经完成；
-  Main 10 整片按当前执行策略延期，不是开始性能优化的前置门槛。rocDecode 专用
-  backend 尚未实现但已进入下一阶段；编译后端已完成可用性评估，没有优于 eager 的
-  可部署项。
+  Main 10 整片按当前执行策略延期，不是开始性能优化的前置门槛。编译后端已完成
+  可用性评估，没有优于 eager 的可部署项。
 
 ### 当前验证证据
 
-- 完整测试集：`1901 passed, 119 skipped, 0 failed`；跳过项是当前 AMD 主机不适用或
+- 完整测试集：`1927 passed, 119 skipped, 0 failed`；跳过项是当前 AMD 主机不适用或
   缺少受保护资源的 TensorRT、NVENC/NVDEC、RTX、TVAI 等路径。
 - 独立 E2E：`6 passed, 17 skipped`；AMD 上执行元数据、解码和检测，NVIDIA 专用项
   按平台声明跳过。
@@ -343,6 +344,19 @@ Data Fabric sync flood/MCE 异常重启。此后生产候选固定为 batch 2，
   MIGraphX fullgraph 连 4 帧 smoke 也未在 180 秒内完成。两者均未回退，但冷启动和
   shape 专用缓存成本不可接受；加上真实 E2E 已受 AV1 media encoder 限制，生产路径
   保持 eager。
+- 陌生 50 秒 8K 片段首次扫描使用 rfdetr-v6、阈值 `0.70`、连续 2 次命中和 detector
+  batch 4；51 个样本中 37 次确认命中，形成 2 个区间，墙钟 `37.987s`、hotspot 峰值
+  `74C`。扫描阈值只负责预扫描区间规划；逐帧 render 检测阈值仍为 `0.35`。
+- workspace v3 最终 34:23 整片 `Processor` 墙钟 `5058.768s`，相对同码控
+  `6061.135s` 基线节省 `1002.367s`、下降 `16.54%`。两个 render span 共 2536 个
+  restoration clips；其中长 span 的 2343 个 clips 触发 92 次 batch 2，padding、显存
+  跳过和 fallback 均为 0。处理期系统 CPU 中位 `19.4%`、GPU gfx/media 中位
+  `92%/62%`、显存中位/峰值 `12.71/13.73 GiB`、hotspot 峰值 `97C`。
+- 最终输出保持 `123669/123669` 视频包和 `96716/96716` 音频包，copy VCL
+  `60836/60836` 全同、render VCL `62833/62833` 全部变化，音频 payload 逐包全同；
+  PTS 最大偏差约 `5.6us`，DTS cadence 通过。独立 AMF 硬解返回码 0、约
+  `93.54 fps`、`dup=0/drop=0`。输出视频码率 `25.673 Mbps`，只比同码控基线
+  `26.253 Mbps` 低 `2.21%`；没有 MCE、Data Fabric、GPU reset、ring timeout 或 OOM。
 
 ## 分阶段实施与门槛
 
@@ -377,21 +391,22 @@ Data Fabric sync flood/MCE 异常重启。此后生产候选固定为 batch 2，
 - Linux AMD H.264/HEVC AMF sparse 真机 E2E 已完成；Windows AMD 和 AV1 不在
   本阶段验收范围，AV1 后续在 P4 独立完成。
 
-### P4：性能与长期稳定性（第一轮优化已收口，可比整片 A/B 待建立）
+### P4：性能与长期稳定性（生产候选整片已通过）
 
 - 已完成 detector/BasicVSR++ session 常驻和 8/10-bit 批量连续任务真机验收。
 - 已完成 Linux AMD AV1 8-bit/Main 10 sparse smart-render 正样本、码控、copy-span
   像素保真和 AMF 全片硬解码验收；AV1 smart fragment 已开放。
 - 已完成 eager、TorchInductor/Triton、MIGraphX 可用性与冷启动 A/B；编译路径均按
   fullgraph 验证且不允许静默回退，当前保持 eager。
-- 已完成 rocDecode 原始帧数、PTS、8/10-bit 像素、吞吐和资源占用验证；正式 backend
-  因 GPU surface 转换边界及当前 E2E 编码瓶颈而延期，生产路径保持软件 decode。
-- 已完成 8K HEVC 扫描 AMF/软件 A/B，并将更快的软件路径限制在扫描 reader；正式
-  smart-render 保持已验证稳定的 AMF 双 reader。
+- 已完成 rocDecode 原始帧与正式 Jasna RGB 路径的帧数、PTS、8/10-bit 像素、seek、
+  吞吐和资源验证；大分辨率 HEVC/AV1 进入受限自动路由，异常回退 AMF/software。
+- 旧 8K HEVC 扫描软件分流和正式 AMF reader 仍作为 rocDecode 不可用时的稳定回退；
+  新 backend 不改变 detector、tracker、smart-render 或 encoder 契约。
 - 8K HEVC 正式编码已排除失控的 QVBR 和会在 AMF 原生预分析线程崩溃的
   `vbr_peak + preanalysis=1`；Linux AMD 在存在自动源码率上限且用户未显式选择
   码控时改用 `vbr_peak + preanalysis=0`，并由 codec context 绑定目标码率。
-  工作区算法同步升为 v2，旧码控生成的高码率片段不会被复用。
+  工作区算法先随码控升为 v2，随后因检测与恢复调度契约升为 v3；旧策略生成的片段
+  不会被错误复用。
 - 已完成 183 秒真实长片窗口、停止/跨进程恢复和尾帧回归，并完成 34:23 的 8-bit
   整部长片渲染、音视频/PTS/VCL 保真、资源监控和 AMF 全片硬解；Main 10 与其他片源
   的长期矩阵按当前策略延期。
@@ -399,6 +414,13 @@ Data Fabric sync flood/MCE 异常重启。此后生产候选固定为 batch 2，
   183 秒验收后撤除，O4/O5 因解码/编码边界不具备等价收益而不实现。O1 后整片已经
   完成但因跨越码控提交只能作为稳定性证据；不得把被拒候选分别升级为整片测试，也不
   在建立相同当前码控基线前重跑完整 8-bit 或提前启动大量素材矩阵。
+- 最终 183 秒当前路径墙钟 `560.356s`，媒体/AMF 硬解全部通过。首个同码控 34:23
+  基线 `Processor` 墙钟 `6061.135s`；workspace v3 最终验收降至 `5058.768s`，下降
+  `16.54%`，并首次在真实整片触发 92 次 restoration batch 2。最终视频/音频包、
+  copy/render VCL、逐包音频、PTS/DTS 和 AMF 硬解全部通过；315W 下 hotspot 峰值
+  `97C`、显存峰值 `13.73 GiB`，零 offload、OOM、fallback、MCE 或 GPU reset。
+  最终证据和输出位于
+  `/home/latiao/vr_toolbox_jasna_linux/benchmarks/o18_full_final_20260804/`。
 
 ## 测试素材矩阵
 
@@ -423,11 +445,14 @@ bit-depth 对照，10-bit 版本用于 Main 10 生产契约。HEVC 的 62 帧 10
 用于编解码契约，不替代上述 AV1 去码正样本。Main 10 长片保留为延期验收素材，不在
 O1--O4 优化阶段运行。
 
-F 盘两套 A/B 目录永远只读，新 Jasna 输出、manifest、截图和资源报告统一写入
-`/media/latiao/D/AI/lada/jasna_benchmarks/`。`scripts/build_legacy_vr_ab_manifest.py`
+Windows 分区中的源片、旧成片和既有证据永远只读；新 Jasna 输出、工作缓存、manifest、
+截图和资源报告统一写入 Ubuntu ext4 的
+`/home/latiao/vr_toolbox_jasna_linux/benchmarks/`。`scripts/build_legacy_vr_ab_manifest.py`
 负责精确配对和媒体/旧日志元数据采集。用户已经批准开始；当前先保留 manifest 和
 分层计划，不与可比基线建立争用磁盘和 CPU。正式大矩阵先用 manifest
 分层选择短/中/长、8/10-bit、低/中/高扫描覆盖率，不对 33 组全部直接跑整片。
+表中位于 `/home/latiao/vr_toolbox_jasna_linux/work/` 的历史短样本已在最终验收后清理，
+需要回归时从只读长片重新抽取；`o17/o18` 最终证据和成片永久保留。
 
 ## 上游同步纪律
 

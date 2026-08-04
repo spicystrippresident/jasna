@@ -76,6 +76,10 @@ YOLO_MODEL_NAMES: frozenset[str] = frozenset(
 
 DEFAULT_DETECTION_MODEL_NAME = "rfdetr-v6"
 
+ONE_CLICK_VR_SCORE_THRESHOLDS: dict[str, float] = {
+    "rfdetr-v6": 0.70,
+}
+
 RFDETR_MODEL_CONFIGS: dict[str, RfDetrModelConfig] = {
     "rfdetr-v5": RfDetrModelConfig(768, 0.25, 4, None),
     "rfdetr-v6": RfDetrModelConfig(576, 0.35, None, "medium"),
@@ -165,6 +169,14 @@ def recommended_score_threshold(name: str) -> float:
     if is_rfdetr_model(coerced):
         return rfdetr_model_config(coerced).score_threshold
     return 0.25
+
+
+def recommended_one_click_score_threshold(name: str) -> float:
+    coerced = coerce_detection_model_name(name)
+    return ONE_CLICK_VR_SCORE_THRESHOLDS.get(
+        coerced,
+        recommended_score_threshold(coerced),
+    )
 
 
 def detection_model_weights_path(name: str) -> Path:

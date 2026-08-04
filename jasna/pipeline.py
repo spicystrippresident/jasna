@@ -391,7 +391,11 @@ class Pipeline:
         if output_frame_count is None:
             output_frame_count = frame_rate.output_frame_count(metadata.num_frames)
 
-        clip_queue = FrameQueue(max_frames=self.max_clip_size)
+        primary_batch_size = max(
+            1,
+            int(self.restoration_pipeline.independent_clip_batch_size),
+        )
+        clip_queue = FrameQueue(max_frames=self.max_clip_size * primary_batch_size)
         secondary_queue = FrameQueue(max_frames=self.max_clip_size * secondary_workers)
         encode_queue = FrameQueue(max_frames=self.max_clip_size)
         metadata_queue: Queue[FrameMeta | object] = Queue(maxsize=self.max_clip_size * 5)
@@ -744,9 +748,21 @@ class Pipeline:
                     )
                     if self._cancel_event.is_set():
                         return
+                    normalize_fragment(
+                        raw,
+                        normalized,
+                        codec=codec,
+                        decode_delay=index.decode_delay_pts * index.time_base,
+                    )
                 else:
-                    create_copy_fragment(self.input_video, span, index, raw, codec=codec)
-                normalize_fragment(raw, normalized, codec=codec)
+                    create_copy_fragment(
+                        self.input_video,
+                        span,
+                        index,
+                        normalized,
+                        codec=codec,
+                        normalized=True,
+                    )
                 workspace.mark_complete(span_index, normalized)
                 fragments.append((normalized, duration))
 

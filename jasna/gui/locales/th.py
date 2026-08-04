@@ -215,6 +215,18 @@ TH = {
         "btn_reset": "↺",
 
         # Sections
+        "section_processing_mode": "โหมดประมวลผล",
+        "processing_mode_standard": "ประมวลผลมาตรฐาน",
+        "processing_mode_one_click_vr": "VR คลิกเดียว",
+        "one_click_scan_interval": "ความถี่การสแกน",
+        "tip_one_click_scan_interval": "ความถี่ที่สุ่มตัวอย่างล่วงหน้าเพื่อฟื้นฟูเฉพาะช่วงที่ตรวจพบโมเสก",
+        "one_click_scan_threshold": "เกณฑ์สแกนคลิกเดียว",
+        "tip_one_click_scan_threshold": "ใช้เฉพาะการสแกนล่วงหน้าและวางแผนช่วง ไม่เปลี่ยนเกณฑ์การฟื้นฟูแต่ละเฟรม ค่าเริ่มต้น rfdetr-v6 คือ 0.70",
+        "one_click_confirmation": "ยืนยันการตรวจพบต่อเนื่อง",
+        "tip_one_click_confirmation": "กำหนดให้ตัวอย่างสแกนที่ติดกันถึงเกณฑ์ เพื่อตัดผลบวกลวงแบบครั้งเดียว ใช้ 1 สำหรับโมเสกที่สั้นมาก",
+        "one_click_confirmation_one": "1 ครั้ง (ไว)",
+        "one_click_confirmation_two": "2 ครั้ง (แนะนำ)",
+        "one_click_confirmation_three": "3 ครั้ง (เข้มงวด)",
         "section_basic": "การประมวลผลพื้นฐาน",
         "section_advanced": "การประมวลผลขั้นสูง",
         "section_secondary": "การฟื้นฟูขั้นที่สอง",

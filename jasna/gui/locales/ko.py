@@ -214,6 +214,18 @@ KO = {
         "btn_reset": "↺",
 
         # Sections
+        "section_processing_mode": "처리 모드",
+        "processing_mode_standard": "표준 처리",
+        "processing_mode_one_click_vr": "원클릭 VR",
+        "one_click_scan_interval": "스캔 빈도",
+        "tip_one_click_scan_interval": "모자이크가 감지된 구간만 복원하기 위한 사전 샘플링 빈도입니다.",
+        "one_click_scan_threshold": "원클릭 스캔 임계값",
+        "tip_one_click_scan_threshold": "사전 스캔과 구간 계획에만 사용되며 프레임별 복원 임계값은 변경하지 않습니다. rfdetr-v6 기본값은 0.70입니다.",
+        "one_click_confirmation": "연속 감지 확인",
+        "tip_one_click_confirmation": "인접한 스캔 샘플의 연속 감지를 요구하여 단발성 오탐을 제거합니다. 짧은 모자이크에는 1을 사용하세요.",
+        "one_click_confirmation_one": "1회 (민감)",
+        "one_click_confirmation_two": "2회 (권장)",
+        "one_click_confirmation_three": "3회 (엄격)",
         "section_basic": "기본 처리",
         "section_advanced": "고급 처리",
         "section_secondary": "2차 복원",
