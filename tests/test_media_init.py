@@ -14,6 +14,8 @@ from jasna.media import (
     validate_encoder_settings,
     is_stream_10bit,
     get_video_meta_data,
+    hevc_level_to_amf_option,
+    parse_hevc_level_idc,
     parse_sample_aspect_ratio,
     parse_video_bitrate,
     resolve_video_start_pts,
@@ -57,6 +59,25 @@ def test_resolve_video_start_pts(stream_start, metadata_start, expected) -> None
 )
 def test_parse_video_bitrate(stream, fmt, expected) -> None:
     assert parse_video_bitrate(stream, fmt) == expected
+
+
+@pytest.mark.parametrize(
+    ("level_idc", "expected"),
+    [
+        (183, "6.1"),
+        ("186", "6.2"),
+        (186.0, "6.2"),
+        (185, None),
+        ("6.2", None),
+    ],
+)
+def test_hevc_level_idc_maps_to_amf_level_option(level_idc, expected) -> None:
+    assert hevc_level_to_amf_option(level_idc) == expected
+
+
+def test_parse_hevc_level_idc_accepts_ffprobe_numeric_text() -> None:
+    assert parse_hevc_level_idc({"codec_name": "hevc", "level": "183"}) == 183
+    assert parse_hevc_level_idc({"codec_name": "h264", "level": 42}) is None
 
 
 class TestParseEncoderSettingScalar:
@@ -298,10 +319,28 @@ class TestGetVideoMetaData:
 
     @patch("jasna.media.resolve_executable", return_value="ffprobe")
     @patch("jasna.media.subprocess.Popen")
+    def test_8bit_hevc_level_is_preserved(self, mock_popen, mock_resolve):
+        proc = MagicMock()
+        proc.communicate.return_value = (self._make_ffprobe_output(level=183), b"")
+        proc.returncode = 0
+        mock_popen.return_value = proc
+
+        meta = get_video_meta_data("test.mp4")
+
+        assert meta.is_10bit is False
+        assert meta.hevc_level == 183
+        assert hevc_level_to_amf_option(meta.hevc_level) == "6.1"
+
+    @patch("jasna.media.resolve_executable", return_value="ffprobe")
+    @patch("jasna.media.subprocess.Popen")
     def test_10bit_stream(self, mock_popen, mock_resolve):
         proc = MagicMock()
         proc.communicate.return_value = (
-            self._make_ffprobe_output(bits_per_raw_sample="10", pix_fmt="yuv420p10le"),
+            self._make_ffprobe_output(
+                bits_per_raw_sample="10",
+                pix_fmt="p010le",
+                level=186,
+            ),
             b"",
         )
         proc.returncode = 0
@@ -309,6 +348,8 @@ class TestGetVideoMetaData:
 
         meta = get_video_meta_data("test.mp4")
         assert meta.is_10bit is True
+        assert meta.hevc_level == 186
+        assert hevc_level_to_amf_option(meta.hevc_level) == "6.2"
 
     @patch("jasna.media.resolve_executable", return_value="ffprobe")
     @patch("jasna.media.subprocess.Popen")

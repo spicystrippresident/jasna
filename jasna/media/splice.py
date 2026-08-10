@@ -172,6 +172,8 @@ def resolve_smart_encoder_settings(
     metadata: VideoMetadata,
     index: KeyframeIndex,
     settings: dict[str, object],
+    *,
+    h264_max_b_frames: int | None = None,
 ) -> dict[str, object]:
     resolved = dict(settings)
     source_gop_size = _source_gop_size(index, metadata.video_fps_exact)
@@ -186,11 +188,17 @@ def resolve_smart_encoder_settings(
         raise SmartRenderCompatibilityError(
             f"Smart rendering cannot match H.264 profile {metadata.profile!r}"
         )
+    max_b_frames = index.max_b_frames
+    if h264_max_b_frames is not None:
+        h264_max_b_frames = int(h264_max_b_frames)
+        if h264_max_b_frames < 0:
+            raise ValueError("h264_max_b_frames must be non-negative")
+        max_b_frames = min(max_b_frames, h264_max_b_frames)
     resolved["profile"] = H264_SMART_PROFILES[profile]
-    resolved["bf"] = index.max_b_frames
+    resolved["bf"] = max_b_frames
     resolved["b_ref_mode"] = (
         "middle"
-        if index.uses_b_references and index.max_b_frames >= 2
+        if index.uses_b_references and max_b_frames >= 2
         else "disabled"
     )
     return resolved
@@ -567,6 +575,17 @@ def _quote_concat_path(path: Path) -> str:
     return str(path.resolve()).replace("'", "'\\''")
 
 
+def _write_concat_manifest(
+    fragments: list[tuple[Path, float]],
+    manifest: Path,
+) -> None:
+    lines = ["ffconcat version 1.0"]
+    for path, duration in fragments:
+        lines.append(f"file '{_quote_concat_path(path)}'")
+        lines.append(f"duration {_seconds(duration)}")
+    manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def concatenate_fragments(
     fragments: list[tuple[Path, float]],
     *,
@@ -574,11 +593,7 @@ def concatenate_fragments(
     destination: Path,
     codec: str,
 ) -> None:
-    lines = ["ffconcat version 1.0"]
-    for path, duration in fragments:
-        lines.append(f"file '{_quote_concat_path(path)}'")
-        lines.append(f"duration {_seconds(duration)}")
-    manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _write_concat_manifest(fragments, manifest)
     muxer = "mpegts" if codec in {"h264", "hevc"} else "matroska"
     muxer_args = ["-muxdelay", "0"] if muxer == "mpegts" else []
     _run_ffmpeg(
@@ -628,6 +643,50 @@ def mux_final_output(
     args.append(str(temporary))
     try:
         _run_ffmpeg(args, purpose=f"mux smart-render output {destination.name}")
+        os.replace(temporary, destination)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            log.warning("Could not remove temporary output %s", temporary)
+
+
+def mux_fragments_final_output(
+    fragments: list[tuple[Path, float]],
+    source: Path,
+    destination: Path,
+    *,
+    manifest: Path,
+    codec: str,
+) -> None:
+    """Concatenate video fragments and mux source audio without an assembled copy."""
+    _write_concat_manifest(fragments, manifest)
+    temporary = destination.with_name(f".{destination.stem}.smart-render{destination.suffix}")
+    args = [
+        "-f", "concat",
+        "-safe", "0",
+        "-i", str(manifest),
+        "-i", str(source),
+        "-map", "0:v:0",
+        "-map", "1:a?",
+        "-map_metadata", "1",
+        "-map_metadata:s:v:0", "1:s:v:0",
+        "-c:v", "copy",
+    ]
+    with av.open(str(source)) as container:
+        audio_streams = list(container.streams.audio)
+        for output_index, stream in enumerate(audio_streams):
+            name = stream.codec_context.name
+            if needs_audio_reencode(name, destination.suffix):
+                args += [f"-c:a:{output_index}", "aac", f"-b:a:{output_index}", "256k"]
+            else:
+                args += [f"-c:a:{output_index}", "copy"]
+    if destination.suffix.lower() in {".mp4", ".mov"}:
+        tag = {"h264": "avc3", "hevc": "hev1", "av1": "av01"}[codec]
+        args += ["-tag:v", tag, "-movflags", "+faststart"]
+    args.append(str(temporary))
+    try:
+        _run_ffmpeg(args, purpose=f"assemble smart-render output {destination.name}")
         os.replace(temporary, destination)
     finally:
         try:

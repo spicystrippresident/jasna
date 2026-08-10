@@ -187,7 +187,7 @@ Per-codec extras:
 
 | Key | What it does |
 | --- | ------------ |
-| `cq` | Portable quality knob, automatically translated to AMF's `qvbr_quality_level`. Lower = better. Defaults 27 (H.264), 28 (HEVC), 35 (AV1). |
+| `cq` | Portable quality knob. Lower = better. It normally maps to AMF QVBR; Linux AMD HEVC smart-render fragments use measured CQP (`CQ + 2`) because QVBR is unreliable from 4K through 8K. A full HEVC render uses the same fallback if the source reports no usable bitrate. Defaults 27 (H.264), 28 (HEVC), 35 (AV1). |
 | `qvbr_quality_level` | The native AMF quality level, if you prefer to set it directly. |
 | `usage` | Encoder usage profile. Default `high_quality`. |
 | `quality` | Speed/quality preset: `speed`, `balanced`, `quality` (default). |

@@ -181,7 +181,7 @@ HEVC 源获得额外余量，因为修复确实会加入源中原本没有的细
 
 | 参数 | 作用 |
 | --- | ------------ |
-| `cq` | 通用质量参数，自动转换为 AMF 的 `qvbr_quality_level`。越低越好。默认 27（H.264）、28（HEVC）、35（AV1）。 |
+| `cq` | 通用质量参数，越低越好。通常转换为 AMF QVBR；Linux AMD 的 HEVC 智能修复片段使用实测 CQP（`CQ + 2`），因为 QVBR 在 4K 到 8K 都不可靠。HEVC 全片处理在源文件没有可用码率时也采用该回退。默认 27（H.264）、28（HEVC）、35（AV1）。 |
 | `qvbr_quality_level` | AMF 原生质量级别，如果你想直接设置它。 |
 | `usage` | 编码器用途配置。默认 `high_quality`。 |
 | `quality` | 速度/质量预设: `speed`、`balanced`、`quality`（默认）。 |

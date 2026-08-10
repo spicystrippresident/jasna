@@ -75,6 +75,7 @@ class Processor:
         self._settings: AppSettings | None = None
         self._output_folder: str = ""
         self._output_pattern: str = "{original}_restored.mp4"
+        self._preserve_input_structure = False
         self._disable_basicvsrpp_tensorrt_for_run = False
 
         # Heavy models are loaded once and reused across consecutive jobs of the
@@ -91,6 +92,7 @@ class Processor:
         output_pattern: str,
         *,
         disable_basicvsrpp_tensorrt: bool,
+        preserve_input_structure: bool = False,
     ):
         if self._thread and self._thread.is_alive():
             return
@@ -99,6 +101,7 @@ class Processor:
         self._settings = settings
         self._output_folder = output_folder
         self._output_pattern = output_pattern
+        self._preserve_input_structure = bool(preserve_input_structure)
         self._disable_basicvsrpp_tensorrt_for_run = bool(disable_basicvsrpp_tensorrt)
         
         self._stop_event.clear()
@@ -216,17 +219,24 @@ class Processor:
             if overrides:
                 job_settings = replace(job_settings, **overrides)
 
-        # Determine output path
+        # Determine output path. Folder-added jobs retain their selected root so
+        # an optional relative directory can be reconstructed below output_dir.
         if self._output_folder:
             output_dir = Path(self._output_folder)
         else:
             output_dir = input_path.parent
 
-        output_name = self._output_pattern.replace("{original}", input_path.stem)
-        output_path = output_dir / output_name
-        if is_image:
-            # The video output pattern carries a video extension; images keep their own.
-            output_path = output_path.with_suffix(input_path.suffix)
+        from jasna.media.media_files import folder_output_path
+
+        output_path = folder_output_path(
+            output_dir,
+            input_path,
+            self._output_pattern,
+            input_root=job.input_root,
+            preserve_structure=(
+                bool(self._output_folder) and self._preserve_input_structure
+            ),
+        )
         
         # Handle file conflict based on settings
         file_conflict = self._settings.file_conflict if self._settings else "auto_rename"

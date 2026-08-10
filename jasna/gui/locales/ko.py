@@ -21,6 +21,7 @@ KO = {
         "btn_clear": "비우기",
         "btn_clear_completed": "✓ 완료 항목 제거",
         "output_location": "출력 위치",
+        "preserve_input_structure": "입력 폴더의 하위 폴더 구조 유지",
         "output_pattern": "출력 파일명 템플릿",
         "output_pattern_placeholder": "{original}_restored.mp4",
         "same_as_input": "입력과 동일",
@@ -402,6 +403,7 @@ KO = {
         "tip_encoder_custom_args": "고급 인코더 매개변수 (쉼표로 구분된 key=value 형식).\n잘 모르겠으면 비워두세요.\n\n예: rc-lookahead=32",
         "tip_post_export_action": "전체 대기열이 완료된 뒤 실행할 선택 작업입니다.\n\n없음: 아무 작업도 하지 않습니다.\nPC 종료: 컴퓨터 전원을 끕니다.\n사용자 정의 명령: 아래 명령을 시스템 셸에서 실행합니다.",
         "tip_output_location": "처리된 동영상을 저장할 폴더.\n비워두면 원본 파일 옆에 저장됩니다.",
+        "tip_preserve_input_structure": "폴더에서 추가한 작업은 선택한 출력 폴더 안에 하위 폴더 구조를 다시 만듭니다. 개별적으로 추가한 파일에는 영향을 주지 않습니다.",
         "tip_output_pattern": "출력 파일의 이름 템플릿.\n{original}은 입력 파일명(확장자 제외)의 자리 표시자입니다.\n\n예: {original}_restored.mp4 → my_video_restored.mp4",
 
         # Preset button tooltips

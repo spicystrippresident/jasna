@@ -31,6 +31,7 @@ from jasna.media import (
     AMF_SUPPORTED_ENCODER_SETTINGS_BY_CODEC,
     SUPPORTED_ENCODER_SETTINGS_BY_CODEC,
     VideoMetadata,
+    hevc_level_to_amf_option,
     validate_encoder_settings,
 )
 from jasna.media.audio_utils import needs_audio_reencode
@@ -143,6 +144,14 @@ DEFAULT_AMF_AV1_ENCODER_OPTIONS: dict[str, str] = {
     "profile": "main",
     "bitdepth": "10",
 }
+
+# Linux AMF QVBR is not a dependable quality/rate contract for HEVC smart
+# fragments. The failure is most severe at 8K but remains measurable at 4K.
+# CQP 30 measured near source rate for GUI CQ 28 while preserving the source's
+# short low-motion runs, so keep the portable CQ scale with a small
+# AMF-specific offset at every resolution. Full renders retain their source
+# rate contract when one is available and use the same CQP fallback otherwise.
+AMD_HEVC_CQP_OFFSET = 2
 
 # Deliberately optimized for short correctness runs, not for production quality
 # or performance comparisons. This backend is reachable only through the
@@ -306,6 +315,28 @@ def source_bitrate_cap_options(metadata: VideoMetadata) -> dict[str, str]:
     }
 
 
+def add_amd_hevc_smart_fragment_source_level(
+    encoder_settings: Mapping[str, object],
+    metadata: VideoMetadata,
+    *,
+    codec: str,
+    vendor: AcceleratorVendor,
+) -> dict[str, object]:
+    """Add the source HEVC level for Linux AMF fragments when it is implicit."""
+    effective = dict(encoder_settings)
+    if (
+        vendor is not AcceleratorVendor.AMD
+        or sys.platform != "linux"
+        or codec != "hevc"
+        or "level" in effective
+    ):
+        return effective
+    level = hevc_level_to_amf_option(metadata.hevc_level)
+    if level is not None:
+        effective["level"] = level
+    return effective
+
+
 def _option_value(value: object) -> str:
     if isinstance(value, bool):
         return "1" if value else "0"
@@ -365,6 +396,16 @@ def _mov_container_options(suffix: str, *, fmp4: bool) -> dict[str, str]:
     return {"movflags": flags}
 
 
+@dataclass(order=True, frozen=True)
+class _BufferedEncodeItem:
+    """One encoder input kept together while the bounded PTS window reorders it."""
+
+    pts: int
+    sequence: int
+    frame: torch.Tensor = field(compare=False)
+    apply_lut: bool = field(compare=False)
+
+
 class NvidiaVideoEncoder:
     def __init__(
         self,
@@ -395,6 +436,13 @@ class NvidiaVideoEncoder:
         encoder_settings = dict(encoder_settings)
         self.encoder_backend = encoder_backend
         self.software_reference = encoder_backend == "software-reference"
+        if smart_fragment and not self.software_reference:
+            encoder_settings = add_amd_hevc_smart_fragment_source_level(
+                encoder_settings,
+                metadata,
+                codec=codec,
+                vendor=self.vendor,
+            )
         specs = (
             SOFTWARE_REFERENCE_ENCODER_SPECS
             if self.software_reference
@@ -497,6 +545,24 @@ class NvidiaVideoEncoder:
         self.encoder_options = dict(spec.default_options)
         self._target_bit_rate: int | None = None
         derived_source_bitrate_ceiling = False
+        explicit_quality = any(
+            key in encoder_settings for key in ("cq", "qvbr_quality_level")
+        )
+        has_amd_hevc_portable_cq = (
+            self.vendor is AcceleratorVendor.AMD
+            and sys.platform != "win32"
+            and codec == "hevc"
+            and "cq" in encoder_settings
+            and "rc" not in encoder_settings
+            and "qvbr_quality_level" not in encoder_settings
+        )
+        preserve_amd_smart_fragment_quality = (
+            smart_fragment
+            and self.vendor is AcceleratorVendor.AMD
+            and sys.platform != "win32"
+            and codec == "hevc"
+            and explicit_quality
+        )
         if (
             self.vendor is AcceleratorVendor.AMD
             and not self.software_reference
@@ -507,10 +573,17 @@ class NvidiaVideoEncoder:
             # hardware encoding and disable only that incompatible 10-bit
             # analysis stage; 8-bit QVBR requires preanalysis to stay enabled.
             self.encoder_options["preanalysis"] = "0"
-        if not self.software_reference and "maxrate" not in encoder_settings:
+        if (
+            not self.software_reference
+            and "maxrate" not in encoder_settings
+            and not preserve_amd_smart_fragment_quality
+        ):
             bitrate_cap_options = source_bitrate_cap_options(metadata)
             self.encoder_options.update(bitrate_cap_options)
             derived_source_bitrate_ceiling = "maxrate" in bitrate_cap_options
+        use_amd_hevc_cqp = has_amd_hevc_portable_cq and (
+            smart_fragment or not derived_source_bitrate_ceiling
+        )
         if encoder_settings:
             overrides = {k: _option_value(v) for k, v in encoder_settings.items()}
             if self.software_reference and "cq" in overrides:
@@ -525,15 +598,40 @@ class NvidiaVideoEncoder:
                 and self.vendor is AcceleratorVendor.AMD
                 and "cq" in overrides
             ):
-                if "qvbr_quality_level" in overrides:
+                if use_amd_hevc_cqp:
+                    portable_cq = int(overrides.pop("cq"))
+                    cqp = max(0, min(51, portable_cq + AMD_HEVC_CQP_OFFSET))
+                    self.encoder_options.pop("qvbr_quality_level", None)
+                    self.encoder_options.pop("vbaq", None)
+                    self.encoder_options.update(
+                        {
+                            "rc": "cqp",
+                            "qp_i": str(cqp),
+                            "qp_p": str(cqp),
+                            "preanalysis": "0",
+                        }
+                    )
+                elif "qvbr_quality_level" in overrides:
                     raise ValueError(
                         "Conflicting encoder settings: cq and "
                         "qvbr_quality_level are aliases on AMD; use only one"
                     )
-                overrides["qvbr_quality_level"] = overrides.pop("cq")
+                else:
+                    overrides["qvbr_quality_level"] = overrides.pop("cq")
             if self.vendor is AcceleratorVendor.NVIDIA:
                 _drop_unsupported_nvenc_overrides(codec, overrides, self.encoder_options)
             self.encoder_options.update(overrides)
+        if (
+            smart_fragment
+            and self.vendor is AcceleratorVendor.AMD
+            and sys.platform != "win32"
+            and codec == "hevc"
+        ):
+            # Repeated 8K HEVC fragment sessions with AMF PreAnalysis enabled
+            # eventually abort inside the native runtime with
+            # std::length_error. A native abort cannot be caught by the GUI,
+            # so keep PA disabled even when custom QVBR options are supplied.
+            self.encoder_options["preanalysis"] = "0"
         if (
             self.vendor is AcceleratorVendor.AMD
             and not self.software_reference
@@ -576,7 +674,8 @@ class NvidiaVideoEncoder:
             self.encoder_options[_forced_idr_option(self.vendor)] = "1"
 
         self.BUFFER_MAX_SIZE = 8
-        self._lut_flags: deque[bool] = deque()
+        self.frame_buffer: list[_BufferedEncodeItem] = []
+        self._next_buffer_sequence = 0
         # Set on AMD in __enter__, where the frame size is known; NVIDIA leaves
         # them None and allocates per frame (NVENC outlives encode()).
         self._packed: torch.Tensor | None = None
@@ -701,9 +800,8 @@ class NvidiaVideoEncoder:
                 dtype=dtype,
                 pin_memory=True,
             )
-        self.pts_heap: list[int] = []
-        self.frame_buffer: deque = deque()
-        self._lut_flags.clear()
+        self.frame_buffer = []
+        self._next_buffer_sequence = 0
         self.pts_set: set[int] = set()
         self._last_emitted_pts: int | None = None
         self._video_started = False
@@ -889,15 +987,14 @@ class NvidiaVideoEncoder:
 
     def _process_buffer(self, flush_all=False):
         if len(self.frame_buffer) > (self.BUFFER_MAX_SIZE // 2) or (flush_all and self.frame_buffer):
-            frame_to_encode = self.frame_buffer.popleft()
-            pts_to_assign = heapq.heappop(self.pts_heap)
-            self.pts_set.remove(pts_to_assign)
-            pts_to_assign = self._clamp_pts_monotonic(pts_to_assign)
-            apply_lut = self._lut_flags.popleft() if self._lut_flags else True
-            if apply_lut:
-                item = self._build_encode_item(frame_to_encode, pts_to_assign)
-            else:
-                item = self._build_encode_item(frame_to_encode, pts_to_assign, False)
+            buffered = heapq.heappop(self.frame_buffer)
+            self.pts_set.remove(buffered.pts)
+            pts_to_assign = self._clamp_pts_monotonic(buffered.pts)
+            item = self._build_encode_item(
+                buffered.frame,
+                pts_to_assign,
+                buffered.apply_lut,
+            )
             self._encode_queue.put(item)
 
     def _encoder_open_error(self, exc: Exception) -> RuntimeError:
@@ -1001,8 +1098,18 @@ class NvidiaVideoEncoder:
         pts = int(pts) - self.pts_origin
         while pts in self.pts_set:
             pts += 1
-        heapq.heappush(self.pts_heap, pts)
-        self.frame_buffer.append(frame)
-        self._lut_flags.append(bool(apply_lut))
+        # rocDecode batch views are reused by subsequent decode batches. Keep
+        # an independent tensor while this bounded buffer delays encoding.
+        owned_frame = frame.clone() if isinstance(frame, torch.Tensor) else frame
+        heapq.heappush(
+            self.frame_buffer,
+            _BufferedEncodeItem(
+                pts=pts,
+                sequence=self._next_buffer_sequence,
+                frame=owned_frame,
+                apply_lut=bool(apply_lut),
+            ),
+        )
+        self._next_buffer_sequence += 1
         self.pts_set.add(pts)
         self._process_buffer()

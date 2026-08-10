@@ -67,6 +67,78 @@ def test_completed_job_stays_completed(tmp_path):
     assert updates[-1].status is JobStatus.COMPLETED
 
 
+def test_folder_job_preserves_relative_output_structure(tmp_path):
+    input_root = tmp_path / "input"
+    source = input_root / "studio" / "series" / "clip.mkv"
+    source.parent.mkdir(parents=True)
+    source.touch()
+    output_root = tmp_path / "output"
+    captured = []
+    job = JobItem(path=source, input_root=input_root)
+    processor = Processor()
+    processor._run_pipeline = (
+        lambda _job_id, _input_path, output_path, **_kwargs: captured.append(output_path)
+    )
+    processor._jobs = [job]
+    processor._settings = AppSettings()
+    processor._output_folder = str(output_root)
+    processor._output_pattern = "{original}_restored.mp4"
+    processor._preserve_input_structure = True
+
+    processor._run()
+
+    assert captured == [output_root / "studio" / "series" / "clip_restored.mp4"]
+    assert captured[0].parent.is_dir()
+
+
+def test_folder_job_stays_flat_when_structure_option_is_disabled(tmp_path):
+    input_root = tmp_path / "input"
+    source = input_root / "studio" / "clip.mkv"
+    source.parent.mkdir(parents=True)
+    source.touch()
+    output_root = tmp_path / "output"
+    captured = []
+    job = JobItem(path=source, input_root=input_root)
+    processor = Processor()
+    processor._run_pipeline = (
+        lambda _job_id, _input_path, output_path, **_kwargs: captured.append(output_path)
+    )
+    processor._jobs = [job]
+    processor._settings = AppSettings()
+    processor._output_folder = str(output_root)
+    processor._output_pattern = "{original}_restored.mp4"
+
+    processor._run()
+
+    assert captured == [output_root / "clip_restored.mp4"]
+
+
+def test_folder_job_skips_existing_nested_output(tmp_path):
+    input_root = tmp_path / "input"
+    source = input_root / "studio" / "clip.mkv"
+    source.parent.mkdir(parents=True)
+    source.touch()
+    existing = tmp_path / "output" / "studio" / "clip_restored.mp4"
+    existing.parent.mkdir(parents=True)
+    existing.touch()
+    updates: list[ProgressUpdate] = []
+    job = JobItem(path=source, input_root=input_root)
+    processor = Processor(on_progress=updates.append)
+    processor._run_pipeline = lambda *_args, **_kwargs: pytest.fail(
+        "existing nested output should have been skipped"
+    )
+    processor._jobs = [job]
+    processor._settings = AppSettings(file_conflict="skip")
+    processor._output_folder = str(tmp_path / "output")
+    processor._output_pattern = "{original}_restored.mp4"
+    processor._preserve_input_structure = True
+
+    processor._run()
+
+    assert job.status is JobStatus.SKIPPED
+    assert updates[-1].status is JobStatus.SKIPPED
+
+
 def test_stop_cancels_the_running_pipeline(tmp_path):
     processor, _job, _updates = _processor_with_job(
         tmp_path,

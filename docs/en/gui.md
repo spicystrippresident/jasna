@@ -22,6 +22,9 @@ Every setting has a tooltip: hover the ⓘ icon next to it.
 
 - **Same as input** writes each result next to its original file. Turn it
   off to pick one output folder for everything.
+- **Preserve input subfolder structure** records the root selected when a folder
+  is added or dropped, then recreates each relative subfolder below the output
+  folder. Individually added files still write directly to the output folder.
 - The **filename pattern** controls output names — `{original}` stands for
   the input name. If a pattern would overwrite something, the affected queue
   items are highlighted immediately.

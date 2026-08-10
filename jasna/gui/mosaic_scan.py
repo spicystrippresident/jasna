@@ -69,6 +69,69 @@ def scan_sample_stride(fps: float, *, seconds: float = 1.0) -> int:
 SCAN_PARALLEL_DECODERS = 2
 SCAN_PARALLEL_MIN_PIXELS = 3840 * 2160
 SCAN_PARALLEL_MIN_DURATION = 10.0
+SCAN_AMD_PARALLEL_MIN_PIXELS = 30_000_000
+
+# Two native sessions expose both RX 7900 XTX media engines and are the accepted
+# production route for large AMD scans. The other policies remain explicit
+# fallbacks for machines or sources that cannot sustain two rocDecode sessions.
+AMD_SCAN_DECODE_STRATEGY = "dual-rocdecode"
+AMD_SCAN_DECODE_STRATEGIES = {
+    "single-rocdecode": ("auto",),
+    "dual-rocdecode": ("auto", "auto"),
+    "rocdecode-software": ("auto", "pyav-sw"),
+}
+
+
+def scan_decode_backends(
+    video_width: int,
+    video_height: int,
+    duration: float,
+    *,
+    amd: bool,
+    amd_strategy: str | None = None,
+) -> tuple[str, ...]:
+    """Return the decode backend assigned to each scan reader."""
+
+    pixels = int(video_width) * int(video_height)
+    if duration < SCAN_PARALLEL_MIN_DURATION:
+        return ("auto",)
+    if not amd:
+        return (
+            ("auto",) * SCAN_PARALLEL_DECODERS
+            if pixels >= SCAN_PARALLEL_MIN_PIXELS
+            else ("auto",)
+        )
+    if pixels < SCAN_AMD_PARALLEL_MIN_PIXELS:
+        return ("auto",)
+    strategy = amd_strategy or AMD_SCAN_DECODE_STRATEGY
+    try:
+        return AMD_SCAN_DECODE_STRATEGIES[strategy]
+    except KeyError as exc:
+        choices = ", ".join(sorted(AMD_SCAN_DECODE_STRATEGIES))
+        raise ValueError(
+            f"Unknown AMD scan decode strategy {strategy!r}; expected one of {choices}"
+        ) from exc
+
+
+def scan_segment_sample_bounds(
+    sample_count: int,
+    backends: tuple[str, ...],
+) -> tuple[int, ...]:
+    """Split one global sample grid using measured relative decoder speeds."""
+
+    if sample_count <= 0 or not backends:
+        raise ValueError("sample_count and backends must be non-empty")
+    # Local 8K HEVC baselines sustain roughly 1.25x through rocDecode and
+    # 0.74x through libavcodec, so software owns about 60% of a HW share.
+    weights = [0.6 if backend == "pyav-sw" else 1.0 for backend in backends]
+    total = sum(weights)
+    boundaries = [0]
+    cumulative = 0.0
+    for weight in weights[:-1]:
+        cumulative += weight
+        boundaries.append(round(sample_count * cumulative / total))
+    boundaries.append(sample_count)
+    return tuple(boundaries)
 
 
 def scan_decoder_count(
@@ -78,20 +141,16 @@ def scan_decoder_count(
     *,
     amd: bool,
 ) -> int:
-    """Parallel decoders for a scan.
+    """Return the production decoder count for this scan input."""
 
-    Scans of 4K+ material are NVDEC-bound while the GPU has more than one
-    NVDEC unit (NVDEC decodes every frame regardless of stride), so split the
-    video across decoders. Smaller resolutions are detection- or
-    loop-overhead-bound and AMD decode sessions are not known to be safe to
-    duplicate, so those stay on one decoder.
-    """
-
-    if amd or duration < SCAN_PARALLEL_MIN_DURATION:
-        return 1
-    if video_width * video_height < SCAN_PARALLEL_MIN_PIXELS:
-        return 1
-    return SCAN_PARALLEL_DECODERS
+    return len(
+        scan_decode_backends(
+            video_width,
+            video_height,
+            duration,
+            amd=amd,
+        )
+    )
 
 
 def segment_sample_indices(
@@ -101,6 +160,16 @@ def segment_sample_indices(
     keeps everything from ``start``)."""
 
     return [i for i, t in enumerate(times) if t >= start and (is_last or t < end)]
+
+
+def _synchronize_scan_decode_batch(batch) -> None:
+    """Complete mixed native/Torch writes before a cross-thread handoff."""
+
+    if batch.device.type == "cpu":
+        return
+    from jasna.accelerator import current_stream
+
+    current_stream(batch.device).synchronize()
 
 
 @dataclass(frozen=True)
@@ -361,12 +430,20 @@ class MosaicScanWorker:
         *,
         stride_seconds: float,
         on_stopped: Callable[[], None] | None = None,
+        decode_strategy: str | None = None,
+        max_duration_seconds: float | None = None,
     ) -> None:
         self.path = Path(path)
         self.metadata = metadata
         self.settings = settings
         self.stride_seconds = float(stride_seconds)
         self._on_stopped = on_stopped
+        self.decode_strategy = decode_strategy
+        self.max_duration_seconds = (
+            None if max_duration_seconds is None else float(max_duration_seconds)
+        )
+        if self.max_duration_seconds is not None and self.max_duration_seconds <= 0:
+            raise ValueError("max_duration_seconds must be greater than zero")
         self.events: queue.Queue[ScanEvent] = queue.Queue()
         self._stop_scan = threading.Event()
         self._closed = threading.Event()
@@ -540,31 +617,52 @@ class MosaicScanWorker:
 
         metadata = self.metadata
         device = torch.device("cuda:0")
-        duration = float(metadata.duration)
+        source_duration = float(metadata.duration)
+        duration = (
+            source_duration
+            if self.max_duration_seconds is None
+            else min(source_duration, self.max_duration_seconds)
+        )
+        bounded_scan = duration < source_duration
         time_base = float(metadata.time_base)
         frame_stride = scan_sample_stride(metadata.video_fps, seconds=self.stride_seconds)
         sample_stride_seconds = frame_stride / float(metadata.video_fps)
         batch_size = int(self.settings.batch_size)
         frame_count = int(metadata.num_frames)
-        if frame_count > 0:
-            capacity = math.ceil(frame_count / frame_stride) + batch_size
+        if bounded_scan:
+            expected_samples = math.ceil(duration / sample_stride_seconds)
+        elif frame_count > 0:
+            expected_samples = math.ceil(frame_count / frame_stride)
         else:
             estimated_rate = max(float(metadata.average_fps), float(metadata.video_fps))
-            capacity = math.ceil(duration * estimated_rate / frame_stride) + batch_size
+            expected_samples = math.ceil(duration * estimated_rate / frame_stride)
+        expected_samples = max(1, expected_samples)
 
-        decoders = scan_decoder_count(
+        decode_backends = scan_decode_backends(
             int(metadata.video_width),
             int(metadata.video_height),
             duration,
             amd=is_amd_device(device),
+            amd_strategy=self.decode_strategy,
         )
-        segment_capacity = (
-            capacity if decoders == 1 else math.ceil(capacity / decoders) + batch_size
-        )
-        bounds = [duration * index / decoders for index in range(decoders + 1)]
+        decoders = len(decode_backends)
+        sample_bounds = scan_segment_sample_bounds(expected_samples, decode_backends)
+        bounds = [
+            min(duration, sample_index * sample_stride_seconds)
+            for sample_index in sample_bounds
+        ]
+        bounds[-1] = duration
+        segment_capacities = [
+            sample_bounds[index + 1] - sample_bounds[index] + batch_size
+            for index in range(decoders)
+        ]
+        self._last_scan_segment_stats = [None] * decoders
         batches: queue.Queue = queue.Queue(maxsize=decoders + 1)
 
         def decode_segment(index: int) -> None:
+            backend = decode_backends[index]
+            segment_started = time.monotonic()
+            segment_samples = 0
             start_s, end_s = bounds[index], bounds[index + 1]
             is_last = index == decoders - 1
             try:
@@ -575,6 +673,7 @@ class MosaicScanWorker:
                     metadata,
                     frame_stride=frame_stride,
                     prefer_software_decode=True,
+                    decode_backend=backend,
                 )
                 with reader:
                     start_pts = reader.start_pts
@@ -587,19 +686,37 @@ class MosaicScanWorker:
                             max(0.0, (pts - start_pts) * time_base) for pts in pts_list
                         ]
                         keep = segment_sample_indices(
-                            sample_times, start_s, end_s, is_last=is_last
+                            sample_times,
+                            start_s,
+                            end_s,
+                            is_last=is_last and not bounded_scan,
                         )
                         if keep:
                             if len(keep) < len(sample_times):
                                 batch = batch[keep]
-                            batches.put(
-                                (index, batch, [sample_times[i] for i in keep])
-                            )
-                        if not is_last and sample_times[-1] >= end_s:
+                            kept_times = [sample_times[i] for i in keep]
+                            segment_samples += len(kept_times)
+                            if batch.device.type != "cpu":
+                                # The AMD reader combines native HIP copies with
+                                # Torch conversion kernels. Finish this producer
+                                # stream before handing the tensor to the detector
+                                # thread; a Torch event alone does not cover that
+                                # mixed-runtime boundary reliably on ROCm.
+                                _synchronize_scan_decode_batch(batch)
+                            batches.put((index, batch, kept_times))
+                        if (not is_last or bounded_scan) and sample_times[-1] >= end_s:
                             break
             except BaseException as exc:
                 batches.put((index, exc, None))
                 return
+            finally:
+                self._last_scan_segment_stats[index] = {
+                    "backend": backend,
+                    "start_seconds": start_s,
+                    "end_seconds": end_s,
+                    "samples": segment_samples,
+                    "wall_seconds": time.monotonic() - segment_started,
+                }
             batches.put((index, None, None))
 
         seg_times: list[list[float]] = [[] for _ in range(decoders)]
@@ -616,7 +733,6 @@ class MosaicScanWorker:
         started = time.monotonic()
         last_progress = -1.0
         total_samples = 0
-        expected_samples = max(1, capacity - batch_size)
         active = decoders
         try:
             for thread in threads:
@@ -629,7 +745,7 @@ class MosaicScanWorker:
                 if isinstance(payload, BaseException):
                     raise payload
                 batch = payload
-                if len(seg_times[index]) + len(sample_times) > segment_capacity:
+                if len(seg_times[index]) + len(sample_times) > segment_capacities[index]:
                     raise RuntimeError(
                         "Video contains more frames than reported by its metadata"
                     )
@@ -644,7 +760,7 @@ class MosaicScanWorker:
                 if collectors[index] is None:
                     collectors[index] = _ScanTensorCollector(
                         torch,
-                        capacity=segment_capacity,
+                        capacity=segment_capacities[index],
                         mask_hw=SCAN_MASK_HW,
                         batch_size=batch_size,
                         device=device,

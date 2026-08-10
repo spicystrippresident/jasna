@@ -166,6 +166,33 @@ def test_smart_h264_settings_match_source_structure() -> None:
     }
 
 
+def test_smart_h264_settings_disable_b_frames_for_amf() -> None:
+    index = KeyframeIndex(
+        (0, 60, 120),
+        Fraction(1, 30),
+        0,
+        180,
+        max_b_frames=4,
+        uses_b_references=True,
+    )
+
+    settings = resolve_smart_encoder_settings(
+        "h264",
+        _metadata("h264", profile="High"),
+        index,
+        {"cq": 22, "profile": "high", "g": 250, "bf": 4, "b_ref_mode": "middle"},
+        h264_max_b_frames=0,
+    )
+
+    assert settings == {
+        "cq": 22,
+        "profile": "high",
+        "g": 60,
+        "bf": 0,
+        "b_ref_mode": "disabled",
+    }
+
+
 @pytest.mark.parametrize("codec", ["hevc", "av1"])
 def test_smart_settings_match_source_gop_for_other_codecs(codec: str) -> None:
     settings = resolve_smart_encoder_settings(

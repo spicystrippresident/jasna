@@ -70,8 +70,72 @@ verified fragments.
 
 The workspace algorithm is versioned independently of its manifest schema.
 Encoder-policy changes must bump that algorithm version so completed fragments
-created under an older rate-control contract cannot be reused. Version 2
-invalidates the earlier Linux AMD HEVC QVBR fragments.
+created under an older rate-control contract cannot be reused. Version 6
+invalidated unbounded Linux AMD HEVC QVBR fragments at every resolution; GUI
+CQ 28 now maps to CQP 30 for those fragments. On real SAVR-1050 and SAVR-1051
+windows this measured 1.01x and 1.22x source bitrate, while the low-change run
+grew only from two source frames to four instead of the old peak-VBR run's
+twelve.
+
+Version 7 also invalidates Linux AMD HEVC fragments created without the source
+level. FFprobe's HEVC `level_idc` is now part of `VideoMetadata`; the pipeline
+maps known values such as 183 and 186 to AMF `level=6.1` and `level=6.2` before
+both the workspace signature and fragment encoder are created. An explicit
+user `level` remains authoritative, and non-HEVC, non-AMD and non-Linux routes
+are unchanged.
+
+This fixed a conformance mismatch in the reported SAVR-1051 8192x4096
+60000/1001 output. Its copied source spans declared Level 6.1, while AMF render
+spans defaulted to Level 6.0 even though their luma sample rate is about 1.88
+times the Level 6.0 limit. The full pre-fix output still had all 159733 frames,
+strict presentation timestamps and the same 2664.879-second duration as the
+source, so container timestamp loss was ruled out. A paired-reader guard now
+also verifies that the blend decoder PTS matches the detector decoder PTS. A
+mismatch never substitutes a neighboring frame: the reader first drops only
+stale frames while looking for the exact target, then reopens rocDecode at that
+PTS for two bounded retries, and finally uses software decode from the same PTS.
+Only failure to recover the exact frame on every route aborts the span.
+
+Worker failure handling now records the first exception, signals the shared
+cancel event and drains bounded pipeline queues while joining the workers. This
+prevents a failed blend reader from leaving the detector blocked forever on a
+full metadata queue. The change followed an interrupted SAVR-1051 long run in
+which a render span remained `running` after an in-memory GUI error; the exact
+error text was lost in a later GPU reset, so the PTS mismatch remains the most
+likely trigger rather than a recovered log fact.
+
+The post-fix 8-bit acceptance used a 15.048367-second stream-copy window from
+the same SAVR source. It preserved 902/902 packets, 302 copied VCL packets and
+600 changed render packets; maximum PTS error was 5.56 microseconds. The output
+declared Level 6.1 instead of the pre-fix Level 6.0, and both software and AMF
+decode completed all 902 frames with zero reported duplicates or drops. Wall
+time was 46.318 seconds versus 46.715 seconds for the pre-fix run. A separate
+15-second 8192x4096 Main 10/P010 acceptance inherited source Level 6.2,
+preserved 750/750 packets with exact PTS, and completed software and AMF decode
+with zero reported duplicates or drops.
+
+The original long output is not rewritten in place and must be processed again
+under workspace v7. Linux AMF decoded the underspecified short pre-fix stream,
+so the final subjective playback check still belongs on the user's affected
+player after that rerun; the fix removes the concrete HEVC-level violation
+rather than claiming every hardware decoder reproduced the drop behavior.
+
+The policy applies below 8K because the same AMF defect reproduced after
+cropping the real SAVR source. In a high-detail window, QVBR 28 versus CQP 30
+measured 68.73 versus 6.65 Mbps at 4096x2048 and 140.50 versus 13.43 Mbps at
+5760x2880; the 4K CQP result measured 44.35 dB PSNR against the decoded source.
+The unaffected routes kept their separate controls: a real 4096x2048 H.264
+smart fragment used 1.84 Mbps against a 31.54 Mbps source window, and 8-bit 8K
+AV1 used 5.32 Mbps with its source ceiling active.
+
+The earlier GUI process abort was a separate symptom of the same AMF path.
+After several 8K QVBR fragments, AMF repeatedly logged `PA has already been
+created` and then terminated the process from native code with
+`std::length_error: vector::_M_default_append` while opening the next encoder.
+Linux AMD HEVC smart fragments now force PreAnalysis off even if custom QVBR
+settings request it. A same-process stress run opened, encoded and closed 16
+consecutive 8K CQP sessions (192 frames) in 38.706 seconds without creating PA,
+leaking an output, or crashing.
 
 The removed toolbox runtime remains recoverable from
 `/home/latiao/vr_toolbox_jasna_linux/migration_archive_vr_remove_mosaic_linux_20260802.tar.zst`
@@ -403,11 +467,50 @@ them into Torch. On the 62-frame 8K HEVC sample, stride 60 preserved the two
 selected PTS/RGB frames and took 0.925 seconds versus 1.434 seconds through the
 software path.
 
+## Parallel AMD sparse-scan decoding
+
+Large Linux AMD scans now split one global sampling grid across two native
+rocDecode readers. Per-reader backend selection is local to
+`NvidiaVideoReader`, so the production render and preview routes retain their
+existing automatic backend. Inputs below 30 million pixels or shorter than ten
+seconds still use one reader. Single rocDecode and rocDecode plus one software
+reader remain explicit fallback policies; the tested two-native-plus-software
+policy was removed because it did not preserve detector evidence reliably.
+
+On the same 50.2-second 8192x4096 HEVC source and RF-DETR v6 scan, one
+rocDecode reader took 37.885 seconds. Two readers took 22.654 seconds, a 40.2%
+reduction, with all 51 PTS, 37 threshold hits and final ranges preserved. The
+rocDecode-plus-software fallback took 28.942 seconds. Three readers reached
+20.7-20.8 seconds but repeatedly changed the 11.011-second score by about 0.17,
+so that policy is not available in production.
+
+The official rocDecode `videoDecodePerf` sample measured internal mapped
+surfaces (`-m 0`) against decode-only surfaces (`-m 3`). One session took
+33.00 versus 32.95 seconds; two sessions took 32.90 seconds in both modes and
+delivered about 183.2 aggregate fps. Selectively mapping only sampled frames
+therefore has no material headroom and the low-level bridge was not rewritten.
+
+A longer 300-second bounded scan exposed occasional incomplete fourth frames
+at the decoder-thread handoff. The reader combines native HIP copies with Torch
+conversion kernels, so a Torch event alone did not establish the complete ROCm
+dependency. The producer stream now completes before each four-frame tensor is
+queued while subsequent decode still overlaps detection. Two post-fix hot runs
+took 106.463 and 106.572 seconds in the scan body. All 300 PTS matched exactly;
+the maximum score delta was 0.004357, within the 0.004859 spread produced by 20
+repeated RF-DETR FP16 inferences over the same fixed tensor. Peak VRAM was 8.84
+and 9.22 GiB, peak junction temperature was 79 and 80 C, and VCN returned to
+zero after each run. A real timed stop returned in 16.697 seconds after a
+15-second request and left no decoder or scan process behind.
+
+The benchmark adapter can bound a scan with `--max-scan-seconds` without
+creating clips or output video. Dual-reader stop and exception paths have
+regressions that require both reader contexts to close.
+
 ## Current source-tree verification
 
 On kernel `6.17.0-41-generic`, RX 7900 XTX and ROCm 7.2.1:
 
-- complete suite: `1911 passed, 119 skipped, 0 failed`;
+- complete suite: `1996 passed, 119 skipped, 0 failed`;
 - E2E suite: `6 passed, 17 skipped`;
 - `python -m compileall -q jasna tests scripts` and `git diff --check`: passed;
 - every entry in `RUNTIME_ASSETS.sha256`: passed.
@@ -431,3 +534,25 @@ payloads for every copy span.
 The skips correspond to inapplicable TensorRT, protected-model, NVENC/NVDEC,
 RTX and TVAI paths. Remaining work is Windows AMD smart rendering and Main 10
 plus broader-source whole-title testing; neither is reported as complete.
+
+## rocDecode frame ownership fix
+
+Human 38 acceptance was user-confirmed on the real 8-bit sample. The causal
+fix keeps delayed encoder ownership intact: the encoder heap binds each frame
+to its PTS and LUT metadata and clones frames before delayed encoding can
+outlive the decoder batch.
+
+rocDecode RGB batches now synchronize before handoff to the processing path.
+The native bridge also waits for asynchronous Y and UV copies to finish before
+calling `ReleaseFrame`. Before that native fence, 34 of 1,201 frames had
+wrong content; after it, the accepted run had 0 of 1,201 wrong-content frames.
+
+The accepted run took 227.27 seconds versus about 230 seconds for the baseline,
+so the ownership and fence fixes introduced no material runtime regression.
+The rejected timeline and experimental diagnostic plumbing was removed to keep
+the GUI hot path clean. Production retains adaptive Fisheye geometry and the
+default previous/current/next mask union.
+
+The frame-ownership evidence covers the real 8-bit sample. The same native-copy
+boundary still requires a separate Main 10/P016 sample before this specific fix
+is claimed validated for that format.

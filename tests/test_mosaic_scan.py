@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from fractions import Fraction
+from types import SimpleNamespace
+
 import pytest
+import torch
 
 from jasna.gui.mosaic_scan import (
     MosaicScanResult,
@@ -147,6 +151,49 @@ def test_scan_decoder_count_parallel_only_for_4k_on_nvidia():
     assert scan_decoder_count(1920, 1080, 120.0, amd=False) == 1
     assert scan_decoder_count(3840, 2160, 5.0, amd=False) == 1
     assert scan_decoder_count(3840, 2160, 120.0, amd=True) == 1
+    assert scan_decoder_count(8192, 4096, 120.0, amd=True) == 2
+
+
+def test_amd_scan_decode_strategies_only_apply_to_large_long_inputs():
+    from jasna.gui.mosaic_scan import scan_decode_backends
+
+    assert scan_decode_backends(
+        8192, 4096, 120.0, amd=True, amd_strategy="dual-rocdecode"
+    ) == ("auto", "auto")
+    assert scan_decode_backends(
+        8192, 4096, 120.0, amd=True, amd_strategy="rocdecode-software"
+    ) == ("auto", "pyav-sw")
+    assert scan_decode_backends(
+        3840, 2160, 120.0, amd=True, amd_strategy="dual-rocdecode"
+    ) == ("auto",)
+    assert scan_decode_backends(
+        8192, 4096, 5.0, amd=True, amd_strategy="dual-rocdecode"
+    ) == ("auto",)
+
+
+def test_scan_segment_bounds_balance_slower_software_reader():
+    from jasna.gui.mosaic_scan import scan_segment_sample_bounds
+
+    assert scan_segment_sample_bounds(100, ("auto", "auto")) == (0, 50, 100)
+    assert scan_segment_sample_bounds(100, ("auto", "pyav-sw")) == (0, 62, 100)
+
+
+def test_scan_decode_batch_synchronizes_gpu_producer_stream(monkeypatch):
+    import jasna.accelerator
+    from jasna.gui.mosaic_scan import _synchronize_scan_decode_batch
+
+    stream = SimpleNamespace(synchronize=lambda: None)
+    synchronized = []
+    stream.synchronize = lambda: synchronized.append(True)
+    device = SimpleNamespace(type="cuda")
+    monkeypatch.setattr(jasna.accelerator, "current_stream", lambda value: stream)
+
+    _synchronize_scan_decode_batch(SimpleNamespace(device=device))
+    _synchronize_scan_decode_batch(
+        SimpleNamespace(device=SimpleNamespace(type="cpu"))
+    )
+
+    assert synchronized == [True]
 
 
 def test_segment_sample_indices_ownership():
@@ -156,3 +203,58 @@ def test_segment_sample_indices_ownership():
     assert segment_sample_indices(times, 0.0, 10.0, is_last=False) == [0, 1]
     assert segment_sample_indices(times, 10.0, 20.0, is_last=True) == [2, 3]
     assert segment_sample_indices([5.0], 10.0, 20.0, is_last=True) == []
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_dual_scan_releases_both_readers_on_stop_or_error(monkeypatch, failure):
+    import jasna.accelerator
+    import jasna.media.video_decoder
+    from jasna.gui.mosaic_scan import MosaicScanWorker
+
+    readers = []
+
+    class FakeReader:
+        def __init__(self, *_args, **_kwargs):
+            self.start_pts = 0
+            self.closed = False
+            readers.append(self)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.closed = True
+
+        def frames(self, seek_ts=None):
+            if failure:
+                raise RuntimeError("decode failed")
+            yield torch.zeros((1, 3, 2, 2), dtype=torch.uint8), [0]
+
+    monkeypatch.setattr(jasna.accelerator, "is_amd_device", lambda _device: True)
+    monkeypatch.setattr(jasna.media.video_decoder, "NvidiaVideoReader", FakeReader)
+    metadata = SimpleNamespace(
+        duration=120.0,
+        time_base=Fraction(1, 30),
+        video_fps=30.0,
+        average_fps=30.0,
+        num_frames=3600,
+        video_width=8192,
+        video_height=4096,
+    )
+    worker = MosaicScanWorker(
+        "input.mp4",
+        metadata,
+        SimpleNamespace(batch_size=1),
+        stride_seconds=1.0,
+        decode_strategy="dual-rocdecode",
+    )
+
+    if failure:
+        with pytest.raises(RuntimeError, match="decode failed"):
+            worker._scan(object())
+    else:
+        worker.stop()
+        worker._scan(object())
+
+    assert len(readers) == 2
+    assert all(reader.closed for reader in readers)

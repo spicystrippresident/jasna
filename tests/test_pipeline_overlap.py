@@ -145,4 +145,3 @@ def test_parent_and_child_crossfade_weights_sum_to_one() -> None:
         p = parent[parent_start + j]
         c = child[child_start + j]
         assert p + c == pytest.approx(1.0)
-

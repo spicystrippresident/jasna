@@ -33,13 +33,22 @@ def test_cli_main_patches_frozen_torch(tmp_path):
 
 @pytest.mark.skipif(find_spec("tkinter") is None, reason="python3-tk is not installed")
 def test_gui_run_gui_patches_frozen_torch():
+    import customtkinter as ctk
+
     from jasna.gui import app as gui_app
 
     class _Stop(Exception):
         pass
 
-    with patch("jasna._frozen.patch_frozen_torch") as spy:
-        with patch.object(gui_app, "JasnaApp", side_effect=_Stop):
-            with pytest.raises(_Stop):
-                gui_app.run_gui()
+    try:
+        with patch("jasna._frozen.patch_frozen_torch") as spy:
+            with patch.object(gui_app, "JasnaApp", side_effect=_Stop):
+                with pytest.raises(_Stop):
+                    gui_app.run_gui()
+    finally:
+        # run_gui() configures process-global CTk scaling before constructing
+        # the app. The deliberate constructor failure must not leak that state
+        # into later GUI tests.
+        ctk.set_widget_scaling(1.0)
+        ctk.set_window_scaling(1.0)
     spy.assert_called()

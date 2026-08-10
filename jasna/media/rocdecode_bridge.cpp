@@ -23,6 +23,7 @@ SOFTWARE.
 #include <cstdint>
 #include <exception>
 #include <memory>
+#include <stdexcept>
 #include <string>
 
 #include <hip/hip_runtime.h>
@@ -33,9 +34,24 @@ namespace {
 struct Bridge {
     explicit Bridge(int device_id, rocDecVideoCodec codec)
         : decoder(std::make_unique<RocVideoDecoder>(
-              device_id, OUT_SURFACE_MEM_DEV_INTERNAL, codec)) {}
+              device_id, OUT_SURFACE_MEM_DEV_INTERNAL, codec)) {
+        const hipError_t status =
+            hipStreamCreateWithFlags(&copy_stream, hipStreamNonBlocking);
+        if (status != hipSuccess) {
+            throw std::runtime_error(
+                std::string("HIP copy stream creation failed: ") +
+                hipGetErrorString(status));
+        }
+    }
+
+    ~Bridge() {
+        if (copy_stream) {
+            (void)hipStreamDestroy(copy_stream);
+        }
+    }
 
     std::unique_ptr<RocVideoDecoder> decoder;
+    hipStream_t copy_stream = nullptr;
     std::string error;
 };
 
@@ -154,28 +170,41 @@ int jasna_rocdecode_copy_frame(
             throw std::runtime_error("Torch destination is smaller than rocDecode output");
         }
 
-        hipError_t status = hipMemcpy2D(
+        hipError_t status = hipMemcpy2DAsync(
             destination,
             row_bytes,
             source,
             info->output_pitch,
             row_bytes,
             info->output_height,
-            hipMemcpyDeviceToDevice
+            hipMemcpyDeviceToDevice,
+            bridge->copy_stream
         );
+        bool copy_queued = status == hipSuccess;
         if (status == hipSuccess) {
             const uint8_t *source_uv = source +
                 static_cast<size_t>(info->output_pitch) * info->output_vstride;
             uint8_t *destination_uv = destination + row_bytes * info->output_height;
-            status = hipMemcpy2D(
+            const hipError_t uv_status = hipMemcpy2DAsync(
                 destination_uv,
                 row_bytes,
                 source_uv,
                 info->output_pitch,
                 row_bytes,
                 info->chroma_height,
-                hipMemcpyDeviceToDevice
+                hipMemcpyDeviceToDevice,
+                bridge->copy_stream
             );
+            if (uv_status != hipSuccess) {
+                status = uv_status;
+            }
+        }
+        if (copy_queued) {
+            const hipError_t sync_status =
+                hipStreamSynchronize(bridge->copy_stream);
+            if (status == hipSuccess && sync_status != hipSuccess) {
+                status = sync_status;
+            }
         }
         const bool released = bridge->decoder->ReleaseFrame(frame_pts);
         if (status != hipSuccess) {

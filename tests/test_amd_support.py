@@ -275,9 +275,44 @@ def test_linux_amd_p010_av1_uses_source_rate_peak_vbr(monkeypatch, tmp_path) -> 
     assert encoder._target_bit_rate == 17_000_000
 
 
+def test_linux_amd_8bit_av1_smart_fragment_keeps_source_ceiling(
+    monkeypatch, tmp_path
+) -> None:
+    import jasna.media.video_encoder as module
+
+    monkeypatch.setattr(
+        module,
+        "vendor_for_device",
+        lambda _device: AcceleratorVendor.AMD,
+    )
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    metadata = _metadata()
+    metadata.codec_name = "av1"
+    metadata.video_bitrate = 17_000_000
+
+    encoder = module.NvidiaVideoEncoder(
+        str(tmp_path / "fragment.nut"),
+        torch.device("cuda:0"),
+        metadata,
+        codec="av1",
+        encoder_settings={"cq": 35},
+        match_input_bit_depth=True,
+        smart_fragment=True,
+        mux_audio=False,
+    )
+
+    assert encoder.spec.ten_bit is False
+    assert encoder.encoder_options["rc"] == "qvbr"
+    assert encoder.encoder_options["qvbr_quality_level"] == "35"
+    assert encoder.encoder_options["maxrate"] == "17000000"
+    assert encoder.encoder_options["bufsize"] == "34000000"
+    assert encoder._target_bit_rate is None
+
+
 @pytest.mark.parametrize("is_10bit", [False, True])
+@pytest.mark.parametrize("portable_cq", [False, True])
 def test_linux_amd_hevc_source_ceiling_uses_stable_peak_vbr(
-    monkeypatch, tmp_path, is_10bit
+    monkeypatch, tmp_path, is_10bit, portable_cq
 ) -> None:
     import jasna.media.video_encoder as module
 
@@ -297,7 +332,7 @@ def test_linux_amd_hevc_source_ceiling_uses_stable_peak_vbr(
         torch.device("cuda:0"),
         metadata,
         codec="hevc",
-        encoder_settings={},
+        encoder_settings={"cq": 28} if portable_cq else {},
         match_input_bit_depth=True,
     )
 
@@ -309,6 +344,215 @@ def test_linux_amd_hevc_source_ceiling_uses_stable_peak_vbr(
     assert "qvbr_quality_level" not in encoder.encoder_options
     assert "bufsize" not in encoder.encoder_options
     assert encoder._target_bit_rate == expected_rate
+
+
+@pytest.mark.parametrize("is_10bit", [False, True])
+def test_linux_amd_hevc_smart_fragment_maps_portable_cq_to_cqp(
+    monkeypatch, tmp_path, is_10bit
+) -> None:
+    import jasna.media.video_encoder as module
+
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        module,
+        "vendor_for_device",
+        lambda _device: AcceleratorVendor.AMD,
+    )
+    metadata = _metadata()
+    metadata.codec_name = "hevc"
+    metadata.is_10bit = is_10bit
+    metadata.video_bitrate = 8_828_873
+    metadata.video_width = 8192
+    metadata.video_height = 4096
+
+    encoder = module.NvidiaVideoEncoder(
+        str(tmp_path / "fragment.nut"),
+        torch.device("cuda:0"),
+        metadata,
+        codec="hevc",
+        encoder_settings={"cq": 28},
+        match_input_bit_depth=True,
+        smart_fragment=True,
+        mux_audio=False,
+    )
+
+    assert encoder.encoder_options["rc"] == "cqp"
+    assert encoder.encoder_options["qp_i"] == "30"
+    assert encoder.encoder_options["qp_p"] == "30"
+    assert encoder.encoder_options["preanalysis"] == "0"
+    assert "qvbr_quality_level" not in encoder.encoder_options
+    assert "vbaq" not in encoder.encoder_options
+    assert "maxrate" not in encoder.encoder_options
+    assert "bufsize" not in encoder.encoder_options
+    assert encoder._target_bit_rate is None
+
+
+@pytest.mark.parametrize(
+    ("is_10bit", "source_level", "expected_level", "frame_format"),
+    [
+        (False, 183, "6.1", "nv12"),
+        (True, 186, "6.2", "p010le"),
+    ],
+)
+def test_linux_amd_hevc_smart_fragment_propagates_source_level(
+    monkeypatch,
+    tmp_path,
+    is_10bit,
+    source_level,
+    expected_level,
+    frame_format,
+) -> None:
+    import jasna.media.video_encoder as module
+
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        module,
+        "vendor_for_device",
+        lambda _device: AcceleratorVendor.AMD,
+    )
+    metadata = _metadata()
+    metadata.codec_name = "hevc"
+    metadata.is_10bit = is_10bit
+    metadata.hevc_level = source_level
+
+    encoder = module.NvidiaVideoEncoder(
+        str(tmp_path / "fragment.nut"),
+        torch.device("cuda:0"),
+        metadata,
+        codec="hevc",
+        encoder_settings={"cq": 28},
+        match_input_bit_depth=True,
+        smart_fragment=True,
+        mux_audio=False,
+    )
+
+    assert encoder.spec.frame_format == frame_format
+    assert encoder.encoder_options["level"] == expected_level
+
+
+def test_linux_amd_hevc_smart_fragment_preserves_explicit_level(
+    monkeypatch, tmp_path
+) -> None:
+    import jasna.media.video_encoder as module
+
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        module,
+        "vendor_for_device",
+        lambda _device: AcceleratorVendor.AMD,
+    )
+    metadata = _metadata()
+    metadata.codec_name = "hevc"
+    metadata.hevc_level = 183
+
+    encoder = module.NvidiaVideoEncoder(
+        str(tmp_path / "fragment.nut"),
+        torch.device("cuda:0"),
+        metadata,
+        codec="hevc",
+        encoder_settings={"level": "5.1"},
+        match_input_bit_depth=True,
+        smart_fragment=True,
+        mux_audio=False,
+    )
+
+    assert encoder.encoder_options["level"] == "5.1"
+
+
+@pytest.mark.parametrize(
+    ("platform", "vendor", "codec"),
+    [
+        ("win32", AcceleratorVendor.AMD, "hevc"),
+        ("linux", AcceleratorVendor.NVIDIA, "hevc"),
+        ("linux", AcceleratorVendor.AMD, "h264"),
+    ],
+)
+def test_source_hevc_level_is_not_added_outside_linux_amd_hevc_fragments(
+    monkeypatch, platform, vendor, codec
+) -> None:
+    import jasna.media.video_encoder as module
+
+    monkeypatch.setattr(module.sys, "platform", platform)
+    metadata = _metadata()
+    metadata.hevc_level = 183
+
+    assert module.add_amd_hevc_smart_fragment_source_level(
+        {},
+        metadata,
+        codec=codec,
+        vendor=vendor,
+    ) == {}
+
+
+@pytest.mark.parametrize("is_10bit", [False, True])
+def test_linux_amd_hevc_smart_fragment_preserves_qvbr_but_disables_preanalysis(
+    monkeypatch, tmp_path, is_10bit
+) -> None:
+    import jasna.media.video_encoder as module
+
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        module,
+        "vendor_for_device",
+        lambda _device: AcceleratorVendor.AMD,
+    )
+    metadata = _metadata()
+    metadata.codec_name = "hevc"
+    metadata.is_10bit = is_10bit
+    metadata.video_bitrate = 8_828_873
+
+    encoder = module.NvidiaVideoEncoder(
+        str(tmp_path / "fragment.nut"),
+        torch.device("cuda:0"),
+        metadata,
+        codec="hevc",
+        encoder_settings={"qvbr_quality_level": 28, "preanalysis": 1},
+        match_input_bit_depth=True,
+        smart_fragment=True,
+        mux_audio=False,
+    )
+
+    assert encoder.encoder_options["rc"] == "qvbr"
+    assert encoder.encoder_options["qvbr_quality_level"] == "28"
+    assert encoder.encoder_options["preanalysis"] == "0"
+    assert "maxrate" not in encoder.encoder_options
+    assert "bufsize" not in encoder.encoder_options
+    assert encoder._target_bit_rate is None
+
+
+def test_linux_amd_hevc_smart_fragment_uses_cqp_at_smaller_resolution(
+    monkeypatch, tmp_path
+) -> None:
+    import jasna.media.video_encoder as module
+
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        module,
+        "vendor_for_device",
+        lambda _device: AcceleratorVendor.AMD,
+    )
+    metadata = _metadata()
+    metadata.codec_name = "hevc"
+    metadata.video_bitrate = 8_828_873
+
+    encoder = module.NvidiaVideoEncoder(
+        str(tmp_path / "fragment.nut"),
+        torch.device("cuda:0"),
+        metadata,
+        codec="hevc",
+        encoder_settings={"cq": 28},
+        match_input_bit_depth=True,
+        smart_fragment=True,
+        mux_audio=False,
+    )
+
+    assert encoder.encoder_options["rc"] == "cqp"
+    assert encoder.encoder_options["qp_i"] == "30"
+    assert encoder.encoder_options["qp_p"] == "30"
+    assert encoder.encoder_options["preanalysis"] == "0"
+    assert "qvbr_quality_level" not in encoder.encoder_options
+    assert "maxrate" not in encoder.encoder_options
+    assert "bufsize" not in encoder.encoder_options
 
 
 def test_linux_amd_hevc_explicit_rate_control_is_preserved(monkeypatch, tmp_path) -> None:
@@ -339,7 +583,11 @@ def test_linux_amd_hevc_explicit_rate_control_is_preserved(monkeypatch, tmp_path
     assert encoder._target_bit_rate is None
 
 
-def test_linux_amd_h264_source_ceiling_keeps_native_qvbr(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize("smart_fragment", [False, True])
+@pytest.mark.parametrize("portable_cq", [False, True])
+def test_linux_amd_h264_source_ceiling_keeps_native_qvbr(
+    monkeypatch, tmp_path, smart_fragment, portable_cq
+) -> None:
     import jasna.media.video_encoder as module
 
     monkeypatch.setattr(module.sys, "platform", "linux")
@@ -356,14 +604,19 @@ def test_linux_amd_h264_source_ceiling_keeps_native_qvbr(monkeypatch, tmp_path) 
         torch.device("cuda:0"),
         metadata,
         codec="h264",
-        encoder_settings={},
+        encoder_settings={"cq": 28} if portable_cq else {},
+        smart_fragment=smart_fragment,
     )
 
     assert encoder.encoder_options["rc"] == "qvbr"
     assert encoder.encoder_options["preanalysis"] == "1"
+    assert encoder.encoder_options["qvbr_quality_level"] == (
+        "28" if portable_cq else "24"
+    )
     assert encoder.encoder_options["maxrate"] == "20000000"
     assert encoder.encoder_options["bufsize"] == "40000000"
     assert encoder._target_bit_rate is None
+    assert ("forced_idr" in encoder.encoder_options) is smart_fragment
 
 
 def test_windows_amd_hevc_source_ceiling_keeps_native_qvbr(monkeypatch, tmp_path) -> None:
@@ -421,6 +674,41 @@ def test_linux_amd_hevc_without_valid_source_ceiling_keeps_qvbr(
 
     assert encoder.encoder_options["rc"] == "qvbr"
     assert encoder.encoder_options["preanalysis"] == "1"
+    assert "maxrate" not in encoder.encoder_options
+    assert "bufsize" not in encoder.encoder_options
+    assert encoder._target_bit_rate is None
+
+
+@pytest.mark.parametrize("source_bitrate", [0, 1_504_546_792, 3_000_000_000])
+def test_linux_amd_hevc_gui_cq_without_valid_source_ceiling_uses_cqp(
+    monkeypatch, tmp_path, source_bitrate
+) -> None:
+    import jasna.media.video_encoder as module
+
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        module,
+        "vendor_for_device",
+        lambda _device: AcceleratorVendor.AMD,
+    )
+    metadata = _metadata()
+    metadata.codec_name = "hevc"
+    metadata.video_bitrate = source_bitrate
+
+    encoder = module.NvidiaVideoEncoder(
+        str(tmp_path / "out.mp4"),
+        torch.device("cuda:0"),
+        metadata,
+        codec="hevc",
+        encoder_settings={"cq": 28},
+        match_input_bit_depth=True,
+    )
+
+    assert encoder.encoder_options["rc"] == "cqp"
+    assert encoder.encoder_options["qp_i"] == "30"
+    assert encoder.encoder_options["qp_p"] == "30"
+    assert encoder.encoder_options["preanalysis"] == "0"
+    assert "qvbr_quality_level" not in encoder.encoder_options
     assert "maxrate" not in encoder.encoder_options
     assert "bufsize" not in encoder.encoder_options
     assert encoder._target_bit_rate is None

@@ -318,6 +318,7 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self._queue_panel.set_initial_output(
             self._settings_panel.get_last_output_folder(),
             self._settings_panel.get_last_output_pattern(),
+            self._settings_panel.get_last_preserve_input_structure(),
         )
         self._queue_panel.set_on_output_changed(self._on_output_changed)
         if self.TkdndVersion is not None:
@@ -394,6 +395,10 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _on_close(self):
         try:
+            self._settings_panel.persist_working_directory()
+        except Exception:
+            logger.debug("Could not persist working directory during shutdown", exc_info=True)
+        try:
             if self._processor:
                 self._processor.stop()
                 self._processor.join(timeout=5.0)
@@ -442,9 +447,17 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self._control_bar.update_progress(queue_total=len(jobs))
         self._update_start_button_state()
 
-    def _on_output_changed(self, folder: str, pattern: str):
+    def _on_output_changed(
+        self,
+        folder: str,
+        pattern: str,
+        preserve_input_structure: bool,
+    ):
         self._settings_panel.set_last_output_folder(folder)
         self._settings_panel.set_last_output_pattern(pattern)
+        self._settings_panel.set_last_preserve_input_structure(
+            preserve_input_structure
+        )
 
     def _open_interactive_image_restore(self):
         from tkinter import filedialog
@@ -502,7 +515,11 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
             
         output_folder = self._queue_panel.get_output_folder()
         output_pattern = self._queue_panel.get_output_pattern()
+        preserve_input_structure = (
+            self._queue_panel.get_preserve_input_structure()
+        )
         settings = self._settings_panel.get_settings()
+        self._settings_panel.persist_working_directory(settings.working_directory)
 
         from jasna.gui.validation import validate_gui_start
         errors = validate_gui_start(settings)
@@ -563,6 +580,7 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
             output_folder,
             output_pattern,
             disable_basicvsrpp_tensorrt=disable_basicvsrpp_tensorrt,
+            preserve_input_structure=preserve_input_structure,
         )
                 
     def _on_stop(self):

@@ -22,6 +22,7 @@ TH = {
         "btn_clear": "ล้าง",
         "btn_clear_completed": "✓ ล้างที่เสร็จแล้ว",
         "output_location": "ตำแหน่งเอาต์พุต",
+        "preserve_input_structure": "คงโครงสร้างโฟลเดอร์ย่อยของอินพุต",
         "output_pattern": "รูปแบบชื่อไฟล์เอาต์พุต",
         "output_pattern_placeholder": "{original}_restored.mp4",
         "same_as_input": "เหมือนกับอินพุต",
@@ -404,6 +405,7 @@ TH = {
         "tip_encoder_custom_args": "พารามิเตอร์ encoder ขั้นสูง ในรูปแบบ key=value คั่นด้วยจุลภาค\nเว้นว่างไว้หากไม่แน่ใจ\n\nตัวอย่าง: rc-lookahead=32",
         "tip_post_export_action": "การทำงานเสริมหลังคิวทั้งหมดเสร็จ\n\nไม่มี: ไม่ทำอะไร\nปิดเครื่อง PC: ปิดคอมพิวเตอร์\nคำสั่งกำหนดเอง: เรียกใช้คำสั่งด้านล่างใน system shell",
         "tip_output_location": "โฟลเดอร์ที่ใช้บันทึกวิดีโอที่ประมวลผลแล้ว\nเว้นว่างเพื่อบันทึกไว้ข้างไฟล์ต้นฉบับ",
+        "tip_preserve_input_structure": "สำหรับงานที่เพิ่มจากโฟลเดอร์ ให้สร้างโครงสร้างโฟลเดอร์ย่อยซ้ำภายในโฟลเดอร์เอาต์พุตที่เลือก ไฟล์ที่เพิ่มทีละไฟล์จะไม่ได้รับผลกระทบ",
         "tip_output_pattern": "รูปแบบชื่อไฟล์เอาต์พุต\nใช้ {original} เป็นตัวแทนชื่อไฟล์อินพุต (ไม่รวมนามสกุล)\n\nตัวอย่าง: {original}_restored.mp4 → my_video_restored.mp4",
 
         # Preset button tooltips

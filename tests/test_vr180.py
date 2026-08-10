@@ -151,6 +151,36 @@ def test_projection_override_applies_to_detected_vr(projection: str) -> None:
     assert result.projection == projection
 
 
+def test_fisheye_source_keeps_adaptive_mask_geometry_with_raw_override() -> None:
+    result = resolve_vr_mode(
+        "auto",
+        _metadata(),
+        Path("SAVR-1050.mp4"),
+        projection="raw",
+    )
+
+    assert result.projection == "raw"
+    assert result.fisheye_mask_geometry is True
+
+
+def test_direct_sbs_source_does_not_enable_adaptive_mask_geometry() -> None:
+    result = resolve_vr_mode(
+        "auto",
+        _metadata(),
+        Path("MDVR-001.mp4"),
+        projection="raw",
+    )
+
+    assert result.is_sbs
+    assert result.fisheye_mask_geometry is False
+
+
+def test_explicit_fisheye_mode_enables_adaptive_mask_geometry() -> None:
+    result = resolve_vr_mode("sbs-fisheye", _metadata(), Path("unknown.mp4"))
+
+    assert result.fisheye_mask_geometry is True
+
+
 def test_projection_override_does_not_enable_vr_layout() -> None:
     result = resolve_vr_mode(
         "auto",

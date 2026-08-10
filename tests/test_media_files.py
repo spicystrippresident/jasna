@@ -78,3 +78,25 @@ class TestFolderOutputPath:
     def test_pattern_without_suffix_preserves_input_extension(self):
         out = folder_output_path(Path("/out"), Path("/in/clip.mkv"), "{original}_restored")
         assert out == Path("/out/clip_restored.mkv")
+
+    def test_preserves_relative_subfolder_structure_when_enabled(self):
+        out = folder_output_path(
+            Path("/out"),
+            Path("/in/studio/series/clip.mkv"),
+            "{original}_restored.mp4",
+            input_root=Path("/in"),
+            preserve_structure=True,
+        )
+
+        assert out == Path("/out/studio/series/clip_restored.mp4")
+
+    def test_preserve_structure_keeps_flat_output_without_matching_root(self):
+        out = folder_output_path(
+            Path("/out"),
+            Path("/elsewhere/clip.mkv"),
+            "{original}_restored.mp4",
+            input_root=Path("/in"),
+            preserve_structure=True,
+        )
+
+        assert out == Path("/out/clip_restored.mp4")

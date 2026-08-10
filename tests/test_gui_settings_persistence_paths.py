@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 
 from jasna import os_utils
 from jasna.gui.models import AppSettings, PresetManager, get_settings_path
@@ -94,6 +96,101 @@ def test_preset_manager_persists_working_directory(monkeypatch, tmp_path: Path) 
     assert loaded.working_directory == r"D:\scratch"
 
 
+def test_preset_manager_saves_and_loads_last_working_directory(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(os_utils.sys, "platform", "win32", raising=False)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
+
+    mgr = PresetManager()
+    assert mgr.get_last_working_directory() is None
+    mgr.set_last_working_directory(r"D:\jasna-work")
+
+    mgr2 = PresetManager()
+    assert mgr2.get_last_working_directory() == r"D:\jasna-work"
+
+    mgr2.set_last_working_directory("")
+    assert PresetManager().get_last_working_directory() == ""
+    data = json.loads(get_settings_path().read_text(encoding="utf-8"))
+    assert data["last_working_directory"] == ""
+
+
+def test_legacy_settings_do_not_override_preset_working_directory(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(os_utils.sys, "platform", "win32", raising=False)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
+
+    settings_path = get_settings_path()
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(
+        json.dumps(
+            {
+                "last_selected": "WithWorkDir",
+                "user_presets": {
+                    "WithWorkDir": asdict(
+                        AppSettings(working_directory=r"D:\preset-work")
+                    )
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    mgr = PresetManager()
+    assert mgr.get_last_working_directory() is None
+    preset = mgr.get_preset("WithWorkDir")
+    assert preset is not None
+    assert preset.working_directory == r"D:\preset-work"
+
+    mgr.set_last_selected("WithWorkDir")
+    saved = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert "last_working_directory" not in saved
+
+
+def test_settings_panel_restores_saved_working_directory() -> None:
+    from jasna.gui.settings_panel import SettingsPanel
+
+    class Entry:
+        value = "preset-work"
+
+        def delete(self, _start, _end) -> None:
+            self.value = ""
+
+        def insert(self, _index, value: str) -> None:
+            self.value = value
+
+    entry = Entry()
+    modified_updates: list[bool] = []
+    panel = SimpleNamespace(
+        _preset_manager=SimpleNamespace(
+            get_last_working_directory=lambda: r"D:\saved-work"
+        ),
+        _widgets={"working_directory": entry},
+        _update_modified_indicator=lambda: modified_updates.append(True),
+    )
+
+    SettingsPanel._restore_last_working_directory(panel)
+
+    assert entry.value == r"D:\saved-work"
+    assert modified_updates == [True]
+
+
+def test_settings_panel_keeps_preset_working_directory_for_legacy_settings() -> None:
+    from jasna.gui.settings_panel import SettingsPanel
+
+    entry = SimpleNamespace(value="preset-work")
+    panel = SimpleNamespace(
+        _preset_manager=SimpleNamespace(get_last_working_directory=lambda: None),
+        _widgets={"working_directory": entry},
+        _update_modified_indicator=lambda: None,
+    )
+
+    SettingsPanel._restore_last_working_directory(panel)
+
+    assert entry.value == "preset-work"
+
+
 def test_preset_manager_persists_frame_rate_retargeting(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(os_utils.sys, "platform", "win32", raising=False)
     monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
@@ -160,3 +257,15 @@ def test_preset_manager_saves_and_loads_last_output_pattern(monkeypatch, tmp_pat
 
     mgr2 = PresetManager()
     assert mgr2.get_last_output_pattern() == "{original}_done.mkv"
+
+
+def test_preset_manager_saves_preserve_input_structure(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(os_utils.sys, "platform", "win32", raising=False)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
+
+    mgr = PresetManager()
+    assert mgr.get_last_preserve_input_structure() is False
+    mgr.set_last_preserve_input_structure(True)
+
+    mgr2 = PresetManager()
+    assert mgr2.get_last_preserve_input_structure() is True

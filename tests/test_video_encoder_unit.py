@@ -507,13 +507,15 @@ class TestColorHandling:
 
 def _buffered_encoder(tmp_path) -> NvidiaVideoEncoder:
     enc = _make_encoder(tmp_path)
-    enc.pts_heap = []
-    enc.frame_buffer = deque()
+    enc.frame_buffer = []
+    enc._next_buffer_sequence = 0
     enc.pts_set = set()
     enc._last_emitted_pts = None
     enc._worker_error = None
     enc._encode_queue = MagicMock()
-    enc._build_encode_item = MagicMock(side_effect=lambda frame, pts: (frame, pts, None))
+    enc._build_encode_item = MagicMock(
+        side_effect=lambda frame, pts, apply_lut=True: (frame, pts, apply_lut)
+    )
     return enc
 
 
@@ -634,26 +636,52 @@ class TestEncodeBuffer:
         enc = _buffered_encoder(tmp_path)
         enc.pts_origin = 100
         enc.encode("frame", 110)
-        assert enc.pts_heap == [10]
+        assert [item.pts for item in enc.frame_buffer] == [10]
 
     def test_bridge_frame_records_lut_bypass(self, tmp_path):
         enc = _buffered_encoder(tmp_path)
         enc.encode("frame", 10, apply_lut=False)
-        assert list(enc.frame_buffer) == ["frame"]
-        assert list(enc._lut_flags) == [False]
+        buffered = enc.frame_buffer[0]
+        assert buffered.frame == "frame"
+        assert buffered.apply_lut is False
 
     def test_encode_pushes_to_buffer_and_heap(self, tmp_path):
         enc = _buffered_encoder(tmp_path)
         enc.encode("frame0", 10)
-        assert list(enc.frame_buffer) == ["frame0"]
-        assert enc.pts_heap == [10]
+        buffered = enc.frame_buffer[0]
+        assert buffered.frame == "frame0"
+        assert buffered.pts == 10
         assert enc.pts_set == {10}
 
-    def test_encode_dedup_pts(self, tmp_path):
+    def test_tensor_frame_is_owned_before_buffering_and_queueing(self, tmp_path):
         enc = _buffered_encoder(tmp_path)
-        enc.encode("a", 5)
-        enc.encode("b", 5)
-        assert sorted(enc.pts_set) == [5, 6]
+        source = torch.arange(4, dtype=torch.uint8)
+
+        enc.encode(source, 0)
+        owned = enc.frame_buffer[0].frame
+        source.fill_(99)
+
+        assert owned is not source
+        assert owned.data_ptr() != source.data_ptr()
+        assert torch.equal(owned, torch.arange(4, dtype=torch.uint8))
+
+        for i in range(1, enc.BUFFER_MAX_SIZE // 2 + 1):
+            enc.encode(f"f{i}", i)
+
+        queued = enc._encode_queue.put.call_args.args[0]
+        assert queued[0] is owned
+        assert torch.equal(queued[0], torch.arange(4, dtype=torch.uint8))
+
+    def test_duplicate_pts_remain_unique_with_corresponding_frames(self, tmp_path):
+        enc = _buffered_encoder(tmp_path)
+        entries = [("a", 5, False), ("b", 5, True)]
+        for frame, pts, apply_lut in entries:
+            enc.encode(frame, pts, apply_lut=apply_lut)
+        while enc.frame_buffer:
+            enc._process_buffer(flush_all=True)
+
+        emitted = [call.args[0] for call in enc._encode_queue.put.call_args_list]
+        assert emitted == [("a", 5, False), ("b", 6, True)]
 
     def test_flush_starts_above_half_buffer(self, tmp_path):
         enc = _buffered_encoder(tmp_path)
@@ -661,29 +689,56 @@ class TestEncodeBuffer:
             enc.encode(f"f{i}", i)
         enc._encode_queue.put.assert_not_called()
         enc.encode("one-more", 99)
-        enc._encode_queue.put.assert_called_once_with(("f0", 0, None))
+        enc._encode_queue.put.assert_called_once_with(("f0", 0, True))
 
-    def test_smallest_pts_pairs_with_oldest_frame(self, tmp_path):
+    def test_scrambled_pts_keep_frame_and_lut_association(self, tmp_path):
         enc = _buffered_encoder(tmp_path)
-        for i, pts in enumerate([30, 10, 20, 40]):
-            enc.encode(f"f{i}", pts)
-        enc._process_buffer(flush_all=True)
-        enc._encode_queue.put.assert_called_once_with(("f0", 10, None))
-
-    def test_emitted_pts_stay_strictly_increasing_on_scrambled_source(self, tmp_path):
-        enc = _buffered_encoder(tmp_path)
-        scrambled = [
-            1761760, 1801800, 1841840, 1881880, 1801801, 1801803, 1801804,
-            1801805, 1801802, 1801807, 1801808, 1801809, 1801806, 1801811,
-            1801812, 1801813, 1801810,
+        entries = [
+            ("f0", 30, False),
+            ("f1", 10, True),
+            ("f2", 20, False),
+            ("f3", 40, True),
         ]
-        for i, pts in enumerate(scrambled):
-            enc.encode(f"f{i}", pts)
+        for frame, pts, apply_lut in entries:
+            enc.encode(frame, pts, apply_lut=apply_lut)
         while enc.frame_buffer:
             enc._process_buffer(flush_all=True)
-        emitted = [call.args[0][1] for call in enc._encode_queue.put.call_args_list]
-        assert len(emitted) == len(scrambled)
-        assert all(b > a for a, b in zip(emitted, emitted[1:]))
+
+        emitted = [call.args[0] for call in enc._encode_queue.put.call_args_list]
+        assert emitted == [
+            ("f1", 10, True),
+            ("f2", 20, False),
+            ("f0", 30, False),
+            ("f3", 40, True),
+        ]
+
+    def test_scrambled_pts_stay_strict_and_keep_correct_frame_pairs(self, tmp_path):
+        enc = _buffered_encoder(tmp_path)
+        entries = [
+            ("f0", 100, True),
+            ("f1", 200, False),
+            ("f2", 300, True),
+            ("f3", 400, False),
+            ("f4", 500, True),
+            ("f5", 600, False),
+            ("late", 0, False),
+        ]
+        for frame, pts, apply_lut in entries:
+            enc.encode(frame, pts, apply_lut=apply_lut)
+        while enc.frame_buffer:
+            enc._process_buffer(flush_all=True)
+        emitted = [call.args[0] for call in enc._encode_queue.put.call_args_list]
+        assert emitted == [
+            ("f0", 100, True),
+            ("f1", 200, False),
+            ("late", 201, False),
+            ("f2", 300, True),
+            ("f3", 400, False),
+            ("f4", 500, True),
+            ("f5", 600, False),
+        ]
+        emitted_pts = [item[1] for item in emitted]
+        assert all(b > a for a, b in zip(emitted_pts, emitted_pts[1:]))
 
     def test_in_order_pts_pass_through_unchanged(self, tmp_path):
         enc = _buffered_encoder(tmp_path)
@@ -692,8 +747,10 @@ class TestEncodeBuffer:
             enc.encode(f"f{i}", pts)
         while enc.frame_buffer:
             enc._process_buffer(flush_all=True)
-        emitted = [call.args[0][1] for call in enc._encode_queue.put.call_args_list]
-        assert emitted == ordered
+        emitted = [call.args[0] for call in enc._encode_queue.put.call_args_list]
+        assert emitted == [
+            (f"f{i}", pts, True) for i, pts in enumerate(ordered)
+        ]
 
     def test_encode_raises_pending_worker_error(self, tmp_path):
         enc = _buffered_encoder(tmp_path)

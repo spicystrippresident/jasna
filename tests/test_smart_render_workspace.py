@@ -23,7 +23,13 @@ def _plan() -> SplicePlan:
     )
 
 
-def _signature(tmp_path, *, projection="fisheye"):
+def _signature(
+    tmp_path,
+    *,
+    projection="fisheye",
+    codec="h264",
+    encoder_settings=None,
+):
     source = tmp_path / "input.mp4"
     if not source.exists():
         source.write_bytes(b"source video")
@@ -36,8 +42,12 @@ def _signature(tmp_path, *, projection="fisheye"):
         plan=_plan(),
         processing={"fp16": True, "batch_size": 4},
         model_files={"detector": model},
-        codec="h264",
-        encoder_settings={"cq": 22, "g": 60},
+        codec=codec,
+        encoder_settings=(
+            {"cq": 22, "g": 60}
+            if encoder_settings is None
+            else encoder_settings
+        ),
         resolved_projection=projection,
     )
 
@@ -102,12 +112,39 @@ def test_workspace_signature_change_uses_separate_directory(tmp_path) -> None:
     assert second.path.is_dir()
 
 
+def test_workspace_signature_changes_for_effective_hevc_level(tmp_path) -> None:
+    first_signature = _signature(
+        tmp_path,
+        codec="hevc",
+        encoder_settings={"cq": 28, "g": 60, "level": "6.1"},
+    )
+    second_signature = _signature(
+        tmp_path,
+        codec="hevc",
+        encoder_settings={"cq": 28, "g": 60, "level": "6.2"},
+    )
+
+    assert first_signature["encoding"]["settings"]["level"] == "6.1"
+    first = SmartRenderWorkspace.open(
+        tmp_path / "work",
+        output=tmp_path / "output.mp4",
+        signature=first_signature,
+    )
+    second = SmartRenderWorkspace.open(
+        tmp_path / "work",
+        output=tmp_path / "output.mp4",
+        signature=second_signature,
+    )
+
+    assert first.path != second.path
+
+
 def test_encoder_policy_version_is_part_of_workspace_signature(
     monkeypatch, tmp_path
 ) -> None:
     import jasna.smart_render_workspace as module
 
-    assert WORKSPACE_ALGORITHM_VERSION == "jasna-smart-render-workspace-v3"
+    assert WORKSPACE_ALGORITHM_VERSION == "jasna-smart-render-workspace-v7"
     first = SmartRenderWorkspace.open(
         tmp_path / "work",
         output=tmp_path / "output.mp4",
@@ -116,7 +153,7 @@ def test_encoder_policy_version_is_part_of_workspace_signature(
     monkeypatch.setattr(
         module,
         "WORKSPACE_ALGORITHM_VERSION",
-        "jasna-smart-render-workspace-v3-test",
+        "jasna-smart-render-workspace-v7-test",
     )
     second = SmartRenderWorkspace.open(
         tmp_path / "work",

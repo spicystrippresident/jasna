@@ -35,6 +35,8 @@ def scan_video_for_one_click_vr(
     stop_event: threading.Event,
     on_progress: Callable[[float, float, float], None] | None = None,
     on_status: Callable[[str], None] | None = None,
+    decode_strategy: str | None = None,
+    max_scan_seconds: float | None = None,
 ) -> OneClickVrPlan:
     """Scan one video and return ranges ready for Jasna smart rendering."""
 
@@ -59,6 +61,8 @@ def scan_video_for_one_click_vr(
         metadata,
         settings,
         stride_seconds=requested_interval,
+        decode_strategy=decode_strategy,
+        max_duration_seconds=max_scan_seconds,
     )
     stop_sent = False
     started = False

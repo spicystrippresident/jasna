@@ -130,12 +130,34 @@ def test_main_window_keeps_design_minimum_at_high_dpi_on_1440p(dpi, monkeypatch)
     assert minimum[-1][0] >= 899 and minimum[-1][1] >= 579
 
 
-def test_activate_static_dpi_is_a_no_op_off_windows() -> None:
-    scaling.activate_static_dpi((900, 580))
+def test_activate_static_dpi_linux_uses_desktop_scaling(monkeypatch) -> None:
+    monkeypatch.setattr(scaling.sys, "platform", "linux")
+    monkeypatch.setattr(scaling, "_linux_desktop_scaling", lambda: 2.0)
+    try:
+        scaling.activate_static_dpi((900, 580))
 
-    assert not ctk.ScalingTracker.deactivate_automatic_dpi_awareness
-    assert ctk.ScalingTracker.widget_scaling == 1
-    assert ctk.ScalingTracker.window_scaling == 1
+        assert not ctk.ScalingTracker.deactivate_automatic_dpi_awareness
+        assert ctk.ScalingTracker.widget_scaling == 2.0
+        assert ctk.ScalingTracker.window_scaling == 2.0
+    finally:
+        ctk.set_widget_scaling(1.0)
+        ctk.set_window_scaling(1.0)
+
+
+def test_linux_desktop_scaling_reads_xft_dpi(monkeypatch) -> None:
+    result = SimpleNamespace(returncode=0, stdout="Xcursor.size:\t48\nXft.dpi:\t192\n")
+    monkeypatch.setattr(scaling.subprocess, "run", lambda *_args, **_kwargs: result)
+
+    assert scaling._linux_desktop_scaling() == 2.0
+
+
+def test_linux_desktop_scaling_falls_back_to_gdk_environment(monkeypatch) -> None:
+    result = SimpleNamespace(returncode=1, stdout="")
+    monkeypatch.setattr(scaling.subprocess, "run", lambda *_args, **_kwargs: result)
+    monkeypatch.setenv("GDK_SCALE", "2")
+    monkeypatch.setenv("GDK_DPI_SCALE", "0.75")
+
+    assert scaling._linux_desktop_scaling() == 1.5
 
 
 def test_activate_static_dpi_windows_path(monkeypatch) -> None:

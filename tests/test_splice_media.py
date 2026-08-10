@@ -11,9 +11,8 @@ import pytest
 from jasna.media import get_video_meta_data
 from jasna.media.splice import (
     SpliceSpan,
-    concatenate_fragments,
     create_copy_fragment,
-    mux_final_output,
+    mux_fragments_final_output,
     normalize_fragment,
     probe_keyframes,
     resolve_smart_encoder_settings,
@@ -72,7 +71,7 @@ def test_h264_probe_resolves_source_compatible_smart_settings(tmp_path: Path) ->
 @pytest.mark.parametrize(
     ("codec", "encoder", "source_options", "render_options"),
     [
-        ("h264", "libx264", ["-g", "12", "-keyint_min", "12", "-sc_threshold", "0"], ["-g", "12", "-bf", "3", "-flags", "+cgop"]),
+        ("h264", "libx264", ["-g", "12", "-keyint_min", "12", "-sc_threshold", "0", "-bf", "3"], ["-g", "12", "-bf", "0", "-flags", "+cgop"]),
         ("hevc", "libx265", ["-x265-params", "keyint=12:min-keyint=12:scenecut=0:open-gop=0"], ["-x265-params", "keyint=12:bframes=0:open-gop=0"]),
         ("av1", "libsvtav1", ["-preset", "10", "-g", "12", "-svtav1-params", "scd=0"], ["-preset", "10", "-g", "12"]),
     ],
@@ -137,15 +136,14 @@ def test_mixed_encoder_splice_decodes_with_exact_duration_and_audio(
         decode_delay=index.decode_delay_pts * index.time_base,
     )
     fragments = [(part, 1.0) for part in normalized_parts]
-    assembled = tmp_path / f"assembled{suffix}"
-    concatenate_fragments(
+    output = tmp_path / f"output-{codec}.mp4"
+    mux_fragments_final_output(
         fragments,
+        source,
+        output,
         manifest=tmp_path / "parts.ffconcat",
-        destination=assembled,
         codec=codec,
     )
-    output = tmp_path / f"output-{codec}.mp4"
-    mux_final_output(assembled, source, output, codec=codec)
 
     with av.open(str(output)) as container:
         assert len(container.streams.video) == 1

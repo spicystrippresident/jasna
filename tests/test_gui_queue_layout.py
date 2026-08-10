@@ -32,6 +32,12 @@ def test_queue_footer_stacks_count_above_action_buttons() -> None:
         )
         assert count_bottom <= actions_top
 
+        preserve_bottom = (
+            panel._preserve_structure_checkbox.winfo_rooty()
+            + panel._preserve_structure_checkbox.winfo_height()
+        )
+        assert preserve_bottom <= panel._output_entry.winfo_rooty()
+
         empty_content_width = panel._empty_state.winfo_width() - 40
         assert panel._empty_label.winfo_reqwidth() <= empty_content_width
     finally:

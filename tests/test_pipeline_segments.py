@@ -3,14 +3,17 @@ from __future__ import annotations
 import threading
 from fractions import Fraction
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
+from jasna.accelerator import AcceleratorVendor
 from jasna.media.splice import KeyframeIndex, SplicePlan, SpliceSpan
 from jasna.pipeline import Pipeline
 from jasna.segments import SegmentRange
+from jasna.smart_render_workspace import workspace_signature as build_workspace_signature
 
 
 def _write_normalized(
@@ -67,7 +70,7 @@ def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_pat
         Fraction(1, 30),
         0,
         180,
-        max_b_frames=3,
+        max_b_frames=4,
         uses_b_references=False,
     )
     plan = SplicePlan(
@@ -83,6 +86,7 @@ def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_pat
 
     with (
         patch("jasna.pipeline.validate_smart_render", return_value="h264"),
+        patch("jasna.pipeline.vendor_for_device", return_value=AcceleratorVendor.AMD),
         patch("jasna.pipeline.probe_keyframes") as probe_keyframes,
         patch("jasna.pipeline.build_splice_plan") as build_splice_plan,
         patch("jasna.pipeline.NvidiaVideoEncoder") as encoder,
@@ -91,8 +95,7 @@ def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_pat
             side_effect=_write_copy_fragment,
         ) as copy_fragment,
         patch("jasna.pipeline.normalize_fragment", side_effect=_write_normalized),
-        patch("jasna.pipeline.concatenate_fragments") as concatenate,
-        patch("jasna.pipeline.mux_final_output") as mux,
+        patch("jasna.pipeline.mux_fragments_final_output") as mux,
     ):
         pipeline._run_smart(metadata)
 
@@ -108,7 +111,7 @@ def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_pat
         "cq": 22,
         "profile": "main",
         "g": 60,
-        "bf": 3,
+        "bf": 0,
         "b_ref_mode": "disabled",
     }
     pipeline._run_pass.assert_called_once()
@@ -116,8 +119,65 @@ def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_pat
     assert pass_args["seek_ts"] == 2.0
     assert pass_args["end_pts"] == 120
     assert pass_args["effect_ranges"] == ((75, 90),)
-    concatenate.assert_called_once()
     mux.assert_called_once()
+
+
+def test_linux_amd_hevc_smart_run_signs_and_encodes_source_level(tmp_path) -> None:
+    pipeline = object.__new__(Pipeline)
+    pipeline.input_video = tmp_path / "input.mp4"
+    pipeline.input_video.write_bytes(b"source")
+    pipeline.output_video = tmp_path / "output.mp4"
+    pipeline.codec = "hevc"
+    pipeline.encoder_settings = {"cq": 28}
+    pipeline.device = torch.device("cuda:0")
+    pipeline.disable_progress = True
+    pipeline.progress_callback = None
+    pipeline.lut_path = None
+    pipeline.sharpen_strength = 0.0
+    pipeline.retarget_high_fps = False
+    pipeline.segments = (SegmentRange(2.5, 3.0),)
+    pipeline.working_dir = None
+    pipeline._cancel_event = threading.Event()
+    pipeline._run_pass = MagicMock()
+    metadata = SimpleNamespace(
+        video_fps=30.0,
+        video_fps_exact=Fraction(30, 1),
+        duration=6.0,
+        hevc_level=183,
+    )
+    pipeline.splice_plan = SplicePlan(
+        index=KeyframeIndex((0, 60, 120), Fraction(1, 30), 0, 180),
+        spans=(
+            SpliceSpan("copy", 0, 60),
+            SpliceSpan("render", 60, 120, ((75, 90),)),
+            SpliceSpan("copy", 120, 180),
+        ),
+        segments=pipeline.segments,
+    )
+    captured_signature = {}
+
+    def capture_workspace_signature(**kwargs):
+        captured_signature.update(kwargs)
+        return build_workspace_signature(**kwargs)
+
+    with (
+        patch("jasna.media.video_encoder.sys.platform", "linux"),
+        patch("jasna.pipeline.validate_smart_render", return_value="hevc"),
+        patch("jasna.pipeline.vendor_for_device", return_value=AcceleratorVendor.AMD),
+        patch("jasna.pipeline.workspace_signature", side_effect=capture_workspace_signature),
+        patch("jasna.pipeline.NvidiaVideoEncoder") as encoder,
+        patch(
+            "jasna.pipeline.create_copy_fragment",
+            side_effect=_write_copy_fragment,
+        ),
+        patch("jasna.pipeline.normalize_fragment", side_effect=_write_normalized),
+        patch("jasna.pipeline.mux_fragments_final_output"),
+    ):
+        pipeline._run_smart(metadata)
+
+    expected_settings = {"cq": 28, "g": 60, "level": "6.1"}
+    assert captured_signature["encoder_settings"] == expected_settings
+    assert encoder.call_args.kwargs["encoder_settings"] == expected_settings
 
 
 def test_smart_run_uses_working_dir_for_temp_files(tmp_path) -> None:
@@ -159,13 +219,12 @@ def test_smart_run_uses_working_dir_for_temp_files(tmp_path) -> None:
             side_effect=_write_copy_fragment,
         ),
         patch("jasna.pipeline.normalize_fragment", side_effect=_write_normalized),
-        patch("jasna.pipeline.concatenate_fragments"),
-        patch("jasna.pipeline.mux_final_output") as mux,
+        patch("jasna.pipeline.mux_fragments_final_output") as mux,
     ):
         pipeline._run_smart(metadata)
 
-    assembled = mux.call_args.args[0]
-    assert assembled.parent.parent == pipeline.working_dir
+    manifest = mux.call_args.kwargs["manifest"]
+    assert manifest.parent.parent == pipeline.working_dir
     assert pipeline.working_dir.is_dir()
     assert pipeline.output_video.parent.is_dir()
 
@@ -226,8 +285,10 @@ def test_smart_run_reuses_verified_spans_after_mux_failure(tmp_path) -> None:
         patch("jasna.pipeline.NvidiaVideoEncoder", side_effect=encoder_factory) as encoder,
         patch("jasna.pipeline.create_copy_fragment", side_effect=copy_fragment) as copy,
         patch("jasna.pipeline.normalize_fragment", side_effect=_write_normalized) as normalize,
-        patch("jasna.pipeline.concatenate_fragments"),
-        patch("jasna.pipeline.mux_final_output", side_effect=RuntimeError("mux failed")),
+        patch(
+            "jasna.pipeline.mux_fragments_final_output",
+            side_effect=RuntimeError("mux failed"),
+        ),
         pytest.raises(RuntimeError, match="mux failed"),
     ):
         pipeline._run_smart(metadata)
@@ -236,6 +297,18 @@ def test_smart_run_reuses_verified_spans_after_mux_failure(tmp_path) -> None:
     assert copy.call_count == 2
     assert normalize.call_count == 1
     assert len(list(pipeline.working_dir.glob(".output.segments-*"))) == 1
+    workspace = next(pipeline.working_dir.glob(".output.segments-*"))
+    assert list(workspace.glob("*-raw.nut")) == []
+
+    stale_raw = workspace / "0001-raw.nut"
+    stale_raw.write_bytes(b"stale raw")
+
+    stale_assembled = workspace / "assembled.ts"
+    stale_assembled.write_bytes(b"incomplete assembly")
+
+    def mux_without_stale_intermediates(*_args, **_kwargs):
+        assert not stale_raw.exists()
+        assert not stale_assembled.exists()
 
     pipeline._run_pass.reset_mock()
     with (
@@ -243,8 +316,10 @@ def test_smart_run_reuses_verified_spans_after_mux_failure(tmp_path) -> None:
         patch("jasna.pipeline.NvidiaVideoEncoder") as encoder,
         patch("jasna.pipeline.create_copy_fragment") as copy,
         patch("jasna.pipeline.normalize_fragment") as normalize,
-        patch("jasna.pipeline.concatenate_fragments") as concatenate,
-        patch("jasna.pipeline.mux_final_output") as mux,
+        patch(
+            "jasna.pipeline.mux_fragments_final_output",
+            side_effect=mux_without_stale_intermediates,
+        ) as mux,
     ):
         pipeline._run_smart(metadata)
 
@@ -252,7 +327,6 @@ def test_smart_run_reuses_verified_spans_after_mux_failure(tmp_path) -> None:
     copy.assert_not_called()
     normalize.assert_not_called()
     pipeline._run_pass.assert_not_called()
-    concatenate.assert_called_once()
     mux.assert_called_once()
     assert list(pipeline.working_dir.glob(".output.segments-*")) == []
 

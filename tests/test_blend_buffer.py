@@ -53,6 +53,44 @@ def _identity_blend_mask(
     return torch.ones((y2 - y1, x2 - x1), dtype=torch.float32)
 
 
+def _capture_blend_mask(
+    masks: list[torch.Tensor],
+    *,
+    local_i: int,
+    fisheye_eye_width: int | None = 4,
+) -> torch.Tensor:
+    captured: list[torch.Tensor] = []
+
+    def capture_mask(mask_lr, bbox_xyxy, frame_shape):
+        captured.append(mask_lr.clone())
+        x1, y1, x2, y2 = bbox_xyxy
+        return torch.ones((y2 - y1, x2 - x1), dtype=torch.float32)
+
+    frame_shape = tuple(int(value) for value in masks[0].shape)
+    bb = BlendBuffer(
+        device=torch.device("cpu"),
+        blend_mask_fn=capture_mask,
+        fisheye_eye_width=fisheye_eye_width,
+    )
+    bb.register_frame(local_i, {1})
+    sr = _make_sr(
+        track_id=1,
+        start_frame=0,
+        frame_count=len(masks),
+        frame_shape=frame_shape,
+    )
+    sr.masks = masks
+    bb.add_result(sr)
+
+    bb.blend_frame(
+        local_i,
+        torch.zeros((3, *frame_shape), dtype=torch.uint8),
+    )
+
+    assert len(captured) == 1
+    return captured[0]
+
+
 class TestBlendBufferReadiness:
     def test_frame_with_no_pending_tracks_is_ready(self):
         bb = BlendBuffer(device=torch.device("cpu"))
@@ -158,6 +196,16 @@ class TestBlendBufferBlending:
         original = torch.zeros(3, 8, 8, dtype=torch.uint8)
         blended = bb.blend_frame(0, original)
         assert not torch.all(blended == 0), "at least one track must have been blended"
+
+    def test_fisheye_uses_neighbor_mask_union(self):
+        masks = [
+            torch.eye(8, dtype=torch.bool),
+            torch.zeros((8, 8), dtype=torch.bool),
+            torch.fliplr(torch.eye(8, dtype=torch.bool)),
+        ]
+        captured = _capture_blend_mask(masks, local_i=1)
+
+        assert torch.equal(captured, masks[0] | masks[2])
 
 
 class TestBlendBufferDiscardedFrames:

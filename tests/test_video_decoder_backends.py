@@ -131,6 +131,19 @@ def test_unknown_backend_raises(monkeypatch) -> None:
         reader.__enter__()
 
 
+def test_reader_backend_override_does_not_change_global_default(monkeypatch) -> None:
+    monkeypatch.setattr(module, "DECODE_BACKEND", "auto")
+    reader = _reader(monkeypatch, AcceleratorVendor.AMD)
+    reader.decode_backend = "pyav-sw"
+    open_pyav = MagicMock()
+    monkeypatch.setattr(reader, "_open_pyav", open_pyav)
+
+    reader.__enter__()
+
+    open_pyav.assert_called_once_with("pyav-sw")
+    assert module.DECODE_BACKEND == "auto"
+
+
 class _FakeVali:
     class TaskExecInfo:
         END_OF_STREAM = "END_OF_STREAM"

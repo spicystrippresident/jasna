@@ -24,6 +24,8 @@ from jasna.pipeline_threads import (
     primary_restore_loop,
     secondary_restore_loop,
     blend_encode_loop,
+    record_worker_error,
+    wait_for_worker_threads,
     _estimate_start_frame,
 )
 from jasna.tracking.clip_tracker import TrackedClip
@@ -50,6 +52,7 @@ def _fake_metadata(num_frames=4, fps=24.0) -> VideoMetadata:
 
 def _mock_reader(batches, seek_ts_check=None):
     r = MagicMock()
+    r.start_pts = 0
     r.__enter__ = MagicMock(return_value=r)
     r.__exit__ = MagicMock(return_value=False)
     def _frames(seek_ts=None):
@@ -65,7 +68,7 @@ class _RecordingWriter:
         self.written: list[tuple[torch.Tensor, int]] = []
         self.after_write_calls: list[int] = []
 
-    def write(self, frame: torch.Tensor, pts: int) -> None:
+    def write(self, frame: torch.Tensor, pts: int, *, apply_lut: bool = True) -> None:
         self.written.append((frame, pts))
 
     def after_write(self, frames_written: int) -> None:
@@ -84,6 +87,41 @@ class TestEstimateStartFrame:
     def test_zero(self):
         meta = _fake_metadata(fps=24.0)
         assert _estimate_start_frame(meta, 0.0) == 0
+
+
+def test_wait_for_worker_threads_unblocks_full_queue_on_cancel():
+    blocked_queue = Queue(maxsize=1)
+    blocked_queue.put("held")
+    producer_done = threading.Event()
+    cancel_event = threading.Event()
+    errors = []
+
+    def _producer():
+        blocked_queue.put("blocked")
+        producer_done.set()
+
+    producer = threading.Thread(target=_producer, daemon=True)
+    producer.start()
+    time.sleep(0.05)
+    assert producer.is_alive()
+
+    def _fail_worker():
+        try:
+            raise RuntimeError("worker failed")
+        except RuntimeError as error:
+            record_worker_error("test", error, errors, cancel_event)
+
+    failing_worker = threading.Thread(target=_fail_worker, daemon=True)
+    failing_worker.start()
+    wait_for_worker_threads(
+        [producer, failing_worker],
+        [blocked_queue],
+        cancel_event,
+    )
+
+    assert cancel_event.is_set()
+    assert len(errors) == 1
+    assert producer_done.is_set()
 
 
 # ---------------------------------------------------------------------------
@@ -773,6 +811,193 @@ class TestBlendEncodeLoop:
 
         assert received_seek == [5.0]
 
+    def test_mismatched_reader_pts_stops_before_writing_frame(self):
+        writer, errors = self._run_blend_encode(
+            metadata_items=[
+                FrameMeta(frame_idx=0, pts=42, apply_effect=False),
+                _SENTINEL,
+            ],
+        )
+
+        assert writer.written == []
+        assert len(errors) == 1
+        assert "expected PTS 42" in str(errors[0])
+        assert "actual PTS 0" in str(errors[0])
+
+    def test_mismatched_reader_pts_retries_rocdecode_and_recovers(self):
+        initial_frame = torch.full((1, 3, 8, 8), 1, dtype=torch.uint8)
+        recovered_frame = torch.full((1, 3, 8, 8), 2, dtype=torch.uint8)
+        initial = _mock_reader([(initial_frame, [41])])
+        initial.start_pts = 24
+        initial._rocdecode_source = object()
+        recovered_seeks = []
+        recovered = _mock_reader(
+            [(recovered_frame, [42])],
+            seek_ts_check=recovered_seeks.append,
+        )
+        recovered.start_pts = 24
+        recovered._rocdecode_source = object()
+
+        metadata_queue = Queue()
+        metadata_queue.put(FrameMeta(frame_idx=0, pts=42, apply_effect=False))
+        metadata_queue.put(_SENTINEL)
+        writer = _RecordingWriter()
+        errors = []
+
+        with (
+            patch(
+                "jasna.pipeline_threads.NvidiaVideoReader",
+                side_effect=[initial, recovered],
+            ) as reader_factory,
+            patch("jasna.pipeline_threads.torch.cuda.set_device"),
+        ):
+            blend_encode_loop(
+                input_video="fake.mkv",
+                batch_size=1,
+                device=torch.device("cpu"),
+                metadata=_fake_metadata(fps=24.0),
+                blend_buffer=BlendBuffer(device=torch.device("cpu")),
+                encode_queue=FrameQueue(max_frames=8),
+                metadata_queue=metadata_queue,
+                error_holder=errors,
+                frame_writer=writer,
+            )
+
+        assert errors == []
+        assert len(writer.written) == 1
+        assert torch.equal(writer.written[0][0], recovered_frame[0])
+        assert writer.written[0][1] == 42
+        assert recovered_seeks == [pytest.approx((42 - 24) / 24)]
+        assert reader_factory.call_args_list[1].kwargs["decode_backend"] == "rocdecode"
+
+    def test_pts_recovery_uses_software_after_hardware_retries(self):
+        initial = _mock_reader(
+            [(torch.zeros((1, 3, 8, 8), dtype=torch.uint8), [43])]
+        )
+        initial._rocdecode_source = object()
+        hardware_retry_1 = _mock_reader(
+            [(torch.zeros((1, 3, 8, 8), dtype=torch.uint8), [43])]
+        )
+        hardware_retry_1._rocdecode_source = object()
+        hardware_retry_2 = _mock_reader([])
+        hardware_retry_2._rocdecode_source = object()
+        software_frame = torch.full((1, 3, 8, 8), 7, dtype=torch.uint8)
+        software_retry = _mock_reader([(software_frame, [42])])
+        software_retry._rocdecode_source = None
+
+        metadata_queue = Queue()
+        metadata_queue.put(FrameMeta(frame_idx=0, pts=42, apply_effect=False))
+        metadata_queue.put(_SENTINEL)
+        writer = _RecordingWriter()
+        errors = []
+
+        with (
+            patch(
+                "jasna.pipeline_threads.NvidiaVideoReader",
+                side_effect=[
+                    initial,
+                    hardware_retry_1,
+                    hardware_retry_2,
+                    software_retry,
+                ],
+            ) as reader_factory,
+            patch("jasna.pipeline_threads.torch.cuda.set_device"),
+        ):
+            blend_encode_loop(
+                input_video="fake.mkv",
+                batch_size=1,
+                device=torch.device("cpu"),
+                metadata=_fake_metadata(fps=24.0),
+                blend_buffer=BlendBuffer(device=torch.device("cpu")),
+                encode_queue=FrameQueue(max_frames=8),
+                metadata_queue=metadata_queue,
+                error_holder=errors,
+                frame_writer=writer,
+            )
+
+        assert errors == []
+        assert torch.equal(writer.written[0][0], software_frame[0])
+        assert [
+            call.kwargs.get("decode_backend")
+            for call in reader_factory.call_args_list
+        ] == [None, "rocdecode", "rocdecode", "pyav-sw"]
+
+    def test_pts_recovery_discards_stale_frame_without_reopening(self):
+        frames = torch.stack(
+            [
+                torch.full((3, 8, 8), 3, dtype=torch.uint8),
+                torch.full((3, 8, 8), 4, dtype=torch.uint8),
+            ]
+        )
+        reader = _mock_reader([(frames, [41, 42])])
+        reader._rocdecode_source = object()
+        metadata_queue = Queue()
+        metadata_queue.put(FrameMeta(frame_idx=0, pts=42, apply_effect=False))
+        metadata_queue.put(_SENTINEL)
+        writer = _RecordingWriter()
+
+        with (
+            patch(
+                "jasna.pipeline_threads.NvidiaVideoReader",
+                return_value=reader,
+            ) as reader_factory,
+            patch("jasna.pipeline_threads.torch.cuda.set_device"),
+        ):
+            blend_encode_loop(
+                input_video="fake.mkv",
+                batch_size=2,
+                device=torch.device("cpu"),
+                metadata=_fake_metadata(fps=24.0),
+                blend_buffer=BlendBuffer(device=torch.device("cpu")),
+                encode_queue=FrameQueue(max_frames=8),
+                metadata_queue=metadata_queue,
+                error_holder=[],
+                frame_writer=writer,
+            )
+
+        assert reader_factory.call_count == 1
+        assert torch.equal(writer.written[0][0], frames[1])
+
+    def test_pts_recovery_stops_immediately_when_cancelled(self):
+        cancel_event = threading.Event()
+        frame = torch.zeros((1, 3, 8, 8), dtype=torch.uint8)
+        reader = _mock_reader([])
+        reader._rocdecode_source = object()
+
+        def _frames(seek_ts=None):
+            cancel_event.set()
+            yield frame, [41]
+
+        reader.frames = _frames
+        metadata_queue = Queue()
+        metadata_queue.put(FrameMeta(frame_idx=0, pts=42, apply_effect=False))
+        metadata_queue.put(_SENTINEL)
+        errors = []
+
+        with (
+            patch(
+                "jasna.pipeline_threads.NvidiaVideoReader",
+                return_value=reader,
+            ) as reader_factory,
+            patch("jasna.pipeline_threads.torch.cuda.set_device"),
+        ):
+            blend_encode_loop(
+                input_video="fake.mkv",
+                batch_size=1,
+                device=torch.device("cpu"),
+                metadata=_fake_metadata(fps=24.0),
+                blend_buffer=BlendBuffer(device=torch.device("cpu")),
+                encode_queue=FrameQueue(max_frames=8),
+                metadata_queue=metadata_queue,
+                error_holder=errors,
+                frame_writer=_RecordingWriter(),
+                cancel_event=cancel_event,
+            )
+
+        assert cancel_event.is_set()
+        assert errors == []
+        assert reader_factory.call_count == 1
+
     def test_error_holder_propagates_in_wait_loop(self):
         blend_buffer = BlendBuffer(device=torch.device("cpu"))
         blend_buffer.register_frame(0, {99})
@@ -879,6 +1104,7 @@ class TestBlendEncodeLoop:
         blend_buffer.blend_frame.assert_called_once()
         assert blend_buffer.blend_frame.call_args.args[0] == 0
         assert torch.equal(blend_buffer.blend_frame.call_args.args[1], original[0])
+        assert blend_buffer.blend_frame.call_args.kwargs == {}
         assert torch.equal(writer.written[0][0], blended_out)
 
 

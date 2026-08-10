@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from jasna.tracking.blending import _box_blur, create_bbox_blend_mask, create_blend_mask
+from jasna.vr_mask_geometry import sbs_fisheye_dilation_ratios
 
 
 @pytest.mark.parametrize("kernel_size", [5, 61, 121])
@@ -144,3 +145,42 @@ def test_bbox_blend_mask_same_res_mask_matches_reference_exactly() -> None:
     ref = _reference_fullres_blend_mask(mask, bbox, frame_shape)
     out = create_bbox_blend_mask(mask, bbox, frame_shape)
     assert torch.allclose(out, ref, atol=1e-5)
+
+
+def test_fisheye_dilation_is_symmetric_between_sbs_eyes() -> None:
+    left = sbs_fisheye_dilation_ratios((1840, 3480, 2256, 3896), 4096, 4096)
+    right = sbs_fisheye_dilation_ratios((5936, 3480, 6352, 3896), 4096, 4096)
+
+    assert left == pytest.approx(right)
+
+
+def test_fisheye_dilation_keeps_center_legacy_ratio() -> None:
+    ratio_y, ratio_x = sbs_fisheye_dilation_ratios(
+        (1840, 1840, 2256, 2256), 4096, 4096
+    )
+
+    assert ratio_y == pytest.approx(0.028)
+    assert ratio_x == pytest.approx(0.028)
+
+
+def test_lower_fisheye_rim_expands_more_tangentially() -> None:
+    ratio_y, ratio_x = sbs_fisheye_dilation_ratios(
+        (1840, 3680, 2256, 4096), 4096, 4096
+    )
+
+    assert 0.045 <= ratio_y < ratio_x
+    assert 0.057 <= ratio_x <= 0.060
+
+
+def test_fisheye_bbox_blend_is_wider_than_normal_sbs_blend() -> None:
+    mask = torch.zeros((256, 512), dtype=torch.bool)
+    mask[221:231, 123:133] = True
+    bbox = (1536, 3328, 2560, 4096)
+    frame_shape = (4096, 8192)
+
+    normal = create_bbox_blend_mask(mask, bbox, frame_shape)
+    fisheye = create_bbox_blend_mask(
+        mask, bbox, frame_shape, fisheye_eye_width=4096
+    )
+
+    assert float(fisheye.sum()) > float(normal.sum())

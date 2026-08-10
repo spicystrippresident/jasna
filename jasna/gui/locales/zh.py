@@ -22,6 +22,7 @@ ZH = {
         "btn_clear": "清空",
         "btn_clear_completed": "✓ 清除已完成",
         "output_location": "输出位置",
+        "preserve_input_structure": "保持输入目录的子文件夹结构",
         "output_pattern": "输出文件名模板",
         "output_pattern_placeholder": "{original}_restored.mp4",
         "same_as_input": "与输入相同",
@@ -422,6 +423,7 @@ ZH = {
         "tip_encoder_custom_args": "高级编码器参数，以逗号分隔的 key=value 格式。\n如果不清楚用途，请留空。\n\n示例：rc-lookahead=32",
         "tip_post_export_action": "整个队列完成后的可选操作。\n\n无：不执行任何操作。\n关闭电脑：关闭计算机。\n自定义命令：在系统 shell 中运行下方命令。",
         "tip_output_location": "处理后视频的保存文件夹。\n留空则保存在原始文件旁边。",
+        "tip_preserve_input_structure": "选择文件夹加入队列时，在指定的输出目录中重建其子文件夹结构。单独添加的文件不受影响。",
         "tip_output_pattern": "输出文件的命名模板。\n使用 {original} 作为输入文件名（不含扩展名）的占位符。\n\n示例：{original}_restored.mp4 → my_video_restored.mp4",
 
         # Preset button tooltips

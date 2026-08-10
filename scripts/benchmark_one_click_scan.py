@@ -30,6 +30,20 @@ def main() -> None:
     parser.add_argument("--scan-interval", type=float, default=1.0)
     parser.add_argument("--consecutive-hits", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument(
+        "--max-scan-seconds",
+        type=float,
+        help="Only scan this many seconds of the source (benchmarking only)",
+    )
+    parser.add_argument(
+        "--decode-strategy",
+        choices=(
+            "single-rocdecode",
+            "dual-rocdecode",
+            "rocdecode-software",
+        ),
+        default="dual-rocdecode",
+    )
     args = parser.parse_args()
 
     source = args.input.resolve(strict=True)
@@ -58,11 +72,15 @@ def main() -> None:
         stop_event=threading.Event(),
         on_progress=lambda *values: progress.append(tuple(map(float, values))),
         on_status=statuses.append,
+        decode_strategy=args.decode_strategy,
+        max_scan_seconds=args.max_scan_seconds,
     )
     wall_seconds = time.monotonic() - started
     payload = {
         "source": str(source),
         "detection_model": args.detection_model,
+        "decode_strategy": args.decode_strategy,
+        "max_scan_seconds": args.max_scan_seconds,
         "scan_threshold": threshold,
         "scan_interval_seconds": plan.scan_interval_seconds,
         "consecutive_hits": int(args.consecutive_hits),

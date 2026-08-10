@@ -92,7 +92,16 @@ class _FakeScanWorker:
     terminal_stopped = False
     result_stride = 1.0
 
-    def __init__(self, _path, metadata, _settings, *, stride_seconds):
+    def __init__(
+        self,
+        _path,
+        metadata,
+        _settings,
+        *,
+        stride_seconds,
+        decode_strategy=None,
+        max_duration_seconds=None,
+    ):
         assert stride_seconds == 1.0
         scan_events = importlib.import_module("jasna.gui.mosaic_scan")
         self.events = queue.Queue()
@@ -169,6 +178,30 @@ def test_scan_adapter_uses_effective_worker_stride(tmp_path) -> None:
 
     assert plan.scan_interval_seconds == 0.5
     assert plan.segments == ()
+
+
+def test_scan_adapter_forwards_benchmark_scan_limits(tmp_path) -> None:
+    source = tmp_path / "video.mp4"
+    source.touch()
+    metadata = SimpleNamespace(video_fps=60.0, duration=500.0)
+
+    class BoundedWorker(_FakeScanWorker):
+        def __init__(self, *args, **kwargs):
+            assert kwargs["decode_strategy"] == "dual-rocdecode"
+            assert kwargs["max_duration_seconds"] == 300.0
+            super().__init__(*args, **kwargs)
+
+    with (
+        patch("jasna.media.get_video_meta_data", return_value=metadata),
+        patch("jasna.gui.mosaic_scan.MosaicScanWorker", BoundedWorker),
+    ):
+        scan_video_for_one_click_vr(
+            source,
+            AppSettings(processing_mode="one_click_vr"),
+            stop_event=threading.Event(),
+            decode_strategy="dual-rocdecode",
+            max_scan_seconds=300.0,
+        )
 
 
 def test_scan_adapter_collects_conservative_projection_evidence(tmp_path) -> None:

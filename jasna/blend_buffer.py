@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import itertools
-import logging
 import threading
 from collections.abc import Callable
+from functools import partial
 
 import torch
 import torch.nn.functional as F
@@ -12,8 +12,6 @@ from jasna.crop_buffer import scale_offsets
 from jasna.pipeline_items import SecondaryRestoreResult
 from jasna.tracking.blending import create_bbox_blend_mask
 
-_log = logging.getLogger(__name__)
-
 
 class BlendBuffer:
     def __init__(
@@ -21,16 +19,41 @@ class BlendBuffer:
         device: torch.device,
         blend_mask_fn: Callable[
             [torch.Tensor, tuple[int, int, int, int], tuple[int, int]], torch.Tensor
-        ] = create_bbox_blend_mask,
+        ] | None = None,
         vr_projector=None,
+        fisheye_eye_width: int | None = None,
     ):
         self.device = device
-        self.blend_mask_fn = blend_mask_fn
+        self.fisheye_eye_width = (
+            int(fisheye_eye_width) if fisheye_eye_width is not None else None
+        )
+        self.blend_mask_fn = blend_mask_fn or partial(
+            create_bbox_blend_mask,
+            fisheye_eye_width=self.fisheye_eye_width,
+        )
         self.vr_projector = vr_projector
         self._lock = threading.Lock()
         self.pending_map: dict[int, set[int]] = {}
         self._results: dict[int, SecondaryRestoreResult] = {}
         self._result_last_frame: dict[int, int] = {}
+
+    def _combine_fisheye_masks_temporally(
+        self,
+        masks: list[torch.Tensor],
+        local_i: int,
+        current_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Union compatible previous/current/next Fisheye detector masks."""
+        mask_lr = current_mask > 0
+        available_masks = [mask_lr]
+        for neighbor_i in (local_i - 1, local_i + 1):
+            if 0 <= neighbor_i < len(masks):
+                neighbor = masks[neighbor_i]
+                if neighbor.shape == mask_lr.shape:
+                    available_masks.append(neighbor.to(mask_lr.device) > 0)
+        for neighbor_mask in available_masks[1:]:
+            mask_lr.logical_or_(neighbor_mask)
+        return mask_lr
 
     def register_frame(self, frame_idx: int, pending_track_ids: set[int]) -> None:
         if pending_track_ids:
@@ -59,7 +82,10 @@ class BlendBuffer:
         start = sr.start_frame
 
         with self._lock:
-            for i in itertools.chain(range(clip_offset), range(clip_offset + kept_count, sr.frame_count)):
+            for i in itertools.chain(
+                range(clip_offset),
+                range(clip_offset + kept_count, sr.frame_count),
+            ):
                 pending = self.pending_map.get(start + i)
                 if pending is not None:
                     pending.discard(sr.track_id)
@@ -130,7 +156,11 @@ class BlendBuffer:
             return
 
         frame_u8 = sr.restored_frames[local_i].to(device)
-        pad_offset, resize_shape = scale_offsets(frame_u8, sr.pad_offsets[local_i], sr.resize_shapes[local_i])
+        pad_offset, resize_shape = scale_offsets(
+            frame_u8,
+            sr.pad_offsets[local_i],
+            sr.resize_shapes[local_i],
+        )
         i_clip = clip_offset + local_i
         cw = sr.crossfade_weights.get(i_clip, 1.0) if sr.crossfade_weights else 1.0
 
@@ -140,8 +170,16 @@ class BlendBuffer:
         resize_h, resize_w = resize_shape
 
         mask_lr = sr.masks[local_i].to(device)
+        if self.fisheye_eye_width is not None:
+            mask_lr = self._combine_fisheye_masks_temporally(
+                sr.masks,
+                local_i,
+                mask_lr,
+            )
 
-        unpadded = frame_u8[:, pad_top:pad_top + resize_h, pad_left:pad_left + resize_w]
+        unpadded = frame_u8[
+            :, pad_top:pad_top + resize_h, pad_left:pad_left + resize_w
+        ]
         resized_back = F.interpolate(
             unpadded.unsqueeze(0).float(),
             size=(crop_h, crop_w),

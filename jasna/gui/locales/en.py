@@ -22,6 +22,7 @@ EN = {
         "btn_clear": "Clear",
         "btn_clear_completed": "✓ Clear Done",
         "output_location": "OUTPUT LOCATION",
+        "preserve_input_structure": "Preserve input subfolder structure",
         "output_pattern": "OUTPUT PATTERN",
         "output_pattern_placeholder": "{original}_restored.mp4",
         "same_as_input": "Same as input",
@@ -422,6 +423,7 @@ EN = {
         "tip_encoder_custom_args": "Advanced encoder parameters as comma-separated key=value pairs.\nLeave empty unless you know what you're doing.\n\nExample: rc-lookahead=32",
         "tip_post_export_action": "Optional action after the whole queue finishes.\n\nNone: do nothing.\nShutdown PC: powers off the computer.\nCustom Command: runs the command below in the system shell.",
         "tip_output_location": "Folder where processed videos are saved.\nLeave empty to save next to the original file.",
+        "tip_preserve_input_structure": "For jobs added from a folder, recreate its subfolder structure inside the selected output folder. Individually added files are unaffected.",
         "tip_output_pattern": "Filename template for output files.\nUse {original} as a placeholder for the input filename (without extension).\n\nExample: {original}_restored.mp4 → my_video_restored.mp4",
         
         # Preset button tooltips

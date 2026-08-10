@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fractions import Fraction
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -175,6 +176,9 @@ def _source(frame_pts: list[int], *, stride: int = 1):
 def test_rocdecode_source_batches_and_applies_stride(monkeypatch) -> None:
     converter = MagicMock()
     monkeypatch.setattr(module, "YuvToRgbConverter", MagicMock(return_value=converter))
+    monkeypatch.setattr(
+        module, "current_stream", lambda _device: SimpleNamespace(synchronize=lambda: None)
+    )
     source = _source([0, 1, 2, 3, 4, 5], stride=2)
 
     batches = list(source.frames(None))
@@ -185,9 +189,30 @@ def test_rocdecode_source_batches_and_applies_stride(monkeypatch) -> None:
     assert source.decoder.drop_frame.call_count == 3
 
 
+def test_rocdecode_source_synchronizes_each_batch_after_conversions(monkeypatch) -> None:
+    events: list[str] = []
+    converter = MagicMock()
+    converter.convert_into.side_effect = lambda *_args: events.append("convert")
+    stream = MagicMock()
+    stream.synchronize.side_effect = lambda: events.append("synchronize")
+    monkeypatch.setattr(module, "YuvToRgbConverter", MagicMock(return_value=converter))
+    current_stream = MagicMock(return_value=stream)
+    monkeypatch.setattr(module, "current_stream", current_stream)
+    source = _source([0, 1, 2], stride=1)
+
+    list(source.frames(None))
+
+    assert events == ["convert", "convert", "synchronize", "convert", "synchronize"]
+    assert current_stream.call_count == 2
+    assert stream.synchronize.call_count == 2
+
+
 def test_rocdecode_source_seek_reanchors_stride(monkeypatch) -> None:
     converter = MagicMock()
     monkeypatch.setattr(module, "YuvToRgbConverter", MagicMock(return_value=converter))
+    monkeypatch.setattr(
+        module, "current_stream", lambda _device: SimpleNamespace(synchronize=lambda: None)
+    )
     source = _source([0, 15, 30, 31, 32, 33], stride=2)
 
     batches = list(source.frames(1.0))
@@ -203,6 +228,30 @@ def test_rocdecode_source_rejects_surface_contract_change(monkeypatch) -> None:
 
     with pytest.raises(RocDecodeError, match="dimensions changed"):
         list(source.frames(None))
+
+
+def test_rocdecode_bridge_fences_copy_before_surface_release() -> None:
+    bridge_path = Path(__file__).parents[1] / "jasna/media/rocdecode_bridge.cpp"
+    source = bridge_path.read_text(encoding="utf-8")
+    copy_frame = source[
+        source.index("int jasna_rocdecode_copy_frame") : source.index(
+            "int jasna_rocdecode_drop_frame"
+        )
+    ]
+    bridge = source[source.index("struct Bridge") : source.index("thread_local")]
+
+    assert "hipStream_t copy_stream" in bridge
+    assert "hipStreamCreateWithFlags(&copy_stream, hipStreamNonBlocking)" in bridge
+    assert "hipStreamDestroy(copy_stream)" in bridge
+    assert "hipDeviceSynchronize" not in source
+    assert copy_frame.count("hipMemcpy2DAsync") == 2
+    y_copy = copy_frame.index("hipMemcpy2DAsync")
+    uv_copy = copy_frame.index("hipMemcpy2DAsync", y_copy + 1)
+    synchronize = copy_frame.index("hipStreamSynchronize")
+    release = copy_frame.index(
+        "const bool released = bridge->decoder->ReleaseFrame(frame_pts)"
+    )
+    assert y_copy < uv_copy < synchronize < release
 
 
 def test_comparison_thermal_stop_returns_reportable_result(monkeypatch) -> None:

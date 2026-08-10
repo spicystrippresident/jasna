@@ -55,6 +55,11 @@ def main() -> None:
     parser.add_argument("--scan-threshold", type=float, default=0.70)
     parser.add_argument("--scan-consecutive-hits", type=int, default=2)
     parser.add_argument(
+        "--vr-projection",
+        choices=("auto", "raw", "fisheye", "gnomonic"),
+        default="auto",
+    )
+    parser.add_argument(
         "--segments",
         help="Optional manual START-END ranges; skips the one-click pre-scan",
     )
@@ -82,7 +87,7 @@ def main() -> None:
         max_clip_size=args.max_clip_size,
         temporal_overlap=args.temporal_overlap,
         vr_mode="auto",
-        vr_projection="auto",
+        vr_projection=args.vr_projection,
         fp16_mode=True,
         denoise_strength="none",
         secondary_restoration="none",

@@ -52,4 +52,3 @@ def compute_parent_crossfade_weights(*, frame_count: int, discard_margin: int, b
         local_idx = int(frame_count) - d - bf + j
         weights[local_idx] = 1.0 - (j + 0.5) / (2 * bf)
     return weights
-
