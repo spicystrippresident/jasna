@@ -63,6 +63,7 @@ JA = {
         "btn_clear": "クリア",
         "btn_clear_completed": "✓ 完了済みを削除",
         "output_location": "出力先",
+        "preserve_input_structure": "入力フォルダーのサブフォルダー構造を保持",
         "output_pattern": "出力ファイル名テンプレート",
         "output_pattern_placeholder": "{original}_restored.mp4",
         "same_as_input": "入力と同じ",
@@ -468,6 +469,7 @@ JA = {
         "tip_post_export_action": "キュー全体が完了した後に実行する任意のアクションです。\n\nなし：何もしません。\nPC をシャットダウン：コンピューターの電源を切ります。\nカスタムコマンド：下のコマンドをシステムシェルで実行します。",
         "tip_post_export_video_command": "各動画の書き出しが正常に完了した後、システムシェルで実行し、終了するまで待機します。空欄にすると無効です。パスは引用符で保護されています。\n\nプレースホルダー：{input}, {output}, {output_dir}, {output_stem}, {output_suffix}",
         "tip_output_location": "処理済み動画の保存先フォルダ。\n空欄の場合、元のファイルと同じ場所に保存されます。",
+        "tip_preserve_input_structure": "フォルダーから追加したジョブでは、選択した出力フォルダー内にサブフォルダー構造を再作成します。個別に追加したファイルには影響しません。",
         "tip_output_pattern": "出力ファイルの名前テンプレート。\n{original} は入力ファイル名（拡張子なし）のプレースホルダーです。\n\n例：{original}_restored.mp4 → my_video_restored.mp4",
 
         # Preset button tooltips

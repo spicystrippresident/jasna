@@ -40,6 +40,7 @@ class JobProcessingSnapshot:
 class JobItem:
     path: Path
     output_path: Path | None = None
+    input_root: Path | None = None
     id: int = field(default_factory=lambda: next(_job_id_counter))
     status: JobStatus = JobStatus.PENDING
     duration_seconds: float | None = None
@@ -319,6 +320,8 @@ class PresetManager:
         self._last_selected: str = "Default"
         self._last_output_folder: str = ""
         self._last_output_pattern: str = "{original}_restored.mp4"
+        self._last_preserve_input_structure: bool = False
+        self._last_working_directory: str | None = None
         self._system_check_passed_version: str = ""
         self._load()
         
@@ -335,6 +338,10 @@ class PresetManager:
             self._last_selected = data.get("last_selected", "Default")
             self._last_output_folder = data.get("last_output_folder", "")
             self._last_output_pattern = data.get("last_output_pattern", "{original}_restored.mp4")
+            self._last_preserve_input_structure = bool(
+                data.get("last_preserve_input_structure", False)
+            )
+            self._last_working_directory = data.get("last_working_directory")
             self._system_check_passed_version = data.get("system_check_passed_version", "")
             
             for name, preset_dict in data.get("user_presets", {}).items():
@@ -361,6 +368,11 @@ class PresetManager:
         data["user_presets"] = {name: asdict(preset) for name, preset in self._user_presets.items()}
         data["last_output_folder"] = self._last_output_folder
         data["last_output_pattern"] = self._last_output_pattern
+        data["last_preserve_input_structure"] = self._last_preserve_input_structure
+        if self._last_working_directory is None:
+            data.pop("last_working_directory", None)
+        else:
+            data["last_working_directory"] = self._last_working_directory
         data["system_check_passed_version"] = self._system_check_passed_version
         
         try:
@@ -439,6 +451,20 @@ class PresetManager:
 
     def set_last_output_pattern(self, pattern: str):
         self._last_output_pattern = pattern or "{original}_restored.mp4"
+        self._save()
+
+    def get_last_preserve_input_structure(self) -> bool:
+        return self._last_preserve_input_structure
+
+    def set_last_preserve_input_structure(self, enabled: bool):
+        self._last_preserve_input_structure = bool(enabled)
+        self._save()
+
+    def get_last_working_directory(self) -> str | None:
+        return self._last_working_directory
+
+    def set_last_working_directory(self, path: str):
+        self._last_working_directory = path or ""
         self._save()
 
     def get_system_check_passed_version(self) -> str:

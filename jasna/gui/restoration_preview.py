@@ -383,7 +383,7 @@ class RestorationPreviewWorker:
         session: RestorationSession,
         detection_model,
     ) -> RestorationFrame | RestorationClip | None:
-        from queue import Empty, Queue
+        from queue import Queue
 
         from jasna.blend_buffer import BlendBuffer
         from jasna.crop_buffer import CropBuffer
@@ -393,6 +393,7 @@ class RestorationPreviewWorker:
             decode_detect_loop,
             primary_restore_loop,
             secondary_restore_loop,
+            wait_for_worker_threads,
         )
         from jasna.vram_offloader import VramOffloader
 
@@ -440,7 +441,15 @@ class RestorationPreviewWorker:
         metadata_queue: Queue = Queue(maxsize=settings.max_clip_size * 5)
 
         error_holder: list[BaseException] = []
-        blend_buffer = BlendBuffer(device=session.device, vr_projector=vr_projector)
+        blend_buffer = BlendBuffer(
+            device=session.device,
+            vr_projector=vr_projector,
+            fisheye_eye_width=(
+                int(self.metadata.video_width) // 2
+                if vr_resolution.fisheye_mask_geometry
+                else None
+            ),
+        )
         crop_buffers: dict[int, CropBuffer] = {}
         crop_lock = threading.Lock()
         primary_idle_event = threading.Event()
@@ -503,6 +512,7 @@ class RestorationPreviewWorker:
                     end_pts=window.end_pts,
                     vr_mode=vr_resolution.resolved,
                     vr_projector=vr_projector,
+                    fisheye_mask_geometry=vr_resolution.fisheye_mask_geometry,
                 ),
                 name="PreviewDecodeDetect", daemon=True,
             ),
@@ -558,20 +568,11 @@ class RestorationPreviewWorker:
                 break
             time.sleep(0.05)
 
-        all_queues = [clip_queue, secondary_queue, encode_queue, metadata_queue]
-
-        def _drain_all_queues():
-            for q in all_queues:
-                try:
-                    while True:
-                        q.get_nowait()
-                except Empty:
-                    pass
-
-        for t in threads:
-            while t.is_alive():
-                _drain_all_queues()
-                t.join(timeout=0.02)
+        wait_for_worker_threads(
+            threads,
+            (clip_queue, secondary_queue, encode_queue, metadata_queue),
+            cancel_event,
+        )
         vram_offloader.stop()
 
         with self._cancel_lock:

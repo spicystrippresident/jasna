@@ -45,19 +45,37 @@ def folder_media_in_processing_order(folder: str | Path) -> list[Path]:
     return images + videos
 
 
-def folder_output_path(output_dir: str | Path, input_path: str | Path, output_pattern: str | None = None) -> Path:
+def folder_output_path(
+    output_dir: str | Path,
+    input_path: str | Path,
+    output_pattern: str | None = None,
+    *,
+    input_root: str | Path | None = None,
+    preserve_structure: bool = False,
+) -> Path:
     """Per-file output path for folder batches.
 
     Without a pattern, writes ``<output_dir>/<stem>_out<ext>``. With a pattern,
     replaces ``{original}`` with the input stem. Image outputs keep their source
     extension; video outputs use the pattern extension when one is provided.
+    When requested, the input's parent path relative to ``input_root`` is
+    recreated below ``output_dir``.
     """
     input_path = Path(input_path)
+    output_dir = Path(output_dir)
+    if preserve_structure and input_root is not None:
+        try:
+            relative_parent = input_path.relative_to(Path(input_root)).parent
+        except ValueError:
+            # A manually added file has no meaningful path below the selected
+            # folder root, so retain the established flat-output behavior.
+            relative_parent = Path()
+        output_dir /= relative_parent
     if not output_pattern:
-        return Path(output_dir) / f"{input_path.stem}_out{input_path.suffix}"
+        return output_dir / f"{input_path.stem}_out{input_path.suffix}"
 
     output_name = output_pattern.replace("{original}", input_path.stem)
-    output_path = Path(output_dir) / output_name
+    output_path = output_dir / output_name
     if is_image(input_path) or not output_path.suffix:
         output_path = output_path.with_suffix(input_path.suffix)
     return output_path

@@ -16,7 +16,6 @@ from jasna.tracking.scene_detector import SceneCutDetector
 
 logger = logging.getLogger(__name__)
 
-
 @dataclass(frozen=True)
 class BatchProcessResult:
     next_frame_idx: int
@@ -135,6 +134,7 @@ def process_frame_batch(
     min_detection_duration: int = 0,
     scene_detector: SceneCutDetector | None = None,
     vr_projector=None,
+    fisheye_mask_geometry: bool = False,
 ) -> BatchProcessResult:
     effective_bs = len(pts_list)
     if effective_bs == 0:
@@ -155,7 +155,9 @@ def process_frame_batch(
         valid_masks = detections.masks[i]
 
         scene_cut_clips = tracker.flush() if i in scene_cuts else []
-        ended_clips, active_track_ids = tracker.update(current_frame_idx, valid_boxes, valid_masks)
+        ended_clips, active_track_ids = tracker.update(
+            current_frame_idx, valid_boxes, valid_masks
+        )
         ended_clips = scene_cut_clips + ended_clips
 
         blend_buffer.register_frame(current_frame_idx, active_track_ids)
@@ -169,7 +171,8 @@ def process_frame_batch(
                 crop_buffers[track_id] = CropBuffer(track_id=track_id, start_frame=clip.start_frame)
             bbox = clip.bboxes[-1]
             raw_crop = _extract_region_crop(
-                frame, bbox, frame_h, frame_w, crop_eye_width, vr_projector
+                frame, bbox, frame_h, frame_w, crop_eye_width, vr_projector,
+                fisheye_mask_geometry,
             )
             crop_buffers[track_id].add(raw_crop)
 
@@ -180,7 +183,8 @@ def process_frame_batch(
             if crop_buffers[tid].frame_count < ec.clip.frame_count:
                 bbox = ec.clip.bboxes[-1]
                 raw_crop = _extract_region_crop(
-                    frame, bbox, frame_h, frame_w, crop_eye_width, vr_projector
+                    frame, bbox, frame_h, frame_w, crop_eye_width, vr_projector,
+                    fisheye_mask_geometry,
                 )
                 crop_buffers[tid].add(raw_crop)
 
@@ -211,13 +215,18 @@ def _extract_region_crop(
     frame_w: int,
     crop_eye_width: int | None,
     vr_projector,
+    fisheye_mask_geometry: bool,
 ) -> RawCrop:
     x_bounds = _eye_bounds(bbox, crop_eye_width, frame_w)
     if vr_projector is not None:
         return vr_projector.extract_region_crop(
-            frame, bbox, frame_h, frame_w, x_bounds=x_bounds
+            frame, bbox, frame_h, frame_w, x_bounds=x_bounds,
+            fisheye_geometry=fisheye_mask_geometry,
         )
-    return extract_crop(frame, bbox, frame_h, frame_w, x_bounds=x_bounds)
+    return extract_crop(
+        frame, bbox, frame_h, frame_w, x_bounds=x_bounds,
+        fisheye_geometry=fisheye_mask_geometry,
+    )
 
 
 def _eye_bounds(

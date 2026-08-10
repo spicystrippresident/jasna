@@ -15,16 +15,18 @@ from jasna.frame_queue import FrameQueue
 import psutil
 import torch
 
-from jasna.accelerator import vendor_for_device
+from jasna.accelerator import AcceleratorVendor, vendor_for_device
 from jasna.media import UnsupportedColorspaceError, get_video_meta_data
-from jasna.media.video_encoder import NvidiaVideoEncoder
+from jasna.media.video_encoder import (
+    NvidiaVideoEncoder,
+    add_amd_hevc_smart_fragment_source_level,
+)
 from jasna.media.frame_rate import resolve_frame_rate_retarget
 from jasna.media.splice import (
     SplicePlan,
     build_splice_plan,
-    concatenate_fragments,
     create_copy_fragment,
-    mux_final_output,
+    mux_fragments_final_output,
     normalize_fragment,
     probe_keyframes,
     resolve_smart_encoder_settings,
@@ -33,7 +35,14 @@ from jasna.media.splice import (
 from jasna.mosaic.detection_registry import build_detection_model
 from jasna.pipeline_debug_logging import PipelineDebugMemoryLogger
 from jasna.pipeline_items import FrameMeta, PrimaryRestoreResult, SecondaryLoopStats, _SENTINEL
-from jasna.pipeline_threads import decode_detect_loop, primary_restore_loop, secondary_restore_loop, blend_encode_loop
+from jasna.pipeline_threads import (
+    blend_encode_loop,
+    decode_detect_loop,
+    primary_restore_loop,
+    record_worker_error,
+    secondary_restore_loop,
+    wait_for_worker_threads,
+)
 from jasna.progressbar import Progressbar
 from jasna.restorer import RestorationPipeline
 from jasna.restorer.secondary_restorer import AsyncSecondaryRestorer
@@ -145,7 +154,7 @@ class Pipeline:
                 path=detection_model_path,
                 batch_size=self.batch_size,
                 score_threshold=float(detection_score_threshold),
-                fp16=bool(fp16),
+                fp16=self.fp16,
             )
         else:
             self.detection_model = build_detection_model(
@@ -154,7 +163,7 @@ class Pipeline:
                 batch_size=self.batch_size,
                 device=self.device,
                 score_threshold=float(detection_score_threshold),
-                fp16=bool(fp16),
+                fp16=self.fp16,
             )
         self.restoration_pipeline = restoration_pipeline
         self.disable_progress = bool(disable_progress)
@@ -237,6 +246,7 @@ class Pipeline:
         debug_memory: PipelineDebugMemoryLogger | None = None,
         clip_queue: FrameQueue | None = None,
         primary_idle_event: threading.Event | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> SecondaryLoopStats:
         restorer: AsyncSecondaryRestorer = self.restoration_pipeline.secondary_restorer  # type: ignore[assignment]
         pending_prs: dict[int, PrimaryRestoreResult] = {}
@@ -252,7 +262,12 @@ class Pipeline:
             nonlocal last_push_time, flushed_since_last_push, pusher_stall_seconds, clips_pushed
             try:
                 while True:
-                    item = secondary_queue.get()
+                    if cancel_event is not None and cancel_event.is_set():
+                        break
+                    try:
+                        item = secondary_queue.get(timeout=self._ASYNC_POLL_TIMEOUT)
+                    except Empty:
+                        continue
                     if item is _SENTINEL:
                         break
                     pr: PrimaryRestoreResult = item  # type: ignore[assignment]
@@ -311,6 +326,8 @@ class Pipeline:
         starvation_start: float | None = None
 
         while not push_done.is_set():
+            if cancel_event is not None and cancel_event.is_set():
+                break
             if pusher_error:
                 raise pusher_error[0]
 
@@ -355,6 +372,14 @@ class Pipeline:
         pusher_thread.join()
         if pusher_error:
             raise pusher_error[0]
+        if cancel_event is not None and cancel_event.is_set():
+            return SecondaryLoopStats(
+                starvation_flushes=starvation_count,
+                starvation_seconds=starvation_seconds,
+                pusher_stall_seconds=pusher_stall_seconds,
+                clips_pushed=clips_pushed,
+                clips_popped=clips_popped,
+            )
         restorer.flush_all()
         for _ in range(100):
             if not pending_prs:
@@ -401,7 +426,15 @@ class Pipeline:
         metadata_queue: Queue[FrameMeta | object] = Queue(maxsize=self.max_clip_size * 5)
 
         error_holder: list[BaseException] = []
-        blend_buffer = BlendBuffer(device=device, vr_projector=self._vr_projector)
+        blend_buffer = BlendBuffer(
+            device=device,
+            vr_projector=self._vr_projector,
+            fisheye_eye_width=(
+                int(metadata.video_width) // 2
+                if self._vr_resolution.fisheye_mask_geometry
+                else None
+            ),
+        )
         crop_buffers: dict[int, CropBuffer] = {}
         crop_lock = threading.Lock()
         primary_idle_event = threading.Event()
@@ -432,10 +465,21 @@ class Pipeline:
             nonlocal starvation_stats
             try:
                 torch.cuda.set_device(device)
-                starvation_stats = self._run_secondary_loop(secondary_queue, encode_queue, debug_memory, clip_queue, primary_idle_event)
+                starvation_stats = self._run_secondary_loop(
+                    secondary_queue,
+                    encode_queue,
+                    debug_memory,
+                    clip_queue,
+                    primary_idle_event,
+                    self._cancel_event,
+                )
             except BaseException as e:
-                log.exception("[secondary-async] thread crashed")
-                error_holder.append(e)
+                record_worker_error(
+                    "secondary-async",
+                    e,
+                    error_holder,
+                    self._cancel_event,
+                )
             finally:
                 encode_queue.put(_SENTINEL)
 
@@ -485,6 +529,7 @@ class Pipeline:
                     output_fps=float(frame_rate.output_fps),
                     vr_mode=self._vr_resolution.resolved,
                     vr_projector=self._vr_projector,
+                    fisheye_mask_geometry=self._vr_resolution.fisheye_mask_geometry,
                     cancel_event=self._cancel_event,
                 ),
                 name="DecodeDetect", daemon=True,
@@ -525,8 +570,11 @@ class Pipeline:
         vram_offloader.start()
         for t in threads:
             t.start()
-        for t in threads:
-            t.join()
+        wait_for_worker_threads(
+            threads,
+            (clip_queue, secondary_queue, encode_queue, metadata_queue),
+            self._cancel_event,
+        )
         vram_offloader.stop()
         frame_writer.close()
 
@@ -659,7 +707,24 @@ class Pipeline:
             index,
             self.encoder_settings,
             vendor=vendor_for_device(self.device),
+            # The current Linux AMF runtime rejects the source's four-B-frame
+            # configuration at 4K. Closed GOP + forced IDR let the rendered
+            # span use P-frames only and still splice safely with copied spans.
+            h264_max_b_frames=(
+                0
+                if codec == "h264"
+                and getattr(self, "encoder_backend", "auto") != "software-reference"
+                and vendor_for_device(self.device) is AcceleratorVendor.AMD
+                else None
+            ),
         )
+        if getattr(self, "encoder_backend", "auto") != "software-reference":
+            smart_encoder_settings = add_amd_hevc_smart_fragment_source_level(
+                smart_encoder_settings,
+                metadata,
+                codec=codec,
+                vendor=vendor_for_device(self.device),
+            )
         total_frames = max(
             1,
             sum(
@@ -711,16 +776,21 @@ class Pipeline:
                 duration = float((span.end_pts - span.start_pts) * index.time_base)
                 expected_frames = max(1, round(duration * metadata.video_fps))
                 normalized = workspace.fragment_path(span_index, fragment_suffix)
+                raw = workspace.raw_path(span_index)
                 reusable = workspace.reusable_fragment(span_index)
                 if reusable is not None:
                     log.info("Reusing smart-render span %s from %s", span_index, reusable)
+                    if span.is_render:
+                        try:
+                            raw.unlink(missing_ok=True)
+                        except OSError:
+                            log.warning("Could not clean raw smart-render span %s", raw)
                     fragments.append((reusable, duration))
                     if span.is_render:
                         progress.mark_completed(expected_frames)
                     continue
 
                 workspace.mark_running(span_index)
-                raw = workspace.raw_path(span_index)
                 if span.is_render:
                     encoder_ctx = NvidiaVideoEncoder(
                         str(raw),
@@ -764,21 +834,35 @@ class Pipeline:
                         normalized=True,
                     )
                 workspace.mark_complete(span_index, normalized)
+                if span.is_render:
+                    try:
+                        raw.unlink(missing_ok=True)
+                    except OSError:
+                        log.warning("Could not clean raw smart-render span %s", raw)
                 fragments.append((normalized, duration))
 
             if self._cancel_event.is_set():
                 return
-            assembled = workspace.path / f"assembled{fragment_suffix}"
-            concatenate_fragments(
-                fragments,
-                manifest=workspace.path / "fragments.ffconcat",
-                destination=assembled,
-                codec=codec,
+            for stale_name in ("assembled.ts", "assembled.mkv"):
+                stale_assembled = workspace.path / stale_name
+                if stale_assembled.is_file():
+                    stale_size = stale_assembled.stat().st_size
+                    stale_assembled.unlink()
+                    log.info(
+                        "Removed stale smart-render assembly %s (%.2f GiB)",
+                        stale_assembled,
+                        stale_size / (1024 ** 3),
+                    )
+            log.info(
+                "Finalizing smart-render output directly from %s fragment(s); "
+                "no assembled intermediate will be created",
+                len(fragments),
             )
-            mux_final_output(
-                assembled,
+            mux_fragments_final_output(
+                fragments,
                 self.input_video,
                 self.output_video,
+                manifest=workspace.path / "fragments.ffconcat",
                 codec=codec,
             )
             try:

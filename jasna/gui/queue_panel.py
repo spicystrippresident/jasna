@@ -17,7 +17,11 @@ from jasna.gui.file_actions import open_containing_folder
 from jasna.gui.file_actions import open_file
 from jasna.gui.locales import t
 
-from jasna.media.media_files import MEDIA_EXTENSIONS, folder_media_in_processing_order
+from jasna.media.media_files import (
+    MEDIA_EXTENSIONS,
+    folder_media_in_processing_order,
+    folder_output_path,
+)
 
 logger = logging.getLogger(__name__)
 from jasna.media.image_io import is_image_path
@@ -181,6 +185,26 @@ class QueuePanel(ctk.CTkFrame):
         output_tip = ctk.CTkLabel(output_label_row, text="\u24d8", text_color=Colors.TEXT_PRIMARY, font=(Fonts.FAMILY, Fonts.SIZE_TINY), cursor="hand2")
         output_tip.pack(side="left", padx=4)
         Tooltip(output_tip, t("tip_output_location"))
+
+        self._preserve_structure_var = ctk.BooleanVar(value=False)
+        self._preserve_structure_checkbox = ctk.CTkCheckBox(
+            footer,
+            text=t("preserve_input_structure"),
+            variable=self._preserve_structure_var,
+            command=self._on_preserve_structure_changed,
+            font=(Fonts.FAMILY, Fonts.SIZE_SMALL),
+            text_color=Colors.TEXT_PRIMARY,
+            fg_color=Colors.PRIMARY,
+            hover_color=Colors.PRIMARY_HOVER,
+            border_color=Colors.BORDER_LIGHT,
+            checkbox_width=18,
+            checkbox_height=18,
+        )
+        self._preserve_structure_checkbox.pack(fill="x", pady=(0, 4))
+        Tooltip(
+            self._preserve_structure_checkbox,
+            t("tip_preserve_input_structure"),
+        )
         
         output_row = ctk.CTkFrame(footer, fg_color="transparent")
         output_row.pack(fill="x")
@@ -239,14 +263,24 @@ class QueuePanel(ctk.CTkFrame):
 
     def _on_pattern_or_conflicts(self, event=None):
         self._refresh_conflicts()
+        self._notify_output_changed()
+
+    def _on_preserve_structure_changed(self):
+        self._refresh_conflicts()
+        self._notify_output_changed()
+
+    def _notify_output_changed(self):
         if self._on_output_changed:
-            self._on_output_changed(self.get_output_folder(), self.get_output_pattern())
+            self._on_output_changed(
+                self.get_output_folder(),
+                self.get_output_pattern(),
+                self.get_preserve_input_structure(),
+            )
 
     def _on_output_entry_changed(self, event=None) -> None:
         self._update_same_as_input_style()
         self._refresh_conflicts()
-        if self._on_output_changed:
-            self._on_output_changed(self.get_output_folder(), self.get_output_pattern())
+        self._notify_output_changed()
         
     def _on_add_files(self):
         files = filedialog.askopenfilenames(
@@ -267,7 +301,7 @@ class QueuePanel(ctk.CTkFrame):
         if folder:
             folder_path = Path(folder)
             for f in folder_media_in_processing_order(folder_path):
-                self.add_job(f)
+                self.add_job(f, input_root=folder_path)
                     
     def _on_browse_output(self):
         folder = filedialog.askdirectory(title=t("select_output_folder"))
@@ -286,8 +320,7 @@ class QueuePanel(ctk.CTkFrame):
         self._refresh_conflicts()
         if self._on_jobs_changed:
             self._on_jobs_changed()
-        if self._on_output_changed:
-            self._on_output_changed(self.get_output_folder(), self.get_output_pattern())
+        self._notify_output_changed()
 
     def _update_same_as_input_style(self) -> None:
         same_as_input = not self.get_output_folder()
@@ -333,15 +366,15 @@ class QueuePanel(ctk.CTkFrame):
         count = len(self._jobs)
         self._queue_count.configure(text=t("items_queued", count=count))
         
-    def add_job(self, path: Path):
+    def add_job(self, path: Path, *, input_root: Path | None = None):
         if any(j.path == path for j in self._jobs):
             return
             
-        job = JobItem(path=path)
+        job = JobItem(path=path, input_root=input_root)
         self._jobs.append(job)
         
         # Check for output file conflict
-        output_path = self._get_output_path(path)
+        output_path = self._get_output_path(job)
         job.has_conflict = output_path.exists() if output_path else False
         
         widget = JobListItem(
@@ -482,18 +515,24 @@ class QueuePanel(ctk.CTkFrame):
             summary = t("segments_full_video")
         self._job_widgets[idx].set_segment_summary(summary, selected=bool(segments))
             
-    def _get_output_path(self, input_path: Path) -> Path | None:
+    def _get_output_path(self, job: JobItem) -> Path | None:
         """Get the output path for a given input file based on current settings."""
         output_folder = self._output_entry.get()
         pattern = self._pattern_entry.get() or "{original}_restored.mp4"
-        
+        input_path = job.path
+        preserve_structure = bool(output_folder) and self.get_preserve_input_structure()
+
         if not output_folder:
             # Use same folder as input
             output_folder = str(input_path.parent)
-            
-        original_stem = input_path.stem
-        output_name = pattern.replace("{original}", original_stem)
-        return Path(output_folder) / output_name
+
+        return folder_output_path(
+            output_folder,
+            input_path,
+            pattern,
+            input_root=job.input_root,
+            preserve_structure=preserve_structure,
+        )
         
         self._update_empty_state()
         self._update_count()
@@ -534,6 +573,9 @@ class QueuePanel(ctk.CTkFrame):
         
     def get_output_pattern(self) -> str:
         return self._pattern_entry.get() or "{original}_restored.mp4"
+
+    def get_preserve_input_structure(self) -> bool:
+        return bool(self._preserve_structure_var.get())
         
     def set_on_jobs_changed(self, callback: callable):
         self._on_jobs_changed = callback
@@ -554,11 +596,18 @@ class QueuePanel(ctk.CTkFrame):
     def set_on_play(self, callback: callable) -> None:
         self._on_play = callback
 
-    def set_initial_output(self, folder: str = "", pattern: str = ""):
+    def set_initial_output(
+        self,
+        folder: str = "",
+        pattern: str = "",
+        preserve_input_structure: bool = False,
+    ):
         self._set_output_folder(folder)
         if pattern:
             self._pattern_entry.delete(0, "end")
             self._pattern_entry.insert(0, pattern)
+        self._preserve_structure_var.set(bool(preserve_input_structure))
+        self._refresh_conflicts()
         
     def _find_job_index_by_id(self, job_id: int) -> int | None:
         for i, job in enumerate(self._jobs):
@@ -607,7 +656,7 @@ class QueuePanel(ctk.CTkFrame):
         """Re-check all jobs for output file conflicts."""
         for job, widget in zip(self._jobs, self._job_widgets):
             if job.status == JobStatus.PENDING:
-                output_path = self._get_output_path(job.path)
+                output_path = self._get_output_path(job)
                 job.has_conflict = output_path.exists() if output_path else False
                 widget.set_conflict(job.has_conflict, t("conflict_tooltip") if job.has_conflict else "")
     
@@ -618,6 +667,7 @@ class QueuePanel(ctk.CTkFrame):
         self._output_browse_btn.configure(state=state)
         self._same_as_input_btn.configure(state=state)
         self._pattern_entry.configure(state=state)
+        self._preserve_structure_checkbox.configure(state=state)
         self._clear_btn.configure(state=state)
         self._clear_completed_btn.configure(state=state)
 
@@ -715,6 +765,7 @@ class QueuePanel(ctk.CTkFrame):
             self._output_entry.configure(state="disabled")
             self._same_as_input_btn.configure(state="disabled")
             self._pattern_entry.configure(state="disabled")
+            self._preserve_structure_checkbox.configure(state="disabled")
             # Allow adding files/folders
             self._add_files_btn.configure(state="normal")
             self._add_folder_btn.configure(state="normal")
@@ -736,6 +787,7 @@ class QueuePanel(ctk.CTkFrame):
             self._output_entry.configure(state="normal")
             self._same_as_input_btn.configure(state="normal")
             self._pattern_entry.configure(state="normal")
+            self._preserve_structure_checkbox.configure(state="normal")
             self._add_files_btn.configure(state="normal")
             self._add_folder_btn.configure(state="normal")
             for job, widget in zip(self._jobs, self._job_widgets):
@@ -774,6 +826,6 @@ class QueuePanel(ctk.CTkFrame):
         for p in paths:
             if p.is_dir():
                 for f in folder_media_in_processing_order(p):
-                    self.add_job(f)
+                    self.add_job(f, input_root=p)
             elif p.is_file() and p.suffix.lower() in MEDIA_EXTENSIONS:
                 self.add_job(p)

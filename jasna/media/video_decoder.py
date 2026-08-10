@@ -388,6 +388,9 @@ class _RocDecodeFrameSource:
             y = surface[: self.height]
             uv = surface[self.height :].view(self.height // 2, self.width // 2, 2)
             converter.convert_into(y, uv, batch[index])
+        # rocDecode RGB conversion kernels are asynchronous; synchronize before
+        # this batch crosses the producer/consumer thread boundary.
+        current_stream(self.device).synchronize()
         return batch, list(pts)
 
     def close(self) -> None:
@@ -409,6 +412,7 @@ class NvidiaVideoReader:
         *,
         frame_stride: int = 1,
         prefer_software_decode: bool = False,
+        decode_backend: str | None = None,
     ):
         frame_stride = int(frame_stride)
         if frame_stride <= 0:
@@ -419,6 +423,7 @@ class NvidiaVideoReader:
         self.metadata = metadata
         self.frame_stride = frame_stride
         self.prefer_software_decode = bool(prefer_software_decode)
+        self.decode_backend = decode_backend
         self.vendor = vendor_for_device(device)
         self._decoder_ctx = None
         self._amd_hardware_decode = False
@@ -432,7 +437,11 @@ class NvidiaVideoReader:
         self._vali_source = None
         self._rocdecode_source = None
         current_stream(self.device)
-        backend = _decode_backend()
+        backend = self.decode_backend or _decode_backend()
+        if backend not in _DECODE_BACKENDS:
+            raise ValueError(
+                f"Unknown decode backend {backend!r}, expected {_DECODE_BACKENDS}"
+            )
         self._decode_backend = backend
         if backend in ("auto", "vali"):
             if self.vendor is AcceleratorVendor.NVIDIA:
