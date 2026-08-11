@@ -96,6 +96,18 @@ def test_preset_manager_persists_working_directory(monkeypatch, tmp_path: Path) 
     assert loaded.working_directory == r"D:\scratch"
 
 
+def test_preset_manager_persists_run_log_preference(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(os_utils.sys, "platform", "win32", raising=False)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
+
+    manager = PresetManager()
+    assert manager.create_preset("WithRunLog", AppSettings(save_run_log=True))
+
+    loaded = PresetManager().get_preset("WithRunLog")
+    assert loaded is not None
+    assert loaded.save_run_log is True
+
+
 def test_preset_manager_saves_and_loads_last_working_directory(
     monkeypatch, tmp_path: Path
 ) -> None:

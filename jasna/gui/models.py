@@ -189,6 +189,9 @@ class AppSettings:
     file_conflict: str = "auto_rename"  # auto_rename, overwrite, skip
     working_directory: str = ""  # empty = same directory as the output video
 
+    # Diagnostics
+    save_run_log: bool = False
+
 
 # Factory default preset - frozen, matches CLI defaults
 DEFAULT_SETTINGS = AppSettings()

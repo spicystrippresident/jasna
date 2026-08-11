@@ -57,6 +57,16 @@ class TestFolderMediaInProcessingOrder:
             "nested/clip_a.webm",
         ]
 
+    def test_excludes_run_log_directory_from_recursive_discovery(self, tmp_path: Path):
+        (tmp_path / "input.mp4").write_bytes(b"x")
+        logs = tmp_path / ".jasna-logs" / "nested"
+        logs.mkdir(parents=True)
+        (logs / "misleading.mp4").write_bytes(b"x")
+
+        ordered = folder_media_in_processing_order(tmp_path)
+
+        assert ordered == [tmp_path / "input.mp4"]
+
 
 class TestFolderOutputPath:
     def test_out_suffix_and_dir(self):

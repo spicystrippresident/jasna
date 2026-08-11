@@ -84,6 +84,7 @@ def _fake_section_widgets() -> dict:
         "vr_mode": _FakeValueMenu({"auto": "自動", "off": "オフ"}, "off"),
         "denoise_strength": _FakeValueMenu({"none": "なし", "high": "高"}, "high"),
         "denoise_step": _FakeValueMenu({"after_primary": "一", "after_secondary": "二"}, "after_secondary"),
+        "save_run_log": _FakeWidget(1),
         "secondary_var": _FakeWidget("tvai"),
         "tvai_ffmpeg_path": _FakeWidget("/opt/tvai/ffmpeg"),
         "tvai_model": _FakeWidget("iris-3"),
@@ -141,6 +142,7 @@ def test_sections_collect_internal_values_without_translation_lookups() -> None:
     assert values["vr_mode"] == "off"
     assert values["denoise_strength"] == "high"
     assert values["denoise_step"] == "after_secondary"
+    assert values["save_run_log"] is True
     assert values["codec"] == "av1"
     assert values["post_export_action"] == "command"
     assert values["post_export_command"] == "echo done"
