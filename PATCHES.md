@@ -597,3 +597,55 @@ appears after preflight. A same-name flat output and a `.segments-*`
 smart-render workspace do not suppress a missing preserved nested final output.
 Focused temporary-directory tests cover the mixed isolated batch, explicit
 overwrite, flat auto-rename, and stale-workspace cases.
+
+## Opt-in GUI run diagnostics
+
+Advanced Processing now exposes an opt-in `Save diagnostic run log` preset
+setting. Disabled is the default and creates no writer thread, telemetry
+sampler, directory, or log file. With an explicit output folder, each batch
+creates a collision-resistant log below `<output>/.jasna-logs/`. Same-as-input
+batches can span unrelated source directories, so they instead write below the
+per-user Jasna configuration directory at `run-logs/`.
+
+This was motivated by two successive hard resets: one during long 8K video
+processing and one while the Python unit suite was running. Both persisted the
+same platform signature: reset reason `0x08000800`, an uncorrected Data Fabric
+sync flood, CPU Bank 27 status `faa000000000080b`, and IPID
+`1002e00000500`. No preceding logged OOM, amdgpu reset/fault, PCIe AER, or NVMe
+error established a Jasna software cause. The second reset had no intentional
+real video, rocDecode, AMF, or FFmpeg run, so no speculative processing-policy
+change was made. Both abrupt resets dirtied D NTFS; it was mounted read-only for
+evidence, and repair remains external and Windows-side.
+
+`jasna.gui.run_log.AsyncRunLog` is strictly a fail-open side channel. GUI and
+processor callbacks only enqueue short text; its daemon writer owns directory
+creation, file writes, flushing, fsync, and close. The bounded queue retains
+recent events and writes a sequence-gap marker when events are evicted. Pending
+writes are explicitly flushed about every second and durably synced about every
+five seconds even when the batch is otherwise quiet; close forces one final
+flush and sync. Writer, telemetry, and sync failures only produce the
+localized generic warning and never alter processing, cancellation, or GUI
+control flow. GUI callbacks only signal diagnostic shutdown and never wait for
+the writer or sampler; after `mainloop()` exits, the existing application
+shutdown path gives the writer one bounded second to finish before its forced
+process exit.
+
+The log records batch context, queued inputs, processor/isolated-worker log
+lines, and periodic parent-side telemetry. `RunTelemetrySampler` only reads
+Linux `/proc/meminfo`, `/proc/loadavg`, and AMD amdgpu files below
+`/sys/class/drm`: load, RAM, GPU busy percentage, raw VRAM use, temperature,
+and power where available. It does not import Torch, HIP, ROCm, or AMD SMI, and
+it does not follow `journalctl` or any other kernel log stream. Kernel resets,
+MCE records, and events emitted after a hard reset remain an operator-side
+investigation using `journalctl` and pstore after restart; the run log cannot
+capture those kernel-only MCE events itself.
+
+Focused tests use fake streams/clocks, fake proc/sysfs trees, and headless GUI
+fakes. They validate the output/config paths, disabled mode, queue overflow,
+flush/sync cadence and forced close, fail-open creation/sync failures,
+telemetry formatting and sampler cleanup, lifecycle cleanup after the processor
+completion callback, preset persistence, and recursive `.jasna-logs` exclusion.
+Worker focused tests passed. The root full-suite acceptance run was interrupted
+by the repeated MCE at about 40% and was deliberately not rerun to avoid more
+platform stress. No full-suite pass, real-media, GPU, or kernel-reset validation
+is claimed for this diagnostic feature.

@@ -168,6 +168,20 @@ class Processor:
 
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
+
+    def active_job(self) -> JobItem | None:
+        """Return the current job for diagnostics without altering processor state."""
+        return next(
+            (job for job in self._jobs if job.status is JobStatus.PROCESSING),
+            None,
+        )
+
+    def isolated_worker_pid(self) -> int | None:
+        """Expose the isolated child PID for parent-side diagnostics only."""
+        with self._isolated_process_lock:
+            process = self._isolated_process
+            pid = getattr(process, "pid", None) if process is not None else None
+        return int(pid) if isinstance(pid, int) else None
         
     def _log(self, level: str, message: str):
         if self._on_log:
