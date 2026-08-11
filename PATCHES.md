@@ -581,3 +581,19 @@ default previous/current/next mask union.
 The frame-ownership evidence covers the real 8-bit sample. The same native-copy
 boundary still requires a separate Main 10/P016 sample before this specific fix
 is claimed validated for that format.
+
+## Preserved GUI batch resume policy
+
+Folder-added jobs with an explicit output folder and preserved input structure
+now treat an existing file at the canonical preserved final path as already
+complete under both the default Auto Rename mode and Skip. This makes rerunning
+a preserved folder batch resume completed nested outputs instead of renaming and
+processing them again. Explicit Overwrite remains authoritative. Flat output
+batches retain their established auto-rename behavior.
+
+The parent applies this exact-file check before starting a Linux AMD isolated
+video child; the child repeats the same processor policy to cover a file that
+appears after preflight. A same-name flat output and a `.segments-*`
+smart-render workspace do not suppress a missing preserved nested final output.
+Focused temporary-directory tests cover the mixed isolated batch, explicit
+overwrite, flat auto-rename, and stale-workspace cases.
