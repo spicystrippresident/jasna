@@ -128,7 +128,7 @@ def test_folder_job_skips_existing_nested_output(tmp_path):
         "existing nested output should have been skipped"
     )
     processor._jobs = [job]
-    processor._settings = AppSettings(file_conflict="skip")
+    processor._settings = AppSettings()
     processor._output_folder = str(tmp_path / "output")
     processor._output_pattern = "{original}_restored.mp4"
     processor._preserve_input_structure = True
@@ -137,6 +137,82 @@ def test_folder_job_skips_existing_nested_output(tmp_path):
 
     assert job.status is JobStatus.SKIPPED
     assert updates[-1].status is JobStatus.SKIPPED
+
+
+def test_folder_job_overwrites_existing_nested_output_when_selected(tmp_path):
+    input_root = tmp_path / "input"
+    source = input_root / "studio" / "clip.mkv"
+    source.parent.mkdir(parents=True)
+    source.touch()
+    existing = tmp_path / "output" / "studio" / "clip_restored.mp4"
+    existing.parent.mkdir(parents=True)
+    existing.touch()
+    captured = []
+    job = JobItem(path=source, input_root=input_root)
+    processor = Processor()
+    processor._run_pipeline = (
+        lambda _job_id, _input_path, output_path, **_kwargs: captured.append(output_path)
+    )
+    processor._jobs = [job]
+    processor._settings = AppSettings(file_conflict="overwrite")
+    processor._output_folder = str(tmp_path / "output")
+    processor._output_pattern = "{original}_restored.mp4"
+    processor._preserve_input_structure = True
+
+    processor._run()
+
+    assert job.status is JobStatus.COMPLETED
+    assert captured == [existing]
+
+
+def test_flat_folder_job_auto_renames_existing_output(tmp_path):
+    input_root = tmp_path / "input"
+    source = input_root / "studio" / "clip.mkv"
+    source.parent.mkdir(parents=True)
+    source.touch()
+    output_root = tmp_path / "output"
+    existing = output_root / "clip_restored.mp4"
+    existing.parent.mkdir(parents=True)
+    existing.touch()
+    captured = []
+    job = JobItem(path=source, input_root=input_root)
+    processor = Processor()
+    processor._run_pipeline = (
+        lambda _job_id, _input_path, output_path, **_kwargs: captured.append(output_path)
+    )
+    processor._jobs = [job]
+    processor._settings = AppSettings()
+    processor._output_folder = str(output_root)
+    processor._output_pattern = "{original}_restored.mp4"
+
+    processor._run()
+
+    assert job.status is JobStatus.COMPLETED
+    assert captured == [output_root / "clip_restored (1).mp4"]
+
+
+def test_flat_folder_job_skips_existing_output_when_selected(tmp_path):
+    input_root = tmp_path / "input"
+    source = input_root / "studio" / "clip.mkv"
+    source.parent.mkdir(parents=True)
+    source.touch()
+    output_root = tmp_path / "output"
+    existing = output_root / "clip_restored.mp4"
+    existing.parent.mkdir(parents=True)
+    existing.touch()
+    job = JobItem(path=source, input_root=input_root)
+    processor = Processor()
+    processor._run_pipeline = lambda *_args, **_kwargs: pytest.fail(
+        "flat output should have been skipped"
+    )
+    processor._jobs = [job]
+    processor._settings = AppSettings(file_conflict="skip")
+    processor._output_folder = str(output_root)
+    processor._output_pattern = "{original}_restored.mp4"
+
+    processor._run()
+
+    assert job.status is JobStatus.SKIPPED
 
 
 def test_stop_cancels_the_running_pipeline(tmp_path):

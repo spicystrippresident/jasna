@@ -97,6 +97,48 @@ def test_video_job_command_supports_source_and_frozen(monkeypatch, tmp_path) -> 
     ]
 
 
+def test_child_skips_existing_preserved_output_with_default_conflict(tmp_path) -> None:
+    import jasna.gui.video_job_process as module
+
+    input_root = tmp_path / "input"
+    source = input_root / "nested" / "clip.mp4"
+    source.parent.mkdir(parents=True)
+    source.touch()
+    output_root = tmp_path / "output"
+    existing = output_root / "nested" / "clip_restored.mp4"
+    existing.parent.mkdir(parents=True)
+    existing.touch()
+
+    job = JobItem(id=43, path=source, input_root=input_root)
+    snapshot = job.begin_processing()
+    assert snapshot is not None
+    request = build_video_job_request(
+        job,
+        snapshot,
+        AppSettings(),
+        output_folder=str(output_root),
+        output_pattern="{original}_restored.mp4",
+        preserve_input_structure=True,
+        disable_basicvsrpp_tensorrt=False,
+    )
+    request_path = tmp_path / "request.json"
+    write_video_job_request(request_path, request)
+    output = io.StringIO()
+
+    assert module.run_video_job_file(
+        request_path,
+        input_stream=_BlockingInput(),
+        output_stream=output,
+    ) == 0
+
+    events = [
+        parse_event_line(line)
+        for line in output.getvalue().splitlines()
+        if line.startswith(EVENT_PREFIX)
+    ]
+    assert events[-1] == {"type": "result", "status": "skipped"}
+
+
 def test_child_emits_progress_and_result_without_running_queue_action(
     monkeypatch, tmp_path
 ) -> None:

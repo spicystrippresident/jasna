@@ -140,6 +140,75 @@ def test_linux_amd_batch_uses_a_fresh_process_for_every_video(
     assert all(process._finished for process in processes)
 
 
+def test_linux_amd_batch_skips_only_existing_preserved_output(
+    monkeypatch, tmp_path
+) -> None:
+    import jasna.gui.processor as module
+
+    input_root = tmp_path / "input"
+    completed_source = input_root / "completed" / "clip.mp4"
+    pending_source = input_root / "pending" / "clip.mp4"
+    completed_source.parent.mkdir(parents=True)
+    pending_source.parent.mkdir(parents=True)
+    completed_source.touch()
+    pending_source.touch()
+
+    output_root = tmp_path / "output"
+    completed_output = output_root / "completed" / "clip_restored.mp4"
+    completed_output.parent.mkdir(parents=True)
+    completed_output.touch()
+    # A flat collision and a stale smart-render workspace are not the final
+    # output for the preserved pending job.
+    (output_root / "clip_restored.mp4").touch()
+    (output_root / ".clip_restored.mp4.segments-interrupted").mkdir()
+
+    jobs = [
+        JobItem(path=completed_source, input_root=input_root),
+        JobItem(path=pending_source, input_root=input_root),
+    ]
+    process = _FakeProcess(_completed_output(jobs[1].id))
+    popen = MagicMock(return_value=process)
+    monkeypatch.setattr(module, "_is_linux_amd_runtime", lambda: True)
+    monkeypatch.setattr(module.subprocess, "Popen", popen)
+
+    processor = _processor(tmp_path, jobs)
+    processor._settings = AppSettings()
+    processor._preserve_input_structure = True
+    processor._run()
+
+    assert [job.status for job in jobs] == [
+        JobStatus.SKIPPED,
+        JobStatus.COMPLETED,
+    ]
+    assert popen.call_count == 1
+
+
+def test_linux_amd_batch_keeps_flat_auto_rename_when_structure_is_disabled(
+    monkeypatch, tmp_path
+) -> None:
+    import jasna.gui.processor as module
+
+    input_root = tmp_path / "input"
+    source = input_root / "nested" / "clip.mp4"
+    source.parent.mkdir(parents=True)
+    source.touch()
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    (output_root / "clip_restored.mp4").touch()
+
+    job = JobItem(path=source, input_root=input_root)
+    process = _FakeProcess(_completed_output(job.id))
+    popen = MagicMock(return_value=process)
+    monkeypatch.setattr(module, "_is_linux_amd_runtime", lambda: True)
+    monkeypatch.setattr(module.subprocess, "Popen", popen)
+
+    processor = _processor(tmp_path, [job])
+    processor._run()
+
+    assert job.status is JobStatus.COMPLETED
+    popen.assert_called_once()
+
+
 def test_unexpected_child_exit_fails_only_that_job_and_batch_continues(
     monkeypatch, tmp_path
 ) -> None:
