@@ -13,10 +13,59 @@ _CODECS = {"h264": 3, "hevc": 4, "av1": 5, "vp9": 7}
 _BUILD_LOCK = threading.Lock()
 _LIBRARY: ctypes.CDLL | None = None
 _LOAD_ERROR: Exception | None = None
+_HELPER_PATCH_VERSION = "jasna-rocdecode-parse-errors-v1"
+_HELPER_PARSE_ERROR_BLOCK = """    if (rocDecParseVideoData(rocdec_parser_, &packet) != ROCDEC_SUCCESS) {
+        ROCDEC_ERR(\"Error occurred in rocDecParseVideoData().\");
+    }"""
+_HELPER_PARSE_EXCEPTION_BLOCK = """    const rocDecStatus parse_status = rocDecParseVideoData(rocdec_parser_, &packet);
+    if (parse_status != ROCDEC_SUCCESS) {
+        std::ostringstream error_log;
+        error_log << \"rocDecParseVideoData() returned \"
+                  << rocDecGetErrorName(parse_status);
+        ROCDEC_THROW(error_log.str(), parse_status);
+    }"""
+_TERMINAL_STATUS_NAMES = (
+    "ROCDEC_DEVICE_INVALID",
+    "ROCDEC_CONTEXT_INVALID",
+    "ROCDEC_RUNTIME_ERROR",
+    "ROCDEC_OUTOF_MEMORY",
+)
 
 
 class RocDecodeError(RuntimeError):
     pass
+
+
+def is_terminal_rocdecode_error(error: BaseException) -> bool:
+    """Return whether continuing in the current GPU context is unsafe."""
+    message = str(error).upper()
+    if any(status in message for status in _TERMINAL_STATUS_NAMES):
+        return True
+    return "HIP" in message and (
+        "HIPERROROUTOFMEMORY" in message or "OUT OF MEMORY" in message
+    )
+
+
+def _patch_helper_source(source: str) -> str:
+    if source.count(_HELPER_PARSE_ERROR_BLOCK) != 1:
+        raise RocDecodeError(
+            "unsupported rocDecode helper source: expected the log-only "
+            "rocDecParseVideoData() failure block exactly once"
+        )
+    return source.replace(
+        _HELPER_PARSE_ERROR_BLOCK,
+        _HELPER_PARSE_EXCEPTION_BLOCK,
+        1,
+    )
+
+
+def _library_cache_key(root: Path, paths: tuple[Path, ...]) -> str:
+    digest = hashlib.sha256()
+    digest.update(_HELPER_PATCH_VERSION.encode())
+    for path in paths:
+        digest.update(path.read_bytes())
+    digest.update(str(root).encode())
+    return digest.hexdigest()[:16]
 
 
 def _sdk_root() -> Path:
@@ -51,11 +100,8 @@ def _build_library() -> Path:
     if not compiler.is_file():
         raise RocDecodeError(f"ROCm C++ compiler is unavailable: {compiler}")
 
-    digest = hashlib.sha256()
-    for path in (source, helper_source, helper_dir / "roc_video_dec.h"):
-        digest.update(path.read_bytes())
-    digest.update(str(root).encode())
-    key = digest.hexdigest()[:16]
+    helper_header = helper_dir / "roc_video_dec.h"
+    key = _library_cache_key(root, (source, helper_source, helper_header))
     cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "jasna/native"
     output = cache / f"rocdecode_bridge_{key}.so"
     if output.is_file():
@@ -63,7 +109,13 @@ def _build_library() -> Path:
 
     cache.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="jasna-rocdecode-", dir=cache) as temporary:
-        staged = Path(temporary) / output.name
+        temporary_path = Path(temporary)
+        staged = temporary_path / output.name
+        patched_helper_source = temporary_path / "roc_video_dec.cpp"
+        patched_helper_source.write_text(
+            _patch_helper_source(helper_source.read_text(encoding="utf-8")),
+            encoding="utf-8",
+        )
         command = [
             str(compiler),
             "-std=c++17",
@@ -75,7 +127,7 @@ def _build_library() -> Path:
             "-fPIC",
             "-shared",
             str(source),
-            str(helper_source),
+            str(patched_helper_source),
             f"-I{root / 'include'}",
             f"-I{runtime_root / 'include'}",
             f"-I{helper_dir}",

@@ -9,6 +9,7 @@ import pytest
 import torch
 
 import jasna.media.video_decoder as module
+import jasna.media.rocdecode as rocdecode_module
 from jasna.accelerator import AcceleratorVendor
 from jasna.media import VideoMetadata
 from jasna.media.rocdecode import RocDecodeError
@@ -145,6 +146,77 @@ def test_auto_rocdecode_runtime_failure_resumes_after_last_pts(monkeypatch) -> N
     source.close.assert_called_once()
     reader._open_pyav.assert_called_once_with("auto")
     reader._frames_pyav.assert_called_once_with(None, after_pts=20)
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "ROCDEC_DEVICE_INVALID",
+        "ROCDEC_CONTEXT_INVALID",
+        "ROCDEC_RUNTIME_ERROR",
+        "ROCDEC_OUTOF_MEMORY",
+    ],
+)
+def test_auto_rocdecode_fatal_runtime_error_does_not_fall_back(
+    monkeypatch, status
+) -> None:
+    monkeypatch.setattr(module, "DECODE_BACKEND", "auto")
+    source = MagicMock()
+
+    def native_frames(_seek):
+        yield torch.empty((1, 3, 2, 2), dtype=torch.uint8), [10]
+        raise RocDecodeError(
+            f"{{ DecodeFrame }} rocDecParseVideoData() returned {status}"
+        )
+
+    source.frames = native_frames
+    reader = module.NvidiaVideoReader.__new__(module.NvidiaVideoReader)
+    reader.file = "input.mp4"
+    reader._vali_source = None
+    reader._rocdecode_source = source
+    reader._decode_backend = "auto"
+    reader._open_pyav = MagicMock()
+    reader._frames_pyav = MagicMock()
+
+    with pytest.raises(module.VideoDecodeError, match="fatal runtime state"):
+        list(reader.frames())
+
+    source.close.assert_called_once()
+    reader._open_pyav.assert_not_called()
+    reader._frames_pyav.assert_not_called()
+
+
+def test_rocdecode_helper_patch_turns_parse_failure_into_exception() -> None:
+    patched = rocdecode_module._patch_helper_source(
+        rocdecode_module._HELPER_PARSE_ERROR_BLOCK
+    )
+
+    assert "ROCDEC_ERR" not in patched
+    assert "ROCDEC_THROW(error_log.str(), parse_status)" in patched
+    assert "rocDecGetErrorName(parse_status)" in patched
+
+
+def test_rocdecode_helper_patch_rejects_unknown_upstream_source() -> None:
+    with pytest.raises(RocDecodeError, match="unsupported rocDecode helper source"):
+        rocdecode_module._patch_helper_source("int DecodeFrame() { return 0; }")
+
+
+def test_rocdecode_cache_key_includes_helper_patch_version(monkeypatch, tmp_path) -> None:
+    paths = []
+    for index, content in enumerate((b"bridge", b"helper", b"header")):
+        path = tmp_path / f"source-{index}"
+        path.write_bytes(content)
+        paths.append(path)
+
+    first = rocdecode_module._library_cache_key(tmp_path, tuple(paths))
+    monkeypatch.setattr(
+        rocdecode_module,
+        "_HELPER_PATCH_VERSION",
+        "jasna-rocdecode-parse-errors-v2",
+    )
+    second = rocdecode_module._library_cache_key(tmp_path, tuple(paths))
+
+    assert first != second
 
 
 def _source(frame_pts: list[int], *, stride: int = 1):

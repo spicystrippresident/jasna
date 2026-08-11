@@ -132,3 +132,26 @@ def test_jasna_main_pid_child_exits_without_dispatch(monkeypatch) -> None:
             assert e.value.code == 0
             run_gui.assert_not_called()
             main.assert_not_called()
+
+
+def test_isolated_video_job_dispatches_before_main_pid_guard(monkeypatch) -> None:
+    if "jasna.__main__" in sys.modules:
+        del sys.modules["jasna.__main__"]
+
+    monkeypatch.setattr(os, "getpid", lambda: 99999)
+    monkeypatch.setenv("JASNA_MAIN_PID", "12345")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["jasna", "--isolated-video-job", "/tmp/request.json"],
+    )
+
+    with patch(
+        "jasna.gui.video_job_process.run_video_job_file",
+        return_value=7,
+    ) as run_job:
+        with pytest.raises(SystemExit) as error:
+            import jasna.__main__  # noqa: F401
+
+    assert error.value.code == 7
+    run_job.assert_called_once_with("/tmp/request.json")
