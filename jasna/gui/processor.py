@@ -1,6 +1,12 @@
 """Background processor for video processing jobs."""
 
 import logging
+import json
+import os
+import signal
+import subprocess
+import sys
+import tempfile
 import threading
 import traceback
 import queue
@@ -16,6 +22,9 @@ from jasna.session_config import SessionConfig
 from jasna.session_factory import RestorationSession, build_pipeline
 
 logger = logging.getLogger(__name__)
+
+_ISOLATED_STOP_GRACE_SECONDS = 5.0
+_ISOLATED_TERMINATE_GRACE_SECONDS = 1.0
 
 
 @dataclass
@@ -53,6 +62,16 @@ def _cleanup_torch(torch_mod) -> None:
         torch_mod.cuda.reset_peak_memory_stats()
 
 
+def _is_linux_amd_runtime() -> bool:
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        import torch
+    except ImportError:
+        return False
+    return bool(getattr(torch.version, "hip", None))
+
+
 class Processor:
     """Handles video processing in a background thread."""
     
@@ -61,10 +80,13 @@ class Processor:
         on_progress: Callable[[ProgressUpdate], None] = None,
         on_log: Callable[[str, str], None] = None,
         on_complete: Callable[[], None] = None,
+        *,
+        video_job_isolation: str | None = None,
     ):
         self._on_progress = on_progress
         self._on_log = on_log
         self._on_complete = on_complete
+        self._video_job_isolation = video_job_isolation
         
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -83,6 +105,9 @@ class Processor:
         self._img_session: tuple | None = None      # (detector, restorer, device)
         self._video_session: RestorationSession | None = None
         self._current_pipeline = None
+        self._isolated_process: subprocess.Popen[str] | None = None
+        self._isolated_process_lock = threading.Lock()
+        self._isolated_stop_reaper: threading.Thread | None = None
         
     def start(
         self,
@@ -115,6 +140,9 @@ class Processor:
             self._pause_event.clear()
         else:
             self._pause_event.set()
+        self._send_isolated_command(
+            {"command": "set_paused", "paused": self.is_paused()}
+        )
             
     def is_paused(self) -> bool:
         return not self._pause_event.is_set()
@@ -125,10 +153,18 @@ class Processor:
         pipeline = self._current_pipeline
         if pipeline is not None:
             pipeline.cancel()
+        self._send_isolated_command({"command": "stop"})
+        self._start_isolated_stop_reaper()
 
     def join(self, timeout: float = 5.0):
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=timeout)
+            if self._thread.is_alive() and self._stop_event.is_set():
+                self._terminate_isolated_process()
+                self._thread.join(timeout=1.0)
+                if self._thread.is_alive():
+                    self._terminate_isolated_process(force=True)
+                    self._thread.join(timeout=1.0)
 
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
@@ -146,6 +182,83 @@ class Processor:
             if job.status == JobStatus.PENDING:
                 return job
         return None
+
+    def _send_isolated_command(self, command: dict) -> None:
+        with self._isolated_process_lock:
+            process = self._isolated_process
+            if process is None or process.poll() is not None or process.stdin is None:
+                return
+            try:
+                process.stdin.write(json.dumps(command, separators=(",", ":")) + "\n")
+                process.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                logger.debug("Could not send command to isolated video job", exc_info=True)
+
+    def _start_isolated_stop_reaper(self) -> None:
+        with self._isolated_process_lock:
+            process = self._isolated_process
+            reaper = self._isolated_stop_reaper
+            if process is None or (reaper is not None and reaper.is_alive()):
+                return
+
+            def reap_stopped_process() -> None:
+                try:
+                    try:
+                        process.wait(timeout=_ISOLATED_STOP_GRACE_SECONDS)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    # The leader can exit while an encoder grandchild still
+                    # owns stdout. Signal the dedicated process group even when
+                    # wait() succeeded, then retain the SIGKILL escalation.
+                    self._terminate_isolated_process(expected=process)
+                    time.sleep(_ISOLATED_TERMINATE_GRACE_SECONDS)
+                    self._terminate_isolated_process(
+                        force=True,
+                        expected=process,
+                    )
+                finally:
+                    with self._isolated_process_lock:
+                        if self._isolated_stop_reaper is threading.current_thread():
+                            self._isolated_stop_reaper = None
+
+            self._isolated_stop_reaper = threading.Thread(
+                target=reap_stopped_process,
+                daemon=True,
+                name="isolated-video-job-stop-reaper",
+            )
+            self._isolated_stop_reaper.start()
+
+    def _terminate_isolated_process(
+        self,
+        *,
+        force: bool = False,
+        expected: subprocess.Popen[str] | None = None,
+    ) -> None:
+        with self._isolated_process_lock:
+            process = self._isolated_process
+            if process is None or (expected is not None and process is not expected):
+                return
+            try:
+                if os.name == "posix" and getattr(process, "pid", None) is not None:
+                    os.killpg(
+                        process.pid,
+                        signal.SIGKILL if force else signal.SIGTERM,
+                    )
+                elif process.poll() is not None:
+                    return
+                elif force:
+                    process.kill()
+                else:
+                    process.terminate()
+            except OSError:
+                logger.debug("Could not terminate isolated video job", exc_info=True)
+
+    def _should_isolate_video_job(self, job: JobItem) -> bool:
+        if self._video_job_isolation != "linux-amd" or not _is_linux_amd_runtime():
+            return False
+        from jasna.media.image_io import IMAGE_EXTENSIONS
+
+        return job.path.suffix.lower() not in IMAGE_EXTENSIONS
 
     def _run(self):
         self._log("INFO", "Processing started")
@@ -190,6 +303,9 @@ class Processor:
         run_post_export_action_safely(action, command, lambda message: self._log("ERROR", message))
             
     def _process_job(self, job: JobItem):
+        if self._should_isolate_video_job(job):
+            self._process_isolated_video_job(job)
+            return
         snapshot = job.begin_processing()
         if snapshot is None:
             return
@@ -402,6 +518,171 @@ class Processor:
         except PostExportVideoCommandCancelled as exc:
             raise ProcessingStopped("Processing stopped") from exc
 
+    def _fail_isolated_video_job(self, job: JobItem, message: str) -> None:
+        job.status = JobStatus.ERROR
+        self._progress(ProgressUpdate(
+            job_id=job.id,
+            status=JobStatus.ERROR,
+            message=message,
+        ))
+        self._log("ERROR", f"Failed to process {job.filename}: {message}")
+
+    def _apply_isolated_event(self, job: JobItem, event: dict) -> bool:
+        event_type = event.get("type")
+        if event_type == "log":
+            self._log(
+                str(event.get("level", "INFO")),
+                str(event.get("message", "")),
+            )
+            return False
+        if event_type == "progress":
+            raw = event["update"]
+            status = JobStatus(raw["status"])
+            update = ProgressUpdate(
+                job_id=job.id,
+                status=status,
+                progress=float(raw.get("progress", 0.0)),
+                fps=float(raw.get("fps", 0.0)),
+                eta_seconds=float(raw.get("eta_seconds", 0.0)),
+                frames_processed=int(raw.get("frames_processed", 0)),
+                total_frames=int(raw.get("total_frames", 0)),
+                message=str(raw.get("message", "")),
+            )
+            job.status = status
+            self._progress(update)
+            return False
+        if event_type == "fatal":
+            detail = str(event.get("message", "isolated video job failed"))
+            child_traceback = str(event.get("traceback", "")).strip()
+            if child_traceback:
+                detail += "\n" + child_traceback
+            self._log("ERROR", f"Isolated video job failed: {detail}")
+            return False
+        if event_type == "result":
+            job.status = JobStatus(event["status"])
+            return True
+        return False
+
+    def _process_isolated_video_job(self, job: JobItem) -> None:
+        snapshot = job.begin_processing()
+        if snapshot is None:
+            return
+        if self._stop_event.is_set():
+            self._mark_stopped(job)
+            return
+        try:
+            # Preserve the existing image-to-video type switch contract: an SD
+            # image session must not occupy VRAM while the video child runs.
+            self._close_image_session()
+        except Exception as error:
+            self._fail_isolated_video_job(job, str(error))
+            return
+
+        from jasna.gui.video_job_process import (
+            build_video_job_request,
+            parse_event_line,
+            video_job_command,
+            write_video_job_request,
+        )
+
+        settings = self._settings
+        if settings is None:
+            self._fail_isolated_video_job(job, "processor settings are unavailable")
+            return
+
+        result_received = False
+        returncode: int | None = None
+        try:
+            with tempfile.TemporaryDirectory(prefix="jasna-video-job-") as temporary:
+                request_path = Path(temporary) / "request.json"
+                request = build_video_job_request(
+                    job,
+                    snapshot,
+                    settings,
+                    output_folder=self._output_folder,
+                    output_pattern=self._output_pattern,
+                    preserve_input_structure=self._preserve_input_structure,
+                    disable_basicvsrpp_tensorrt=(
+                        self._disable_basicvsrpp_tensorrt_for_run
+                    ),
+                )
+                write_video_job_request(request_path, request)
+                environment = os.environ.copy()
+                environment.pop("JASNA_MAIN_PID", None)
+                environment["PYTHONUNBUFFERED"] = "1"
+                process = subprocess.Popen(
+                    video_job_command(request_path),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                    env=environment,
+                    start_new_session=True,
+                )
+                with self._isolated_process_lock:
+                    self._isolated_process = process
+                if self.is_paused():
+                    self._send_isolated_command(
+                        {"command": "set_paused", "paused": True}
+                    )
+                if self._stop_event.is_set():
+                    self._send_isolated_command({"command": "stop"})
+                    self._start_isolated_stop_reaper()
+
+                assert process.stdout is not None
+                for raw_line in process.stdout:
+                    line = raw_line.rstrip("\r\n")
+                    try:
+                        event = parse_event_line(line)
+                        if event is None:
+                            if line:
+                                self._log("WARNING", f"[video worker] {line}")
+                            continue
+                        result_received = self._apply_isolated_event(job, event) or result_received
+                    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                        self._log(
+                            "ERROR",
+                            f"Invalid isolated video job event: {error}: {line}",
+                        )
+                returncode = process.wait()
+        except Exception as error:
+            if self._stop_event.is_set():
+                self._mark_stopped(job)
+            else:
+                self._fail_isolated_video_job(job, str(error))
+            return
+        finally:
+            with self._isolated_process_lock:
+                process = self._isolated_process
+                self._isolated_process = None
+            if process is not None:
+                for stream in (process.stdin, process.stdout):
+                    if stream is None:
+                        continue
+                    try:
+                        stream.close()
+                    except (BrokenPipeError, OSError, ValueError):
+                        logger.debug(
+                            "Could not close isolated video job pipe",
+                            exc_info=True,
+                        )
+
+        if self._stop_event.is_set() and not result_received:
+            self._mark_stopped(job)
+        elif returncode != 0:
+            self._fail_isolated_video_job(
+                job,
+                f"isolated video job exited with code {returncode}",
+            )
+        elif not result_received:
+            self._fail_isolated_video_job(
+                job,
+                "isolated video job exited without a final result",
+            )
+
     def _mark_stopped(self, job: JobItem):
         job.status = JobStatus.PENDING
         self._progress(ProgressUpdate(
@@ -446,7 +727,7 @@ class Processor:
             disable_basicvsrpp_tensorrt=self._disable_basicvsrpp_tensorrt_for_run,
             log=lambda msg: self._log("INFO", msg),
         )
-        self._log("INFO", "Restoration models loaded (reused across video jobs)")
+        self._log("INFO", "Restoration models loaded")
 
     def _build_encoder_settings(self, codec: str) -> dict:
         # Built per job (not cached in the video session) so a codec change

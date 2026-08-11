@@ -17,7 +17,12 @@ from jasna.accelerator import (
     vendor_for_device,
 )
 from jasna.media import VideoMetadata, resolve_video_start_pts
-from jasna.media.rocdecode import RocDecodeError, RocDecoder, rocdecode_supported_codec
+from jasna.media.rocdecode import (
+    RocDecodeError,
+    RocDecoder,
+    is_terminal_rocdecode_error,
+    rocdecode_supported_codec,
+)
 from jasna.media.yuv_to_rgb import YuvToRgbConverter
 
 log = logging.getLogger(__name__)
@@ -494,6 +499,10 @@ class NvidiaVideoReader:
                         self.frame_stride,
                     )
                 except (OSError, RuntimeError, ValueError, RocDecodeError) as exc:
+                    if is_terminal_rocdecode_error(exc):
+                        raise VideoDecodeError(
+                            f"rocDecode entered a fatal runtime state for {self.file}: {exc}"
+                        ) from exc
                     if backend == "rocdecode":
                         raise VideoDecodeError(f"rocDecode cannot open {self.file}: {exc}") from exc
                     log.warning(
@@ -797,6 +806,12 @@ class NvidiaVideoReader:
                         last_pts = pts[-1]
                 return
             except (OSError, RuntimeError, ValueError, RocDecodeError) as exc:
+                if is_terminal_rocdecode_error(exc):
+                    source.close()
+                    self._rocdecode_source = None
+                    raise VideoDecodeError(
+                        f"rocDecode entered a fatal runtime state for {self.file}: {exc}"
+                    ) from exc
                 if getattr(self, "_decode_backend", DECODE_BACKEND) == "rocdecode":
                     raise VideoDecodeError(f"rocDecode failed for {self.file}: {exc}") from exc
                 log.warning(

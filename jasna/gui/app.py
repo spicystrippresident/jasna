@@ -28,7 +28,7 @@ from jasna.engine_paths import UNET4X_ONNX_ENC_PATH
 from jasna.gui.control_bar import ControlBar
 from jasna.gui.log_panel import LogPanel
 from jasna.gui.log_filter import runtime_log_level_for_filter
-from jasna.gui.processor import Processor, ProgressUpdate
+from jasna.gui.processor import Processor, ProgressUpdate, _is_linux_amd_runtime
 from jasna.gui.models import JobStatus, PresetManager
 from jasna.gui.locales import get_locale, t, LANGUAGE_NAMES
 from jasna.gui.font_backend import (
@@ -374,6 +374,7 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
             on_progress=self._on_processor_progress,
             on_log=self._on_processor_log,
             on_complete=self._on_processor_complete,
+            video_job_isolation="linux-amd",
         )
 
     def _log_startup_timing(self):
@@ -385,6 +386,11 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
         )
 
     def _start_cuda_warmup(self):
+        # A HIP context in the long-lived GUI keeps native video mappings alive.
+        # Linux AMD video jobs initialize the GPU only inside their child process.
+        if _is_linux_amd_runtime():
+            return
+
         def _run():
             try:
                 _warm_up_cuda()

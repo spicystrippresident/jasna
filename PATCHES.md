@@ -137,6 +137,31 @@ settings request it. A same-process stress run opened, encoded and closed 16
 consecutive 8K CQP sessions (192 frames) in 38.706 seconds without creating PA,
 leaking an output, or crashing.
 
+## Linux AMD per-video process isolation
+
+A later eight-file GUI batch exhausted VRAM inside rocDecode/HIP. The ROCm SDK
+helper logged a failed `rocDecParseVideoData()` call but returned normally, so
+the bridge kept feeding packets and produced an error storm while AMDGPU was
+already rejecting command submissions. Jasna now patches a temporary build
+copy of that helper to throw the SDK exception, includes the patch revision in
+the native-library cache key, and rejects an unknown upstream source shape.
+`ROCDEC_RUNTIME_ERROR` is terminal for the current GPU context; ordinary seek
+or timestamp failures still retain the exact-PTS PyAV recovery path.
+
+Every Linux AMD GUI video now runs its complete scan and render in a fresh
+child process. Progress, logs, pause and stop remain connected to the parent,
+while child exit releases rocDecode, AMF and HIP state before the next queued
+file. An unexpected child exit fails only that file. The long-lived GUI skips
+its HIP warm-up; Windows, NVIDIA and still-image processing keep their existing
+in-process behavior.
+
+Acceptance ran the real 8192x4096, 60000/1001, 1201-frame SAVR test clip as
+three consecutive isolated jobs. VRAM returned to 1.896, 1.907 and 1.886 GB
+after each child against a 1.917 GB baseline. All outputs retained 1201 frames
+and 20.0367 seconds and completed full software decode. The test window added
+no rocDecode parse storm, HIP out-of-memory report or AMDGPU command-submission
+memory error.
+
 The removed toolbox runtime remains recoverable from
 `/home/latiao/vr_toolbox_jasna_linux/migration_archive_vr_remove_mosaic_linux_20260802.tar.zst`
 (SHA-256 `0b9794d17ac6de0789142b6e19f8f2cfaba2344aba74be13aa63227ce82f4555`).
