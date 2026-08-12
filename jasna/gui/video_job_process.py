@@ -217,10 +217,13 @@ def run_video_job_file(
         ).start()
         processor._run()
         completed.set()
-        _emit_event(
-            output_stream,
-            {"type": "result", "status": job.status.value},
-        )
+        result = {"type": "result", "status": job.status.value}
+        if job.status.value == JobStatus.COMPLETED.value:
+            output_path = processor.completed_output_path(job.id)
+            if output_path is None:
+                raise RuntimeError("completed video job did not record its output path")
+            result["output_path"] = str(output_path)
+        _emit_event(output_stream, result)
         return 0
     except Exception as error:
         _emit_event(

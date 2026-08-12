@@ -7,6 +7,8 @@ import subprocess
 import threading
 from unittest.mock import MagicMock
 
+import pytest
+
 from jasna.gui.models import AppSettings, JobItem, JobStatus
 from jasna.gui.processor import Processor
 from jasna.gui.video_job_process import EVENT_PREFIX
@@ -16,7 +18,7 @@ def _event(payload: dict) -> str:
     return EVENT_PREFIX + json.dumps(payload) + "\n"
 
 
-def _completed_output(job_id: int) -> str:
+def _completed_output(job_id: int, output_path: Path | None = None) -> str:
     return "".join(
         (
             _event(
@@ -39,7 +41,17 @@ def _completed_output(job_id: int) -> str:
                     },
                 }
             ),
-            _event({"type": "result", "status": "completed"}),
+            _event(
+                {
+                    "type": "result",
+                    "status": "completed",
+                    **(
+                        {"output_path": str(output_path)}
+                        if output_path is not None
+                        else {}
+                    ),
+                }
+            ),
         )
     )
 
@@ -116,7 +128,12 @@ def _processor(tmp_path: Path, jobs: list[JobItem]) -> Processor:
     processor._settings = AppSettings()
     processor._output_folder = str(tmp_path / "output")
     processor._output_pattern = "{original}_restored.mp4"
+    processor._validate_isolated_completed_output = lambda *_args, **_kwargs: None
     return processor
+
+
+def _canonical_output(tmp_path: Path, job: JobItem) -> Path:
+    return tmp_path / "output" / f"{job.path.stem}_restored.mp4"
 
 
 def test_linux_amd_batch_uses_a_fresh_process_for_every_video(
@@ -125,7 +142,10 @@ def test_linux_amd_batch_uses_a_fresh_process_for_every_video(
     import jasna.gui.processor as module
 
     jobs = [JobItem(path=tmp_path / "a.mp4"), JobItem(path=tmp_path / "b.mp4")]
-    processes = [_FakeProcess(_completed_output(job.id)) for job in jobs]
+    processes = [
+        _FakeProcess(_completed_output(job.id, _canonical_output(tmp_path, job)))
+        for job in jobs
+    ]
     popen = MagicMock(side_effect=processes)
     monkeypatch.setattr(module, "_is_linux_amd_runtime", lambda: True)
     monkeypatch.setattr(module.subprocess, "Popen", popen)
@@ -166,7 +186,8 @@ def test_linux_amd_batch_skips_only_existing_preserved_output(
         JobItem(path=completed_source, input_root=input_root),
         JobItem(path=pending_source, input_root=input_root),
     ]
-    process = _FakeProcess(_completed_output(jobs[1].id))
+    pending_output = output_root / "pending" / "clip_restored.mp4"
+    process = _FakeProcess(_completed_output(jobs[1].id, pending_output))
     popen = MagicMock(return_value=process)
     monkeypatch.setattr(module, "_is_linux_amd_runtime", lambda: True)
     monkeypatch.setattr(module.subprocess, "Popen", popen)
@@ -197,7 +218,9 @@ def test_linux_amd_batch_keeps_flat_auto_rename_when_structure_is_disabled(
     (output_root / "clip_restored.mp4").touch()
 
     job = JobItem(path=source, input_root=input_root)
-    process = _FakeProcess(_completed_output(job.id))
+    process = _FakeProcess(
+        _completed_output(job.id, output_root / "clip_restored (1).mp4")
+    )
     popen = MagicMock(return_value=process)
     monkeypatch.setattr(module, "_is_linux_amd_runtime", lambda: True)
     monkeypatch.setattr(module.subprocess, "Popen", popen)
@@ -217,7 +240,9 @@ def test_unexpected_child_exit_fails_only_that_job_and_batch_continues(
     jobs = [JobItem(path=tmp_path / "bad.mp4"), JobItem(path=tmp_path / "good.mp4")]
     processes = [
         _FakeProcess("native crash output\n", returncode=9),
-        _FakeProcess(_completed_output(jobs[1].id)),
+        _FakeProcess(
+            _completed_output(jobs[1].id, _canonical_output(tmp_path, jobs[1]))
+        ),
     ]
     monkeypatch.setattr(module, "_is_linux_amd_runtime", lambda: True)
     monkeypatch.setattr(module.subprocess, "Popen", MagicMock(side_effect=processes))
@@ -235,7 +260,10 @@ def test_child_stdin_broken_during_cleanup_does_not_abort_batch(
     import jasna.gui.processor as module
 
     jobs = [JobItem(path=tmp_path / "first.mp4"), JobItem(path=tmp_path / "next.mp4")]
-    processes = [_FakeProcess(_completed_output(job.id)) for job in jobs]
+    processes = [
+        _FakeProcess(_completed_output(job.id, _canonical_output(tmp_path, job)))
+        for job in jobs
+    ]
     processes[0].stdin = _BrokenClosePipe()
     monkeypatch.setattr(module, "_is_linux_amd_runtime", lambda: True)
     monkeypatch.setattr(
@@ -251,6 +279,137 @@ def test_child_stdin_broken_during_cleanup_does_not_abort_batch(
         JobStatus.COMPLETED,
         JobStatus.COMPLETED,
     ]
+
+
+def test_completed_child_without_output_path_is_rejected(monkeypatch, tmp_path) -> None:
+    import jasna.gui.processor as module
+
+    job = JobItem(path=tmp_path / "clip.mp4")
+    monkeypatch.setattr(module, "_is_linux_amd_runtime", lambda: True)
+    monkeypatch.setattr(
+        module.subprocess,
+        "Popen",
+        MagicMock(return_value=_FakeProcess(_completed_output(job.id))),
+    )
+
+    processor = _processor(tmp_path, [job])
+    processor._run()
+
+    assert job.status is JobStatus.ERROR
+
+
+def test_completed_child_outside_expected_folder_is_rejected(
+    monkeypatch, tmp_path
+) -> None:
+    import jasna.gui.processor as module
+
+    job = JobItem(path=tmp_path / "clip.mp4")
+    outside = tmp_path / "other" / "clip_restored.mp4"
+    monkeypatch.setattr(module, "_is_linux_amd_runtime", lambda: True)
+    monkeypatch.setattr(
+        module.subprocess,
+        "Popen",
+        MagicMock(return_value=_FakeProcess(_completed_output(job.id, outside))),
+    )
+
+    processor = _processor(tmp_path, [job])
+    processor._run()
+
+    assert job.status is JobStatus.ERROR
+
+
+def test_auto_rename_child_cannot_claim_preexisting_canonical_output(
+    monkeypatch, tmp_path
+) -> None:
+    import jasna.gui.processor as module
+
+    job = JobItem(path=tmp_path / "clip.mp4")
+    canonical = _canonical_output(tmp_path, job)
+    canonical.parent.mkdir(parents=True)
+    canonical.touch()
+    monkeypatch.setattr(module, "_is_linux_amd_runtime", lambda: True)
+    monkeypatch.setattr(
+        module.subprocess,
+        "Popen",
+        MagicMock(return_value=_FakeProcess(_completed_output(job.id, canonical))),
+    )
+
+    processor = _processor(tmp_path, [job])
+    processor._run()
+
+    assert job.status is JobStatus.ERROR
+
+
+@pytest.mark.parametrize(
+    ("file_conflict", "reported_name"),
+    [
+        ("overwrite", "clip_restored.mp4"),
+        ("auto_rename", "clip_restored (1).mp4"),
+    ],
+)
+def test_child_cannot_claim_unchanged_preexisting_output(
+    monkeypatch,
+    tmp_path,
+    file_conflict,
+    reported_name,
+) -> None:
+    import jasna.gui.processor as module
+
+    job = JobItem(path=tmp_path / "clip.mp4")
+    output = tmp_path / "output" / reported_name
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b"old completed output")
+    if file_conflict == "auto_rename":
+        _canonical_output(tmp_path, job).write_bytes(b"canonical output")
+    monkeypatch.setattr(module, "_is_linux_amd_runtime", lambda: True)
+    monkeypatch.setattr(
+        module.subprocess,
+        "Popen",
+        MagicMock(return_value=_FakeProcess(_completed_output(job.id, output))),
+    )
+
+    processor = _processor(tmp_path, [job])
+    processor._settings = AppSettings(file_conflict=file_conflict)
+
+    def require_fresh_output(
+        _input_path,
+        output_path,
+        *,
+        previous_fingerprint,
+        **_kwargs,
+    ):
+        processor._require_completed_output_changed(
+            output_path,
+            previous_fingerprint,
+        )
+
+    processor._validate_isolated_completed_output = require_fresh_output
+    processor._run()
+
+    assert job.status is JobStatus.ERROR
+
+
+def test_child_completed_progress_waits_for_parent_validation(
+    monkeypatch, tmp_path
+) -> None:
+    import jasna.gui.processor as module
+
+    job = JobItem(path=tmp_path / "clip.mp4")
+    output = _canonical_output(tmp_path, job)
+    updates = []
+    process = _FakeProcess(_completed_output(job.id, output))
+    monkeypatch.setattr(module, "_is_linux_amd_runtime", lambda: True)
+    monkeypatch.setattr(module.subprocess, "Popen", MagicMock(return_value=process))
+
+    processor = _processor(tmp_path, [job])
+    processor._on_progress = updates.append
+    processor._run()
+
+    assert [update.status for update in updates[-2:]] == [
+        JobStatus.PROCESSING,
+        JobStatus.COMPLETED,
+    ]
+    assert [update.progress for update in updates[-2:]] == [99.9, 100.0]
 
 
 def test_pause_and_stop_commands_are_forwarded_to_child() -> None:

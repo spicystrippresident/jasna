@@ -178,6 +178,9 @@ def test_child_emits_progress_and_result_without_running_queue_action(
             )
             self._on_complete()
 
+        def completed_output_path(self, _job_id):
+            return tmp_path / "out" / "clip.mkv"
+
     monkeypatch.setattr(processor_module, "Processor", FakeProcessor)
     monkeypatch.setattr(video_job_module, "is_frozen", lambda: True)
     monkeypatch.setattr("jasna._frozen.patch_frozen_torch", frozen_patch)
@@ -203,6 +206,7 @@ def test_child_emits_progress_and_result_without_running_queue_action(
         "result",
     ]
     assert events[-1]["status"] == "completed"
+    assert events[-1]["output_path"] == str(tmp_path / "out" / "clip.mkv")
     frozen_patch.assert_called_once_with()
     assert captured_settings[0].post_export_action == "none"
     assert captured_settings[0].post_export_command == ""

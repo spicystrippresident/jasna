@@ -330,6 +330,7 @@ def test_processor_one_click_mode_scans_then_uses_native_segments(tmp_path) -> N
     with (
         patch.object(processor, "_scan_one_click_vr", return_value=plan) as scan,
         patch.object(processor, "_run_pipeline") as run_pipeline,
+        patch.object(processor, "_validate_completed_video_output"),
         patch("jasna.gui.processor._cleanup_torch"),
     ):
         processor._process_job(job)
@@ -454,6 +455,7 @@ def test_processor_one_click_mode_honors_manual_ranges(tmp_path) -> None:
     with (
         patch.object(processor, "_scan_one_click_vr") as scan,
         patch.object(processor, "_run_pipeline") as run_pipeline,
+        patch.object(processor, "_validate_completed_video_output"),
         patch("jasna.gui.processor._cleanup_torch"),
     ):
         processor._process_job(job)

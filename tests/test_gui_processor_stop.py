@@ -24,7 +24,12 @@ def _processor_with_job(tmp_path, run_pipeline):
     processor._settings = AppSettings()
     processor._output_folder = str(tmp_path)
     processor._output_pattern = "{original}_restored.mp4"
+    processor._validate_completed_video_output = lambda *_args, **_kwargs: None
     return processor, job, updates
+
+
+def _accept_completed_video(processor):
+    processor._validate_completed_video_output = lambda *_args, **_kwargs: None
 
 
 def test_stopped_job_leaves_processing_state(tmp_path):
@@ -67,6 +72,52 @@ def test_completed_job_stays_completed(tmp_path):
     assert updates[-1].status is JobStatus.COMPLETED
 
 
+def test_pipeline_return_without_output_is_not_completed(tmp_path):
+    processor, job, updates = _processor_with_job(
+        tmp_path,
+        lambda job_id, input_path, output_path, **kwargs: None,
+    )
+
+    def reject_missing(_input_path, output_path, **_kwargs):
+        if not output_path.is_file():
+            raise RuntimeError("completed output is missing")
+
+    processor._validate_completed_video_output = reject_missing
+    processor._run()
+
+    assert job.status is JobStatus.ERROR
+    assert updates[-1].status is JobStatus.ERROR
+
+
+def test_overwrite_pipeline_cannot_claim_unchanged_preexisting_output(tmp_path):
+    existing = tmp_path / "clip_restored.mp4"
+    existing.write_bytes(b"old completed output")
+    processor, job, updates = _processor_with_job(
+        tmp_path,
+        lambda job_id, input_path, output_path, **kwargs: None,
+    )
+    processor._settings = AppSettings(file_conflict="overwrite")
+
+    def require_fresh_output(
+        _input_path,
+        output_path,
+        *,
+        previous_fingerprint,
+        **_kwargs,
+    ):
+        processor._require_completed_output_changed(
+            output_path,
+            previous_fingerprint,
+        )
+
+    processor._validate_completed_video_output = require_fresh_output
+    processor._run()
+
+    assert job.status is JobStatus.ERROR
+    assert updates[-1].status is JobStatus.ERROR
+    assert "not created or changed" in updates[-1].message
+
+
 def test_folder_job_preserves_relative_output_structure(tmp_path):
     input_root = tmp_path / "input"
     source = input_root / "studio" / "series" / "clip.mkv"
@@ -84,6 +135,7 @@ def test_folder_job_preserves_relative_output_structure(tmp_path):
     processor._output_folder = str(output_root)
     processor._output_pattern = "{original}_restored.mp4"
     processor._preserve_input_structure = True
+    _accept_completed_video(processor)
 
     processor._run()
 
@@ -107,6 +159,7 @@ def test_folder_job_stays_flat_when_structure_option_is_disabled(tmp_path):
     processor._settings = AppSettings()
     processor._output_folder = str(output_root)
     processor._output_pattern = "{original}_restored.mp4"
+    _accept_completed_video(processor)
 
     processor._run()
 
@@ -132,6 +185,7 @@ def test_folder_job_skips_existing_nested_output(tmp_path):
     processor._output_folder = str(tmp_path / "output")
     processor._output_pattern = "{original}_restored.mp4"
     processor._preserve_input_structure = True
+    _accept_completed_video(processor)
 
     processor._run()
 
@@ -158,6 +212,7 @@ def test_folder_job_overwrites_existing_nested_output_when_selected(tmp_path):
     processor._output_folder = str(tmp_path / "output")
     processor._output_pattern = "{original}_restored.mp4"
     processor._preserve_input_structure = True
+    _accept_completed_video(processor)
 
     processor._run()
 
@@ -184,6 +239,7 @@ def test_flat_folder_job_auto_renames_existing_output(tmp_path):
     processor._settings = AppSettings()
     processor._output_folder = str(output_root)
     processor._output_pattern = "{original}_restored.mp4"
+    _accept_completed_video(processor)
 
     processor._run()
 

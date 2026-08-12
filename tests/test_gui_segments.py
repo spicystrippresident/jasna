@@ -45,6 +45,7 @@ def test_processor_passes_frozen_segments_to_video_job(tmp_path) -> None:
 
     with (
         patch.object(processor, "_run_pipeline") as run_pipeline,
+        patch.object(processor, "_validate_completed_video_output"),
         patch("jasna.gui.processor._cleanup_torch"),
     ):
         processor._process_job(job)

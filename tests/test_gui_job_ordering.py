@@ -58,7 +58,10 @@ class TestProcessorPullLoop:
         def fake_pipeline(job_id, inp, out):
             processed_ids.append(job_id)
 
-        with patch.object(p, "_run_pipeline", side_effect=fake_pipeline):
+        with (
+            patch.object(p, "_run_pipeline", side_effect=fake_pipeline),
+            patch.object(p, "_validate_completed_video_output"),
+        ):
             p.start(
                 jobs,
                 AppSettings(),
@@ -85,7 +88,10 @@ class TestProcessorPullLoop:
                 # Simulate GUI removing b.mp4 while a is processing
                 del jobs[1]
 
-        with patch.object(p, "_run_pipeline", side_effect=fake_pipeline):
+        with (
+            patch.object(p, "_run_pipeline", side_effect=fake_pipeline),
+            patch.object(p, "_validate_completed_video_output"),
+        ):
             p.start(
                 jobs,
                 AppSettings(),
@@ -104,7 +110,10 @@ class TestProcessorPullLoop:
         p = Processor(on_progress=lambda u: updates.append(u))
         jobs = _make_jobs("a.mp4")
 
-        with patch.object(p, "_run_pipeline"):
+        with (
+            patch.object(p, "_run_pipeline"),
+            patch.object(p, "_validate_completed_video_output"),
+        ):
             p.start(
                 jobs,
                 AppSettings(),
@@ -136,7 +145,10 @@ class TestProcessorPullLoop:
                     idx_c = jobs.index(pending[1])
                     jobs[idx_b], jobs[idx_c] = jobs[idx_c], jobs[idx_b]
 
-        with patch.object(p, "_run_pipeline", side_effect=fake_pipeline):
+        with (
+            patch.object(p, "_run_pipeline", side_effect=fake_pipeline),
+            patch.object(p, "_validate_completed_video_output"),
+        ):
             p.start(
                 jobs,
                 AppSettings(),
