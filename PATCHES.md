@@ -640,6 +640,48 @@ MCE records, and events emitted after a hard reset remain an operator-side
 investigation using `journalctl` and pstore after restart; the run log cannot
 capture those kernel-only MCE events itself.
 
+## Durable final-output completion
+
+A later batch exposed a separate crash-consistency gap. Jasna logged
+`Finished processing` for `4k2.me@savr01061_1_8k.mp4`, began scanning the next
+file about two seconds later, and the platform then reset with the already known
+CPU Bank 27/Data Fabric Machine Check. The visible final output did not exist
+after reboot. Its hidden 6,188,808,593-byte smart-render temporary contained an
+`ftyp` atom followed by one `mdat` extending to EOF, but no `moov` atom. Both
+verified smart-render fragments still matched their manifest hashes, so the
+expensive restoration work was recovered by repeating only concat/audio muxing.
+
+The old runtime ordering was blocking FFmpeg, `os.replace`, then immediate GUI
+success. It proved FFmpeg and rename had returned to user space, but it did not
+prove that the MP4 trailer or NTFS metadata was valid and durable. Smart-render
+finalization now opens the hidden output after FFmpeg returns, checks its video
+stream, codec and duration against the source, and performs a bounded seek/read
+near the video tail. It then fsyncs the file, atomically replaces the final path,
+reopens and fsyncs the committed name, fsyncs the destination directory on
+POSIX, and validates the final path again. Reopening the committed name provides
+the post-rename barrier on Windows, where directory fsync is unavailable.
+The hidden output is no longer unconditionally deleted on FFmpeg, validation,
+sync or rename failure; verified span workspaces remain available for recovery.
+
+Full-render videos receive the same bounded structure/tail validation plus file
+and directory durability barriers before the GUI marks them complete. This runs
+once per file after encoding and does not enter frame processing. Linux AMD
+isolated children now report the exact selected output path. The parent holds a
+child `completed` progress event at 99.9%, verifies the path is the canonical
+name or a permitted same-directory auto-rename, independently validates the
+media, and only then emits final 100% completion and advances the batch. Missing,
+corrupt, outside-directory and stale pre-existing outputs fail the current job.
+
+The recovered 6.19 GB final MP4 passed the bounded production validation; the
+retained pre-recovery file without `moov` was rejected. A real NTFS3 probe on the
+output volume passed file fsync, atomic replace and directory fsync. Focused
+media, processor, isolation, one-click, workspace and splice regressions passed
+217 tests. Root full-suite acceptance passed 2,054 tests with 119 skipped and no
+MCE, Data Fabric, AMDGPU reset, NTFS3 or I/O error in the concurrent kernel log.
+This change cannot prevent or repair a hardware Machine Check. It prevents false
+success, improves crash consistency, and preserves enough work to remux instead
+of repeating AI restoration.
+
 Focused tests use fake streams/clocks, fake proc/sysfs trees, and headless GUI
 fakes. They validate the output/config paths, disabled mode, queue overflow,
 flush/sync cadence and forced close, fail-open creation/sync failures,

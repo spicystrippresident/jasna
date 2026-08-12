@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 _ISOLATED_STOP_GRACE_SECONDS = 5.0
 _ISOLATED_TERMINATE_GRACE_SECONDS = 1.0
+_OutputFingerprint = tuple[int, int, int, int, int, int]
 
 
 @dataclass
@@ -108,6 +109,7 @@ class Processor:
         self._isolated_process: subprocess.Popen[str] | None = None
         self._isolated_process_lock = threading.Lock()
         self._isolated_stop_reaper: threading.Thread | None = None
+        self._completed_output_paths: dict[int, Path] = {}
         
     def start(
         self,
@@ -128,6 +130,7 @@ class Processor:
         self._output_pattern = output_pattern
         self._preserve_input_structure = bool(preserve_input_structure)
         self._disable_basicvsrpp_tensorrt_for_run = bool(disable_basicvsrpp_tensorrt)
+        self._completed_output_paths.clear()
         
         self._stop_event.clear()
         self._pause_event.set()
@@ -175,6 +178,84 @@ class Processor:
             (job for job in self._jobs if job.status is JobStatus.PROCESSING),
             None,
         )
+
+    def completed_output_path(self, job_id: int) -> Path | None:
+        return self._completed_output_paths.get(int(job_id))
+
+    def _validate_completed_video_output(
+        self,
+        input_path: Path,
+        output_path: Path,
+        *,
+        codec: str,
+        smart_render: bool,
+        previous_fingerprint: _OutputFingerprint | None,
+    ) -> None:
+        from jasna.media.splice import (
+            sync_and_validate_final_output,
+            validate_video_output,
+        )
+
+        self._require_completed_output_changed(output_path, previous_fingerprint)
+        if smart_render:
+            # Smart-render muxing already performs its durability barriers before
+            # the recoverable span workspace is removed.
+            validate_video_output(output_path, source=input_path)
+        else:
+            sync_and_validate_final_output(
+                output_path,
+                source=input_path,
+                expected_codec=codec,
+            )
+
+    def _validate_isolated_completed_output(
+        self,
+        input_path: Path,
+        output_path: Path,
+        *,
+        codec: str | None,
+        previous_fingerprint: _OutputFingerprint | None,
+    ) -> None:
+        from jasna.media.splice import validate_video_output
+
+        self._require_completed_output_changed(output_path, previous_fingerprint)
+        validate_video_output(
+            output_path,
+            source=input_path,
+            expected_codec=codec,
+        )
+
+    @staticmethod
+    def _output_fingerprint(path: Path) -> _OutputFingerprint | None:
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            return None
+        return (
+            int(info.st_mode),
+            int(info.st_dev),
+            int(info.st_ino),
+            int(info.st_size),
+            int(info.st_mtime_ns),
+            int(info.st_ctime_ns),
+        )
+
+    @classmethod
+    def _require_completed_output_changed(
+        cls,
+        output_path: Path,
+        previous_fingerprint: _OutputFingerprint | None,
+    ) -> None:
+        current_fingerprint = cls._output_fingerprint(output_path)
+        if current_fingerprint is None:
+            raise ValueError(f"completed output is missing: {output_path}")
+        if (
+            previous_fingerprint is not None
+            and current_fingerprint == previous_fingerprint
+        ):
+            raise ValueError(
+                f"completed output was not created or changed by this job: {output_path}"
+            )
 
     def isolated_worker_pid(self) -> int | None:
         """Expose the isolated child PID for parent-side diagnostics only."""
@@ -419,9 +500,11 @@ class Processor:
                 self._log("INFO", f"Renamed output to {output_path.name} to avoid overwrite")
             # "overwrite" - just proceed and let the file be replaced
         
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
         try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            previous_output_fingerprint = (
+                self._output_fingerprint(output_path) if not is_image else None
+            )
             if is_image and job_settings.processing_mode == "one_click_vr":
                 raise OneClickVrSkipped("One-click VR accepts video inputs only")
             if is_image:
@@ -489,9 +572,17 @@ class Processor:
                 **pipeline_options,
             )
             if not is_image:
-                self._run_post_export_video_command(input_path, output_path)
-
+                self._validate_completed_video_output(
+                    input_path,
+                    output_path,
+                    codec=job_settings.codec,
+                    smart_render=bool(segments),
+                    previous_fingerprint=previous_output_fingerprint,
+                )
+            self._completed_output_paths[job.id] = output_path.resolve()
             job.output_path = output_path
+            if not is_image:
+                self._run_post_export_video_command(input_path, output_path)
             job.status = JobStatus.COMPLETED
             self._progress(ProgressUpdate(
                 job_id=job.id,
@@ -574,7 +665,7 @@ class Processor:
         ))
         self._log("ERROR", f"Failed to process {job.filename}: {message}")
 
-    def _apply_isolated_event(self, job: JobItem, event: dict) -> bool:
+    def _apply_isolated_event(self, job: JobItem, event: dict) -> dict | bool:
         event_type = event.get("type")
         if event_type == "log":
             self._log(
@@ -585,10 +676,12 @@ class Processor:
         if event_type == "progress":
             raw = event["update"]
             status = JobStatus(raw["status"])
+            if status is JobStatus.COMPLETED:
+                status = JobStatus.PROCESSING
             update = ProgressUpdate(
                 job_id=job.id,
                 status=status,
-                progress=float(raw.get("progress", 0.0)),
+                progress=min(99.9, float(raw.get("progress", 0.0))),
                 fps=float(raw.get("fps", 0.0)),
                 eta_seconds=float(raw.get("eta_seconds", 0.0)),
                 frames_processed=int(raw.get("frames_processed", 0)),
@@ -606,9 +699,69 @@ class Processor:
             self._log("ERROR", f"Isolated video job failed: {detail}")
             return False
         if event_type == "result":
-            job.status = JobStatus(event["status"])
-            return True
+            return event
         return False
+
+    def _validate_isolated_output_path(
+        self,
+        job: JobItem,
+        raw_path: object,
+        *,
+        file_conflict: str,
+        preexisting_outputs: dict[Path, _OutputFingerprint],
+    ) -> Path:
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            raise ValueError("isolated video job did not report its completed output path")
+        output = Path(raw_path).expanduser().resolve()
+        canonical_path = self._final_output_path(job).expanduser()
+        canonical = canonical_path.parent.resolve() / canonical_path.name
+        if output.parent != canonical.parent:
+            raise ValueError("isolated video job reported an output outside the expected folder")
+        if output == canonical and not (
+            file_conflict == "auto_rename" and canonical in preexisting_outputs
+        ):
+            return output
+        if file_conflict != "auto_rename" or not self._is_auto_renamed_output(
+            canonical,
+            output,
+        ):
+            raise ValueError("isolated video job reported an unexpected output filename")
+        return output
+
+    @staticmethod
+    def _is_auto_renamed_output(canonical: Path, output: Path) -> bool:
+        counter_text = output.stem[len(canonical.stem) + 2 : -1]
+        return (
+            output.parent == canonical.parent
+            and output.suffix == canonical.suffix
+            and output.stem.startswith(f"{canonical.stem} (")
+            and output.stem.endswith(")")
+            and counter_text.isdigit()
+            and str(int(counter_text)) == counter_text
+            and 1 <= int(counter_text) <= 9999
+        )
+
+    def _snapshot_isolated_output_candidates(
+        self,
+        canonical_path: Path,
+    ) -> dict[Path, _OutputFingerprint]:
+        canonical = canonical_path.parent.resolve() / canonical_path.name
+        candidates = [canonical]
+        try:
+            candidates.extend(
+                candidate.resolve()
+                for candidate in canonical.parent.iterdir()
+                if self._is_auto_renamed_output(canonical, candidate)
+            )
+        except FileNotFoundError:
+            pass
+
+        fingerprints = {}
+        for candidate in candidates:
+            fingerprint = self._output_fingerprint(candidate)
+            if fingerprint is not None:
+                fingerprints[candidate] = fingerprint
+        return fingerprints
 
     def _process_isolated_video_job(self, job: JobItem) -> None:
         snapshot = job.begin_processing()
@@ -622,11 +775,22 @@ class Processor:
         if settings is None:
             self._fail_isolated_video_job(job, "processor settings are unavailable")
             return
+        canonical_output = self._final_output_path(job)
         if self._skip_existing_final_output(
             job,
-            self._final_output_path(job),
+            canonical_output,
             file_conflict=settings.file_conflict,
         ):
+            return
+        try:
+            preexisting_outputs = self._snapshot_isolated_output_candidates(
+                canonical_output
+            )
+        except OSError as error:
+            self._fail_isolated_video_job(
+                job,
+                f"could not inspect the output folder: {error}",
+            )
             return
 
         try:
@@ -644,7 +808,8 @@ class Processor:
             write_video_job_request,
         )
 
-        result_received = False
+        result_event: dict | None = None
+        protocol_error: str | None = None
         returncode: int | None = None
         try:
             with tempfile.TemporaryDirectory(prefix="jasna-video-job-") as temporary:
@@ -695,8 +860,13 @@ class Processor:
                             if line:
                                 self._log("WARNING", f"[video worker] {line}")
                             continue
-                        result_received = self._apply_isolated_event(job, event) or result_received
+                        applied_result = self._apply_isolated_event(job, event)
+                        if isinstance(applied_result, dict):
+                            if result_event is not None:
+                                raise ValueError("isolated video job emitted multiple final results")
+                            result_event = applied_result
                     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                        protocol_error = str(error)
                         self._log(
                             "ERROR",
                             f"Invalid isolated video job event: {error}: {line}",
@@ -724,18 +894,66 @@ class Processor:
                             exc_info=True,
                         )
 
-        if self._stop_event.is_set() and not result_received:
+        if self._stop_event.is_set() and result_event is None:
             self._mark_stopped(job)
         elif returncode != 0:
             self._fail_isolated_video_job(
                 job,
                 f"isolated video job exited with code {returncode}",
             )
-        elif not result_received:
+        elif protocol_error is not None:
+            self._fail_isolated_video_job(
+                job,
+                f"invalid isolated video job protocol: {protocol_error}",
+            )
+        elif result_event is None:
             self._fail_isolated_video_job(
                 job,
                 "isolated video job exited without a final result",
             )
+        else:
+            try:
+                status = JobStatus(result_event["status"])
+            except (KeyError, TypeError, ValueError) as error:
+                self._fail_isolated_video_job(
+                    job,
+                    f"invalid isolated video job result: {error}",
+                )
+                return
+            if status is not JobStatus.COMPLETED:
+                job.status = status
+                return
+            try:
+                output_path = self._validate_isolated_output_path(
+                    job,
+                    result_event.get("output_path"),
+                    file_conflict=settings.file_conflict,
+                    preexisting_outputs=preexisting_outputs,
+                )
+                self._validate_isolated_completed_output(
+                    job.path,
+                    output_path,
+                    codec=(
+                        None
+                        if snapshot.segments
+                        or settings.processing_mode == "one_click_vr"
+                        else settings.codec
+                    ),
+                    previous_fingerprint=preexisting_outputs.get(output_path),
+                )
+            except Exception as error:
+                self._fail_isolated_video_job(
+                    job,
+                    f"completed output validation failed: {error}",
+                )
+                return
+            self._completed_output_paths[job.id] = output_path
+            job.status = JobStatus.COMPLETED
+            self._progress(ProgressUpdate(
+                job_id=job.id,
+                status=JobStatus.COMPLETED,
+                progress=100.0,
+            ))
 
     def _mark_stopped(self, job: JobItem):
         job.status = JobStatus.PENDING
