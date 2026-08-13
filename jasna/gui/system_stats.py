@@ -13,6 +13,7 @@ _DRM_CLASS_PATH = Path("/sys/class/drm")
 class SystemStats:
     gpu_util: int | None
     vram_util: int | None
+    total_vram_bytes: int | None
     ram_util: int
     cpu_util: int
 
@@ -26,7 +27,7 @@ def _clamp_pct(value: float) -> int:
     return v
 
 
-def _parse_nvidia_smi_csv_line(line: str) -> tuple[int, int]:
+def _parse_nvidia_smi_csv_line(line: str) -> tuple[int, int, int]:
     parts = [p.strip() for p in (line or "").split(",")]
     if len(parts) < 3:
         raise ValueError(f"Unexpected nvidia-smi output: {line!r}")
@@ -36,10 +37,11 @@ def _parse_nvidia_smi_csv_line(line: str) -> tuple[int, int]:
     if mem_total <= 0:
         raise ValueError(f"Unexpected nvidia-smi total memory: {mem_total!r}")
     vram_util = _clamp_pct((mem_used / mem_total) * 100.0)
-    return gpu_util, vram_util
+    total_vram_bytes = int(mem_total * 1024 * 1024)
+    return gpu_util, vram_util, total_vram_bytes
 
 
-def _read_amd_sysfs() -> tuple[int | None, int | None]:
+def _read_amd_sysfs() -> tuple[int | None, int | None, int | None]:
     for card in sorted(_DRM_CLASS_PATH.glob("card[0-9]*")):
         device = card / "device"
         try:
@@ -54,13 +56,13 @@ def _read_amd_sysfs() -> tuple[int | None, int | None]:
             used = int((device / "mem_info_vram_used").read_text(encoding="utf-8"))
             total = int((device / "mem_info_vram_total").read_text(encoding="utf-8"))
             vram_util = _clamp_pct((used / total) * 100.0) if total > 0 else None
-            return gpu_util, vram_util
+            return gpu_util, vram_util, total
         except (OSError, ValueError):
             continue
-    return None, None
+    return None, None, None
 
 
-def read_gpu_vram() -> tuple[int | None, int | None]:
+def read_gpu_vram() -> tuple[int | None, int | None, int | None]:
     exe_path = os_utils.find_executable("nvidia-smi")
     if exe_path is None:
         return _read_amd_sysfs()
@@ -80,20 +82,20 @@ def read_gpu_vram() -> tuple[int | None, int | None]:
             **os_utils.subprocess_no_window_kwargs(),
         )
     except (subprocess.TimeoutExpired, OSError):
-        return None, None
+        return None, None, None
 
     if completed.returncode != 0:
-        return None, None
+        return None, None, None
 
     lines = (completed.stdout or "").splitlines()
     first = next((ln for ln in lines if ln.strip()), "")
     if first == "":
-        return None, None
+        return None, None, None
 
     try:
         return _parse_nvidia_smi_csv_line(first)
     except ValueError:
-        return None, None
+        return None, None, None
 
 
 def read_cpu_ram() -> tuple[int, int]:
@@ -105,10 +107,11 @@ def read_cpu_ram() -> tuple[int, int]:
 
 def read_system_stats() -> SystemStats:
     cpu_util, ram_util = read_cpu_ram()
-    gpu_util, vram_util = read_gpu_vram()
+    gpu_util, vram_util, total_vram_bytes = read_gpu_vram()
     return SystemStats(
         gpu_util=gpu_util,
         vram_util=vram_util,
+        total_vram_bytes=total_vram_bytes,
         ram_util=ram_util,
         cpu_util=cpu_util,
     )

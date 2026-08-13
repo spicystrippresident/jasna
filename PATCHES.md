@@ -502,6 +502,30 @@ change: the earlier run used QVBR while the later run used stable
 47.556 Mbps. A future whole-title comparison requires the same current
 rate-control policy on both sides.
 
+## 24 GB GUI RF-DETR v6 batch default
+
+The GUI now derives its hidden detection batch from lightweight total-VRAM
+telemetry. RF-DETR v6 uses batch 8 on GPUs reporting at least 23 GiB, a
+threshold that accepts 24 GB boards whose drivers reserve a small amount of
+the advertised capacity. Smaller GPUs and failed telemetry stay at batch 4.
+RF-DETR v6-large, fixed-batch v5, and YOLO models also stay at batch 4 because
+their batch-8 memory and output behavior have not passed this validation. CLI
+`--batch-size` remains explicitly user-controlled and defaults to 4.
+
+The comparison used the same real 8192x4096 59.94 fps SAVR mosaic window,
+forced SBS Fisheye routing, RF-DETR v6 FP16, rocDecode, HEVC AMF, and
+`max_clip_size=180`. Batch 8 versus 4 reduced wall time from 141.854 to 134.751
+seconds on the Main 10/P010 input (5.27%) and from 122.927 to 116.863 seconds on
+the 8-bit/NV12 input (5.19%). Peak system VRAM was 21.036 GiB for 10-bit and
+16.702 GiB for 8-bit on the 24 GB RX 7900 XTX. All six comparison outputs kept
+1202/1202 frames, exact display-order PTS, source bit depth, and passed full
+software decode without OOM, PTS mismatch, rocDecode, AMF, or fallback errors.
+
+The GUI's existing manual preset Save/Create behavior is unchanged. Detection
+batch is not exposed as a setting and is ignored when deciding whether a
+preset is modified, so legacy presets containing the old hidden value 4 do not
+disable the hardware-derived runtime choice.
+
 ## Native rocDecode reader for large AMD inputs
 
 Linux AMD now keeps container demux and integer packet timestamps in PyAV while
