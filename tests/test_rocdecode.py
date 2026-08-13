@@ -65,6 +65,36 @@ def test_forced_rocdecode_backend_selects_native_source(monkeypatch) -> None:
     factory.assert_called_once()
 
 
+def test_forced_rocdecode_passes_reusable_decoder_to_native_source(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(module, "DECODE_BACKEND", "rocdecode")
+    source = SimpleNamespace(width=16, height=16)
+    factory = MagicMock(return_value=source)
+    monkeypatch.setattr(module, "_RocDecodeFrameSource", factory)
+    monkeypatch.setattr(module, "rocdecode_supported_codec", lambda _codec: True)
+    reusable = MagicMock()
+    reader = _reader(monkeypatch, AcceleratorVendor.AMD)
+    reader.reusable_rocdecoder = reusable
+
+    assert reader.__enter__() is reader
+
+    assert factory.call_args.args[-1] is reusable
+
+
+def test_vali_does_not_receive_reusable_rocdecode_slot(monkeypatch) -> None:
+    monkeypatch.setattr(module, "DECODE_BACKEND", "vali")
+    source = SimpleNamespace(width=16, height=16)
+    factory = MagicMock(return_value=source)
+    monkeypatch.setattr(module, "_ValiFrameSource", factory)
+    reader = _reader(monkeypatch, AcceleratorVendor.NVIDIA)
+    reader.reusable_rocdecoder = MagicMock()
+
+    assert reader.__enter__() is reader
+
+    assert len(factory.call_args.args) == 5
+
+
 def test_auto_rocdecode_open_failure_permanently_uses_pyav(monkeypatch, caplog) -> None:
     monkeypatch.setattr(module, "DECODE_BACKEND", "auto")
     monkeypatch.setattr(module, "ROCDECODE_AUTO_ENABLED", True)
@@ -229,12 +259,15 @@ def _source(frame_pts: list[int], *, stride: int = 1):
     source.width = 16
     source.height = 16
     source._full_range = False
+    source._reusable_decoder = None
+    source._active_frames = None
     source._used = False
     source.container = MagicMock()
     source.video_stream = SimpleNamespace(start_time=0, time_base=Fraction(1, 30))
     source.bitstream_filter = None
-    source._decode_counts = lambda: iter([len(frame_pts), 0])
+    source._packets = lambda: iter([SimpleNamespace(pts=0, dts=0)])
     source.decoder = MagicMock()
+    source.decoder.decode.side_effect = [len(frame_pts), 0]
     pending_pts = iter(frame_pts)
 
     def next_frame(*_args):
@@ -291,6 +324,70 @@ def test_rocdecode_source_seek_reanchors_stride(monkeypatch) -> None:
 
     assert [pts for _batch, pts in batches] == [[30, 32]]
     source.container.seek.assert_called_once_with(30, stream=source.video_stream, backward=True)
+
+
+def test_rocdecode_source_close_drains_current_batch_and_ends_sequence(
+    monkeypatch,
+) -> None:
+    converter = MagicMock()
+    monkeypatch.setattr(module, "YuvToRgbConverter", MagicMock(return_value=converter))
+    monkeypatch.setattr(
+        module, "current_stream", lambda _device: SimpleNamespace(synchronize=lambda: None)
+    )
+    source = _source([0, 1, 2, 3, 4], stride=1)
+    source.batch_size = 2
+    source.decoder.decode.side_effect = [4, 1]
+    decoder = source.decoder
+
+    frames = source.frames(None)
+    _batch, pts = next(frames)
+    assert pts == [0, 1]
+
+    source.close()
+
+    assert source.decoder is None
+    assert source._active_frames is None
+    assert source.container is None
+    assert converter.convert_into.call_count == 2
+    assert decoder.decode.call_count == 2
+    assert decoder.drop_frame.call_count == 3
+    decoder.close.assert_called_once()
+
+
+def test_reusable_rocdecoder_reuses_one_native_decoder(monkeypatch) -> None:
+    native = MagicMock()
+    factory = MagicMock(return_value=native)
+    monkeypatch.setattr(module, "RocDecoder", factory)
+    reusable = module.ReusableRocDecoder()
+
+    first = reusable.acquire(0, "hevc")
+    with pytest.raises(RocDecodeError, match="already in use"):
+        reusable.acquire(0, "hevc")
+    reusable.release(first)
+    second = reusable.acquire(0, "HEVC")
+    reusable.release(second)
+    reusable.close()
+
+    assert first is second is native
+    factory.assert_called_once_with(0, "hevc")
+    native.close.assert_called_once()
+
+
+def test_reusable_rocdecoder_discards_failed_native_decoder(monkeypatch) -> None:
+    first = MagicMock()
+    second = MagicMock()
+    factory = MagicMock(side_effect=[first, second])
+    monkeypatch.setattr(module, "RocDecoder", factory)
+    reusable = module.ReusableRocDecoder()
+
+    reusable.release(reusable.acquire(0, "hevc"), discard=True)
+    replacement = reusable.acquire(0, "hevc")
+    reusable.release(replacement)
+    reusable.close()
+
+    assert replacement is second
+    first.close.assert_called_once()
+    second.close.assert_called_once()
 
 
 def test_rocdecode_source_rejects_surface_contract_change(monkeypatch) -> None:

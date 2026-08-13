@@ -12,7 +12,7 @@ import torch
 from jasna.blend_buffer import BlendBuffer
 from jasna.crop_buffer import CropBuffer
 from jasna.frame_queue import FrameQueue
-from jasna.media.video_decoder import NvidiaVideoReader
+from jasna.media.video_decoder import NvidiaVideoReader, ReusableRocDecoder
 from jasna.pipeline_debug_logging import PipelineDebugMemoryLogger
 from jasna.pipeline_items import ClipRestoreItem, FrameMeta, PrimaryRestoreResult, SecondaryRestoreResult, _SENTINEL
 from jasna.pipeline_processing import process_frame_batch, finalize_processing
@@ -88,6 +88,7 @@ class _PtsAlignedFrameReader:
         frame_stride: int,
         seek_ts: float | None,
         cancel_event: threading.Event | None,
+        reusable_rocdecoder: ReusableRocDecoder | None = None,
     ) -> None:
         self.input_video = input_video
         self.batch_size = int(batch_size)
@@ -96,6 +97,7 @@ class _PtsAlignedFrameReader:
         self.frame_stride = int(frame_stride)
         self.seek_ts = seek_ts
         self.cancel_event = cancel_event
+        self.reusable_rocdecoder = reusable_rocdecoder
         self._reader: NvidiaVideoReader | None = None
         self._frames = None
         self._retry_backend: str | None = None
@@ -116,7 +118,9 @@ class _PtsAlignedFrameReader:
 
     def close(self) -> None:
         reader, self._reader = self._reader, None
-        self._frames = None
+        frames, self._frames = self._frames, None
+        if frames is not None and hasattr(frames, "close"):
+            frames.close()
         if reader is not None:
             reader.__exit__(None, None, None)
 
@@ -129,8 +133,13 @@ class _PtsAlignedFrameReader:
             metadata=self.metadata,
             frame_stride=self.frame_stride,
             decode_backend=decode_backend,
+            reusable_rocdecoder=self.reusable_rocdecoder,
         )
-        entered = reader.__enter__()
+        try:
+            entered = reader.__enter__()
+        except BaseException:
+            reader.__exit__(None, None, None)
+            raise
         self._reader = reader
         self._frames = self._flat_frames(entered, seek_ts)
         self._stream_start_pts = int(entered.start_pts)
@@ -290,6 +299,7 @@ def decode_detect_loop(
     vr_mode: str = "off",
     vr_projector=None,
     fisheye_mask_geometry: bool = False,
+    reusable_rocdecoder: ReusableRocDecoder | None = None,
 ) -> None:
     timer = LoopTimer("decode-detect")
     try:
@@ -310,6 +320,7 @@ def decode_detect_loop(
                 device=device,
                 metadata=metadata,
                 frame_stride=frame_stride,
+                reusable_rocdecoder=reusable_rocdecoder,
             ) as reader,
             torch.inference_mode(),
         ):
@@ -716,6 +727,7 @@ def blend_encode_loop(
     seek_ts: float | None = None,
     frame_stride: int = 1,
     vram_offloader=None,
+    reusable_rocdecoder: ReusableRocDecoder | None = None,
 ) -> None:
     timer = LoopTimer("blend-encode")
     try:
@@ -729,6 +741,7 @@ def blend_encode_loop(
             frame_stride=frame_stride,
             seek_ts=seek_ts,
             cancel_event=cancel_event,
+            reusable_rocdecoder=reusable_rocdecoder,
         ) as reader2:
             secondary_done = False
             frames_encoded = 0

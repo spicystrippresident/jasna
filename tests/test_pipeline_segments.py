@@ -122,6 +122,62 @@ def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_pat
     mux.assert_called_once()
 
 
+def test_smart_run_reuses_two_rocdecode_slots_across_render_spans(tmp_path) -> None:
+    pipeline = object.__new__(Pipeline)
+    pipeline.input_video = tmp_path / "input.mp4"
+    pipeline.input_video.write_bytes(b"source")
+    pipeline.output_video = tmp_path / "output.mp4"
+    pipeline.codec = "h264"
+    pipeline.encoder_settings = {"cq": 22}
+    pipeline.device = torch.device("cuda:0")
+    pipeline.disable_progress = True
+    pipeline.progress_callback = None
+    pipeline.lut_path = None
+    pipeline.sharpen_strength = 0.0
+    pipeline.retarget_high_fps = False
+    pipeline.segments = (SegmentRange(1.0, 1.5), SegmentRange(3.0, 3.5))
+    pipeline.working_dir = None
+    pipeline._cancel_event = threading.Event()
+    pipeline._run_pass = MagicMock()
+
+    metadata = MagicMock(
+        video_fps=30.0,
+        video_fps_exact=Fraction(30, 1),
+        duration=5.0,
+        profile="Main",
+    )
+    index = KeyframeIndex((0, 60, 120), Fraction(1, 30), 0, 150)
+    pipeline.splice_plan = SplicePlan(
+        index=index,
+        spans=(
+            SpliceSpan("render", 0, 60, ((30, 45),)),
+            SpliceSpan("copy", 60, 90),
+            SpliceSpan("render", 90, 150, ((90, 105),)),
+        ),
+        segments=pipeline.segments,
+    )
+    slots = (MagicMock(), MagicMock())
+
+    with (
+        patch("jasna.pipeline.validate_smart_render", return_value="h264"),
+        patch("jasna.pipeline.vendor_for_device", return_value=AcceleratorVendor.AMD),
+        patch("jasna.pipeline.NvidiaVideoEncoder"),
+        patch("jasna.pipeline.ReusableRocDecoder", side_effect=slots),
+        patch("jasna.pipeline.create_copy_fragment", side_effect=_write_copy_fragment),
+        patch("jasna.pipeline.normalize_fragment", side_effect=_write_normalized),
+        patch("jasna.pipeline.mux_fragments_final_output"),
+    ):
+        pipeline._run_smart(metadata)
+
+    assert pipeline._run_pass.call_count == 2
+    assert all(
+        call.kwargs["reusable_rocdecoders"] == slots
+        for call in pipeline._run_pass.call_args_list
+    )
+    for slot in slots:
+        slot.close.assert_called_once()
+
+
 def test_linux_amd_hevc_smart_run_signs_and_encodes_source_level(tmp_path) -> None:
     pipeline = object.__new__(Pipeline)
     pipeline.input_video = tmp_path / "input.mp4"

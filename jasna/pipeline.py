@@ -21,6 +21,7 @@ from jasna.media.video_encoder import (
     NvidiaVideoEncoder,
     add_amd_hevc_smart_fragment_source_level,
 )
+from jasna.media.video_decoder import ReusableRocDecoder
 from jasna.media.frame_rate import resolve_frame_rate_retarget
 from jasna.media.splice import (
     SplicePlan,
@@ -405,6 +406,9 @@ class Pipeline:
         end_pts: int | None = None,
         effect_ranges: tuple[tuple[int, int], ...] | None = None,
         output_frame_count: int | None = None,
+        reusable_rocdecoders: tuple[
+            ReusableRocDecoder, ReusableRocDecoder
+        ] | None = None,
     ) -> None:
         device = self.device
         secondary_workers = max(1, int(self.restoration_pipeline.secondary_num_workers))
@@ -531,6 +535,11 @@ class Pipeline:
                     vr_projector=self._vr_projector,
                     fisheye_mask_geometry=self._vr_resolution.fisheye_mask_geometry,
                     cancel_event=self._cancel_event,
+                    reusable_rocdecoder=(
+                        reusable_rocdecoders[0]
+                        if reusable_rocdecoders is not None
+                        else None
+                    ),
                 ),
                 name="DecodeDetect", daemon=True,
             ),
@@ -563,6 +572,11 @@ class Pipeline:
                     frame_stride=frame_rate.frame_stride,
                     seek_ts=seek_ts,
                     cancel_event=self._cancel_event,
+                    reusable_rocdecoder=(
+                        reusable_rocdecoders[1]
+                        if reusable_rocdecoders is not None
+                        else None
+                    ),
                 ),
                 name="BlendEncode", daemon=True,
             ),
@@ -625,6 +639,22 @@ class Pipeline:
                 f"Unsupported color space: {metadata.color_space!r} in {self.input_video.name}. "
                 "Only BT.709, BT.601, and BT.2020 non-constant-luminance are supported."
             )
+
+    @staticmethod
+    def _system_vram_used_bytes() -> int | None:
+        """Return Linux DRM's total VRAM reading when it is available."""
+        if os.name == "nt":
+            return None
+        try:
+            values = [
+                int(path.read_text(encoding="ascii").strip())
+                for path in Path("/sys/class/drm").glob(
+                    "card*/device/mem_info_vram_used"
+                )
+            ]
+        except (OSError, ValueError):
+            return None
+        return max(values, default=None)
 
     def _run_full(self, metadata) -> None:
         frame_rate = resolve_frame_rate_retarget(
@@ -765,6 +795,10 @@ class Pipeline:
             output=self.output_video,
             signature=signature,
         )
+        reusable_rocdecoders = (
+            ReusableRocDecoder(),
+            ReusableRocDecoder(),
+        )
 
         try:
             fragments: list[tuple[Path, float]] = []
@@ -814,7 +848,15 @@ class Pipeline:
                         end_pts=span.end_pts,
                         effect_ranges=span.effect_ranges,
                         output_frame_count=expected_frames,
+                        reusable_rocdecoders=reusable_rocdecoders,
                     )
+                    system_vram = self._system_vram_used_bytes()
+                    if system_vram is not None:
+                        log.info(
+                            "Smart-render span %d system VRAM after render: %.1f MiB",
+                            span_index,
+                            system_vram / (1024 ** 2),
+                        )
                     if self._cancel_event.is_set():
                         return
                     normalize_fragment(
@@ -869,6 +911,8 @@ class Pipeline:
             except OSError:
                 log.warning("Could not clean completed smart-render workspace %s", workspace.path)
         finally:
+            for reusable_decoder in reusable_rocdecoders:
+                reusable_decoder.close()
             progress.close(ensure_completed_bar=True)
 
     def run(self) -> None:
