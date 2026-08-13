@@ -6,11 +6,13 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import wave
 from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
 
 import av
+import numpy as np
 import pytest
 import torch
 
@@ -94,6 +96,119 @@ def _make_source(
     cmd.append(str(out))
     subprocess.run(cmd, check=True)
     return out
+
+
+def _make_count_only_stereo_pcm_source(tmp_path: Path) -> Path:
+    duration = 0.5
+    sample_rate = 48_000
+    audio = tmp_path / "count-only-stereo.wav"
+    with wave.open(str(audio), "wb") as wav:
+        wav.setnchannels(2)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(bytes(int(duration * sample_rate) * 2 * 2))
+
+    source = tmp_path / "count-only-stereo.mkv"
+    subprocess.run(
+        [
+            resolve_executable("ffmpeg"),
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            f"testsrc2=size=256x256:rate=12:duration={duration}",
+            "-guess_layout_max",
+            "0",
+            "-i",
+            str(audio),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "copy",
+            str(source),
+        ],
+        check=True,
+    )
+    return source
+
+
+def _make_rich_source(tmp_path: Path) -> Path:
+    base = _make_source(tmp_path, "rich-base.mkv")
+    subtitle = tmp_path / "rich-subtitle.srt"
+    subtitle.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nOpening subtitle\n",
+        encoding="utf-8",
+    )
+    attachment = tmp_path / "rich-font.txt"
+    attachment.write_bytes(b"font payload")
+    ffmetadata = tmp_path / "rich-chapters.ffmeta"
+    ffmetadata.write_text(
+        ";FFMETADATA1\n"
+        "title=Source title\n"
+        "[CHAPTER]\n"
+        "TIMEBASE=1/1000\n"
+        "START=0\n"
+        "END=1000\n"
+        "title=Opening\n"
+        "[CHAPTER]\n"
+        "TIMEBASE=1/1000\n"
+        "START=1000\n"
+        "END=2000\n"
+        "title=Main\n",
+        encoding="utf-8",
+    )
+    source = tmp_path / "rich-source.mkv"
+    cmd = [
+        resolve_executable("ffmpeg"),
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        str(base),
+        "-f",
+        "ffmetadata",
+        "-i",
+        str(ffmetadata),
+        "-i",
+        str(subtitle),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0",
+        "-map",
+        "2:s:0",
+        "-map_metadata",
+        "1",
+        "-map_chapters",
+        "1",
+        "-metadata:s:v:0",
+        "language=jpn",
+        "-metadata:s:s:0",
+        "language=pol",
+        "-metadata:s:s:0",
+        "title=Signs",
+        "-disposition:s:0",
+        "default+forced",
+        "-c",
+        "copy",
+        "-c:s",
+        "srt",
+        "-attach",
+        str(attachment),
+        "-metadata:s:t:0",
+        "mimetype=text/plain",
+        str(source),
+    ]
+    subprocess.run(cmd, check=True)
+    return source
 
 
 def _transcode(src: Path, dst: Path, codec: str = "hevc") -> None:
@@ -338,6 +453,80 @@ def test_container_metadata_and_audio_language_copied(tmp_path):
     with av.open(str(dst)) as c:
         assert c.metadata.get("title") == "jasna-test"
         assert c.streams.audio[0].metadata.get("language") == "pol"
+
+
+@pytest.mark.parametrize(
+    ("suffix", "expected_subtitle_codec", "expected_attachments"),
+    [(".mkv", "srt", 1), (".mp4", "mov_text", 0)],
+)
+def test_container_structure_preserved(
+    tmp_path,
+    suffix,
+    expected_subtitle_codec,
+    expected_attachments,
+):
+    src = _make_rich_source(tmp_path)
+    dst = tmp_path / f"rich-output{suffix}"
+
+    _transcode(src, dst)
+
+    with av.open(str(dst)) as container:
+        assert container.metadata["title"] == "Source title"
+        assert [chapter["metadata"]["title"] for chapter in container.chapters()] == [
+            "Opening",
+            "Main",
+        ]
+        assert container.streams.video[0].metadata["language"] == "jpn"
+        assert len(container.streams.audio) == 1
+        assert len(container.streams.subtitles) == 1
+        output_subtitle = container.streams.subtitles[0]
+        assert output_subtitle.codec_context.name == expected_subtitle_codec
+        assert output_subtitle.metadata["language"] == "pol"
+        assert (
+            output_subtitle.metadata.get("title")
+            or output_subtitle.metadata.get("name")
+        ) == "Signs"
+        assert output_subtitle.disposition.default
+        assert output_subtitle.disposition.forced
+        subtitle_text = b"".join(
+            getattr(rect, "ass", b"") + getattr(rect, "text", b"")
+            for packet in container.demux(output_subtitle)
+            if packet.size
+            for rect in packet.decode()
+        )
+        assert b"Opening subtitle" in subtitle_text
+        assert len(container.streams.attachments) == expected_attachments
+        if expected_attachments:
+            output_attachment = container.streams.attachments[0]
+            assert output_attachment.name == "rich-font.txt"
+            assert output_attachment.mimetype == "text/plain"
+            assert output_attachment.data == b"font payload"
+
+
+def test_count_only_stereo_pcm_copies_to_mp4_with_explicit_layout(tmp_path):
+    src = _make_count_only_stereo_pcm_source(tmp_path)
+    dst = tmp_path / "out.mp4"
+
+    with av.open(str(src)) as container:
+        audio = container.streams.audio[0]
+        assert audio.codec_context.layout.name == "2 channels"
+        source_samples = np.concatenate(
+            [frame.to_ndarray() for frame in container.decode(audio)], axis=1
+        )
+
+    _transcode(src, dst, codec="h264")
+
+    with av.open(str(dst)) as container:
+        audio = container.streams.audio[0]
+        assert audio.codec_context.name == "pcm_s16le"
+        assert audio.codec_context.layout.name == "stereo"
+        output_samples = np.concatenate(
+            [frame.to_ndarray() for frame in container.decode(audio)], axis=1
+        )
+
+    assert np.array_equal(output_samples, source_samples)
+    data = dst.read_bytes()
+    assert data.index(b"moov") < data.index(b"mdat")
 
 
 def test_faststart_moov_before_mdat(tmp_path):

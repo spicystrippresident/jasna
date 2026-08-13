@@ -3,6 +3,7 @@ from __future__ import annotations
 from fractions import Fraction
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import av
 import numpy as np
@@ -15,6 +16,7 @@ from jasna.media.splice import (
     _commit_smart_output,
     _fsync_file,
     create_copy_fragment,
+    mux_final_output,
     mux_fragments_final_output,
     normalize_fragment,
     probe_keyframes,
@@ -395,3 +397,244 @@ def test_mixed_encoder_splice_decodes_with_exact_duration_and_audio(
         source_frames = [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
     for frame_index in [*range(12), *range(24, 36)]:
         assert np.array_equal(output_frames[frame_index], source_frames[frame_index])
+
+
+@pytest.mark.parametrize(
+    ("suffix", "expected_subtitle_codec", "expected_attachments"),
+    [(".mkv", "srt", 1), (".mp4", "mov_text", 0)],
+)
+def test_final_mux_preserves_compatible_source_structure(
+    tmp_path: Path,
+    suffix: str,
+    expected_subtitle_codec: str,
+    expected_attachments: int,
+) -> None:
+    subtitle = tmp_path / "subtitle.srt"
+    subtitle.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nOpening subtitle\n",
+        encoding="utf-8",
+    )
+    attachment = tmp_path / "font.txt"
+    attachment.write_bytes(b"font payload")
+    ffmetadata = tmp_path / "chapters.ffmeta"
+    ffmetadata.write_text(
+        ";FFMETADATA1\n"
+        "title=Source title\n"
+        "[CHAPTER]\n"
+        "TIMEBASE=1/1000\n"
+        "START=0\n"
+        "END=1000\n"
+        "title=Opening\n"
+        "[CHAPTER]\n"
+        "TIMEBASE=1/1000\n"
+        "START=1000\n"
+        "END=2000\n"
+        "title=Main\n",
+        encoding="utf-8",
+    )
+    source = tmp_path / "source.mkv"
+    _ffmpeg(
+        "-f", "lavfi", "-i", "testsrc2=size=160x96:rate=12:duration=2",
+        "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000:duration=2",
+        "-f", "ffmetadata", "-i", str(ffmetadata),
+        "-i", str(subtitle),
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-map", "3:s:0",
+        "-map_metadata", "2",
+        "-map_chapters", "2",
+        "-metadata:s:v:0", "language=jpn",
+        "-metadata:s:s:0", "language=pol",
+        "-metadata:s:s:0", "title=Signs",
+        "-disposition:s:0", "default+forced",
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-c:s", "srt",
+        "-attach", str(attachment),
+        "-metadata:s:t:0", "mimetype=text/plain",
+        str(source),
+    )
+    assembled = tmp_path / "assembled.mkv"
+    _ffmpeg(
+        "-i", str(source),
+        "-map", "0:v:0",
+        "-an",
+        "-c:v", "copy",
+        str(assembled),
+    )
+    output = tmp_path / f"output{suffix}"
+
+    mux_final_output(assembled, source, output, codec="h264")
+
+    with av.open(str(output)) as container:
+        assert container.metadata["title"] == "Source title"
+        assert [chapter["metadata"]["title"] for chapter in container.chapters()] == [
+            "Opening",
+            "Main",
+        ]
+        assert container.streams.video[0].metadata["language"] == "jpn"
+        assert len(container.streams.audio) == 1
+        assert len(container.streams.subtitles) == 1
+        assert len(container.streams.attachments) == expected_attachments
+        output_subtitle = container.streams.subtitles[0]
+        assert output_subtitle.codec_context.name == expected_subtitle_codec
+        assert output_subtitle.metadata["language"] == "pol"
+        assert (
+            output_subtitle.metadata.get("title")
+            or output_subtitle.metadata.get("name")
+        ) == "Signs"
+        assert output_subtitle.disposition.default
+        assert output_subtitle.disposition.forced
+        subtitle_text = b"".join(
+            getattr(rect, "ass", b"") + getattr(rect, "text", b"")
+            for packet in container.demux(output_subtitle)
+            if packet.size
+            for rect in packet.decode()
+        )
+        assert b"Opening subtitle" in subtitle_text
+        if expected_attachments:
+            output_attachment = container.streams.attachments[0]
+            assert output_attachment.name == "font.txt"
+            assert output_attachment.mimetype == "text/plain"
+            assert output_attachment.data == b"font payload"
+
+
+def test_final_mux_rebuilds_mp4_chapter_carrier_only_once(tmp_path: Path) -> None:
+    ffmetadata = tmp_path / "chapters.ffmeta"
+    ffmetadata.write_text(
+        ";FFMETADATA1\n"
+        "[CHAPTER]\n"
+        "TIMEBASE=1/1000\n"
+        "START=0\n"
+        "END=1000\n"
+        "title=Opening\n"
+        "[CHAPTER]\n"
+        "TIMEBASE=1/1000\n"
+        "START=1000\n"
+        "END=2000\n"
+        "title=Main\n",
+        encoding="utf-8",
+    )
+    source = tmp_path / "source.mp4"
+    _ffmpeg(
+        "-f", "lavfi", "-i", "testsrc2=size=160x96:rate=12:duration=2",
+        "-f", "ffmetadata", "-i", str(ffmetadata),
+        "-map", "0:v:0",
+        "-map_chapters", "1",
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        str(source),
+    )
+    assembled = tmp_path / "assembled.mp4"
+    _ffmpeg(
+        "-i", str(source),
+        "-map", "0:v:0",
+        "-c:v", "copy",
+        str(assembled),
+    )
+    output = tmp_path / "output.mp4"
+
+    mux_final_output(assembled, source, output, codec="h264")
+
+    with av.open(str(output)) as container:
+        assert [chapter["metadata"]["title"] for chapter in container.chapters()] == [
+            "Opening",
+            "Main",
+        ]
+        assert len(container.streams.data) == 1
+
+
+def test_fragment_mux_maps_source_side_streams_from_the_second_input(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import jasna.media.splice as module
+
+    primary_video = SimpleNamespace(index=0)
+    audio = SimpleNamespace(
+        index=1,
+        type="audio",
+        codec_context=SimpleNamespace(name="aac"),
+    )
+
+    class Streams:
+        video = [primary_video]
+
+        def __iter__(self):
+            return iter([primary_video, audio])
+
+    class SourceContext:
+        streams = Streams()
+        format = SimpleNamespace(name="matroska")
+
+        def chapters(self):
+            return []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class ProbeContext:
+        supported_codecs = frozenset({"aac"})
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        module.av,
+        "open",
+        lambda source, *_args, **_kwargs: (
+            ProbeContext() if not isinstance(source, (str, Path)) else SourceContext()
+        ),
+    )
+
+    args = module._final_mux_args(
+        [
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            "parts.ffconcat",
+            "-i",
+            "input.mkv",
+        ],
+        tmp_path / "input.mkv",
+        tmp_path / "output.mkv",
+        codec="h264",
+        source_input_index=1,
+    )
+
+    assert args[:10] == [
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        "parts.ffconcat",
+        "-i",
+        "input.mkv",
+        "-map",
+        "0:v:0",
+    ]
+    assert args[10:] == [
+        "-map",
+        "1:1",
+        "-map_metadata",
+        "1",
+        "-map_metadata:s:v:0",
+        "1:s:v:0",
+        "-map_chapters",
+        "1",
+        "-c",
+        "copy",
+        "-map_metadata:s:1",
+        "1:s:1",
+        "-c:a:0",
+        "copy",
+    ]

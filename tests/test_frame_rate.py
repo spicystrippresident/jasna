@@ -44,6 +44,29 @@ def test_other_frame_rates_are_unchanged(source: Fraction):
     assert retarget.output_fps == source
 
 
+def test_near_standard_container_rate_is_halved_without_losing_its_time_base():
+    """ffprobe can report 19001/317 for 59.94 fps footage with drifting timestamps."""
+    source = Fraction(19_001, 317)
+
+    retarget = resolve_frame_rate_retarget(source, enabled=True, measured_fps=59.94)
+
+    assert retarget.active is True
+    assert retarget.frame_stride == 2
+    assert retarget.output_fps == Fraction(19_001, 634)
+    assert retarget.rate_mismatch is False
+
+
+def test_rate_outside_the_standard_source_tolerance_is_not_halved():
+    source = Fraction(59, 1)
+
+    retarget = resolve_frame_rate_retarget(source, enabled=True, measured_fps=59.0)
+
+    assert retarget.active is False
+    assert retarget.frame_stride == 1
+    assert retarget.output_fps == source
+    assert retarget.rate_mismatch is False
+
+
 def test_disabled_retarget_keeps_60_fps():
     retarget = resolve_frame_rate_retarget(Fraction(60, 1), enabled=False, measured_fps=60.0)
 

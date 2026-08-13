@@ -531,6 +531,56 @@ The benchmark adapter can bound a scan with `--max-scan-seconds` without
 creating clips or output video. Dual-reader stop and exception paths have
 regressions that require both reader contexts to close.
 
+## Selective upstream v0.10.0 port
+
+Upstream `v0.10.0` was audited commit by commit instead of merged. The local
+Linux AMD branch keeps its rocDecode backend and exact-PTS reopen/retry path,
+one-click VR routing, recoverable smart-render workspace, isolated batch jobs,
+diagnostic logging, durable output commit, and locally measured AMF rate-control
+policy. The selected changes are:
+
+- queue running-state updates return immediately when neither running state nor
+  processing job changed, avoiding repeated Tk widget reconfiguration;
+- 60/59.94 fps retargeting accepts timestamp grids such as `19001/317` within a
+  0.5% source-rate tolerance while retaining the measured-rate guard;
+- the AMD PyAV software-decode fallback owns one device YUV staging plane per
+  batch slot on the current ROCm stream, so a later H2D upload cannot overwrite
+  a plane still consumed by an earlier YUV-to-RGB conversion;
+- ordinary renders and the final smart-render mux preserve compatible container
+  metadata, chapters, stream metadata/dispositions, audio, subtitles, alternate
+  streams, data, and Matroska attachments; unsupported side streams warn and
+  are skipped, and compatible text subtitles are transcoded when required;
+- count-only two-channel audio layouts are normalized to named `stereo` before
+  muxing.
+
+The upstream blocking AMF host-copy change was deliberately rejected. On the
+same real 20-second 8192x4096 SAVR range, the retained path took 117.19 seconds
+and 104.77 seconds on repeat, while the upstream candidate took 128.22 and
+128.89 seconds. Both produced 1201/1201 frames, exact duration and the identical
+encoded-video SHA-256
+`0d2d5418c80ac02c002f34aa7190d08c3f2f8a593222b852257300b71c260ca6`;
+the candidate therefore cost about 15% without changing output. Only the
+independent software-decode staging fix was retained. Its real comparison was
+35.536 seconds at 33.797 fps before and 35.003 seconds at 34.312 fps after, with
+1201 matching PTS and the same sampled-picture digest
+`21d19e4e3c5796abfd4750084e1f108015d4d1dfec299dd85142f9354fc2f88d`.
+
+Container preservation was exercised through the production ROCm/AMF path, not
+only mocks. A rich 8-bit source produced 60/60 exact-PTS frames in both MP4 and
+Matroska, retained AAC, subtitles, chapters, language/title metadata, and kept
+the Matroska attachment. A real 8192x4096 60000/1001 Main10/P010 source produced
+220/220 exact-PTS frames as Main10 `yuv420p10le`, retained AAC, and decoded end
+to end with FFmpeg. `mux_audio=False` excludes audio without suppressing other
+compatible side streams in an ordinary render; smart fragments remain
+video-only by design and the durable final mux restores all compatible side
+streams from the source.
+
+The new upstream video-player/action-menu UI, post-export command execution,
+TVAI additions, release tooling and blanket dependency/build changes were not
+ported. They are independent product features or packaging changes, not fixes
+needed by the current one-click VR route, and importing them would expand the
+GUI/process surface without local validation.
+
 ## Current source-tree verification
 
 On kernel `6.17.0-41-generic`, RX 7900 XTX and ROCm 7.2.1:

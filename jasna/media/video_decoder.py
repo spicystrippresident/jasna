@@ -925,13 +925,21 @@ class NvidiaVideoReader:
         color_range = AvColorRange.JPEG if self._full_range else AvColorRange.MPEG
         H, W = self.height, self.width
 
-        # One packed pinned host batch and one packed device staging frame bound
-        # the fallback's extra memory: H2D copies and conversion kernels are
-        # ordered on the same stream, so the next H2D overwrite of the staging
-        # frame starts only after the prior conversion kernel consumed it.
+        # AMD uses one device YUV plane per batch slot on the current stream.
+        # Under a contended ROCm pipeline, reusing one staging plane can let a
+        # later H2D overwrite race a prior conversion. NVIDIA keeps the older
+        # private-stream/single-staging path.
         pinned = torch.empty((self.batch_size, H + H // 2, W), dtype=dtype, pin_memory=True)
-        staging = torch.empty((H + H // 2, W), dtype=dtype, device=self.device)
-        stream = new_stream(self.device)
+        if self.vendor is AcceleratorVendor.AMD:
+            device_yuv = torch.empty(
+                (self.batch_size, H + H // 2, W), dtype=dtype, device=self.device
+            )
+            staging = None
+            stream = current_stream(self.device)
+        else:
+            device_yuv = None
+            staging = torch.empty((H + H // 2, W), dtype=dtype, device=self.device)
+            stream = new_stream(self.device)
 
         while group:
             batch = torch.empty((len(group), 3, H, W), device=self.device, dtype=torch.uint8)
@@ -962,9 +970,10 @@ class NvidiaVideoReader:
 
             with stream_context(stream):
                 for i in range(len(group)):
-                    staging.copy_(pinned[i], non_blocking=True)
+                    plane = staging if staging is not None else device_yuv[i]
+                    plane.copy_(pinned[i], non_blocking=True)
                     converter.convert_into(
-                        staging[:H], staging[H:].view(H // 2, W // 2, 2), batch[i]
+                        plane[:H], plane[H:].view(H // 2, W // 2, 2), batch[i]
                     )
 
             next_group = self._read_group(decoded)

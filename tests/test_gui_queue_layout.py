@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 import tkinter as tk
 from tkinter import TclError
 
@@ -122,6 +123,100 @@ def test_workspace_sash_cursor_stays_on_the_sash() -> None:
         assert root._settings_panel.cget("cursor") == "arrow"
     finally:
         root.destroy()
+
+
+def _running_state_test_panel(control_updates, row_updates, *, running=None):
+    jobs = [
+        SimpleNamespace(id=index, status=JobStatus.PENDING)
+        for index in range(3)
+    ]
+    widgets = [
+        SimpleNamespace(
+            set_removable=lambda value, index=index: row_updates.append(
+                (index, "removable", value)
+            ),
+            set_segments_editable=lambda value, index=index: row_updates.append(
+                (index, "segments", value)
+            ),
+        )
+        for index in range(3)
+    ]
+
+    def control(name):
+        return SimpleNamespace(
+            configure=lambda **kwargs: control_updates.append((name, kwargs))
+        )
+
+    return SimpleNamespace(
+        _running=running,
+        _processing_job_id=None,
+        _clear_btn=control("clear"),
+        _clear_completed_btn=control("clear_completed"),
+        _output_browse_btn=control("output_browse"),
+        _pattern_entry=control("pattern"),
+        _preserve_structure_checkbox=control("preserve_structure"),
+        _add_files_btn=control("add_files"),
+        _add_folder_btn=control("add_folder"),
+        _jobs=jobs,
+        _job_widgets=widgets,
+        _find_job_index_by_id=lambda job_id: job_id,
+    )
+
+
+def test_repeated_running_state_does_not_reconfigure_queue_rows() -> None:
+    control_updates = []
+    row_updates = []
+    panel = _running_state_test_panel(control_updates, row_updates)
+
+    QueuePanel.set_running(panel, True, processing_job_id=0)
+    control_updates.clear()
+    row_updates.clear()
+
+    QueuePanel.set_running(panel, True, processing_job_id=0)
+
+    assert control_updates == []
+    assert row_updates == []
+
+
+def test_running_state_redraws_when_active_job_changes() -> None:
+    control_updates = []
+    row_updates = []
+    panel = _running_state_test_panel(control_updates, row_updates, running=True)
+
+    QueuePanel.set_running(panel, True, processing_job_id=1)
+
+    assert control_updates
+    assert (0, "removable", True) in row_updates
+    assert (1, "removable", False) in row_updates
+    assert panel._processing_job_id == 1
+
+
+def test_initial_non_running_state_is_applied() -> None:
+    control_updates = []
+    row_updates = []
+    panel = _running_state_test_panel(control_updates, row_updates)
+
+    QueuePanel.set_running(panel, False)
+
+    assert control_updates
+    assert len(row_updates) == 6
+    assert panel._running is False
+    assert panel._processing_job_id is None
+
+
+def test_repeated_non_running_state_does_not_reconfigure_queue_rows() -> None:
+    control_updates = []
+    row_updates = []
+    panel = _running_state_test_panel(control_updates, row_updates)
+
+    QueuePanel.set_running(panel, False)
+    control_updates.clear()
+    row_updates.clear()
+
+    QueuePanel.set_running(panel, False, processing_job_id=0)
+
+    assert control_updates == []
+    assert row_updates == []
 
 
 @pytest.mark.parametrize("hidpi", [1.0, 1.25, 1.5], indirect=True)
