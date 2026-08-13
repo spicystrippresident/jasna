@@ -11,7 +11,7 @@ import pytest
 
 from jasna.gui.models import AppSettings, JobItem, JobStatus
 from jasna.gui.processor import Processor
-from jasna.gui.video_job_process import EVENT_PREFIX
+from jasna.gui.video_job_process import EVENT_PREFIX, build_video_job_request
 
 
 def _event(payload: dict) -> str:
@@ -134,6 +134,26 @@ def _processor(tmp_path: Path, jobs: list[JobItem]) -> Processor:
 
 def _canonical_output(tmp_path: Path, job: JobItem) -> Path:
     return tmp_path / "output" / f"{job.path.stem}_restored.mp4"
+
+
+def test_isolated_video_job_request_preserves_resolved_detection_batch(
+    tmp_path,
+) -> None:
+    job = JobItem(path=tmp_path / "clip.mp4")
+    snapshot = job.begin_processing()
+    assert snapshot is not None
+
+    request = build_video_job_request(
+        job,
+        snapshot,
+        AppSettings(batch_size=8),
+        output_folder=str(tmp_path / "output"),
+        output_pattern="{original}_restored.mp4",
+        preserve_input_structure=False,
+        disable_basicvsrpp_tensorrt=False,
+    )
+
+    assert request["settings"]["batch_size"] == 8
 
 
 def test_linux_amd_batch_uses_a_fresh_process_for_every_video(
