@@ -2,6 +2,7 @@ import ctypes
 import logging
 import os
 import sys
+import threading
 from typing import Iterator
 
 import av
@@ -76,6 +77,60 @@ def _decode_backend() -> str:
             f"expected {_DECODE_BACKENDS}"
         )
     return backend
+
+
+class ReusableRocDecoder:
+    """Keep one rocDecode surface pool alive across sequential readers.
+
+    rocDecode 1.7.0 leaves the VAAPI/HIP surface mappings resident after a
+    decoder is destroyed. Smart rendering used to create two decoders for
+    every render span, so those mappings accumulated for the lifetime of the
+    per-video worker process. A slot lends the same decoder to one reader at a
+    time; each reader still owns its demuxer and bitstream filter.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._decoder: RocDecoder | None = None
+        self._signature: tuple[int, str] | None = None
+        self._in_use = False
+
+    def acquire(self, device_id: int, codec_name: str) -> RocDecoder:
+        signature = (int(device_id), str(codec_name).lower())
+        with self._lock:
+            if self._in_use:
+                raise RocDecodeError("reusable rocDecode decoder is already in use")
+            if self._decoder is not None and self._signature != signature:
+                raise RocDecodeError(
+                    "reusable rocDecode decoder cannot change device or codec"
+                )
+            if self._decoder is None:
+                self._decoder = RocDecoder(*signature)
+                self._signature = signature
+            self._in_use = True
+            return self._decoder
+
+    def release(self, decoder: RocDecoder, *, discard: bool = False) -> None:
+        close_decoder = None
+        with self._lock:
+            if decoder is not self._decoder or not self._in_use:
+                raise RocDecodeError("invalid reusable rocDecode decoder release")
+            self._in_use = False
+            if discard:
+                close_decoder, self._decoder = self._decoder, None
+                self._signature = None
+        if close_decoder is not None:
+            close_decoder.close()
+
+    def close(self) -> None:
+        decoder = None
+        with self._lock:
+            if self._in_use:
+                raise RocDecodeError("cannot close a reusable rocDecode decoder in use")
+            decoder, self._decoder = self._decoder, None
+            self._signature = None
+        if decoder is not None:
+            decoder.close()
 
 
 def _cuda_driver() -> ctypes.CDLL:
@@ -266,6 +321,7 @@ class _RocDecodeFrameSource:
         device: torch.device,
         metadata: VideoMetadata,
         frame_stride: int,
+        reusable_decoder: ReusableRocDecoder | None = None,
     ):
         self.file = file
         self.batch_size = batch_size
@@ -274,6 +330,8 @@ class _RocDecodeFrameSource:
         self.frame_stride = frame_stride
         self.container = None
         self.decoder = None
+        self._reusable_decoder = reusable_decoder
+        self._active_frames = None
         self._used = False
         try:
             self.container = av.open(file)
@@ -285,7 +343,11 @@ class _RocDecodeFrameSource:
                 if filter_name is not None
                 else None
             )
-            self.decoder = RocDecoder(device.index or 0, codec)
+            self.decoder = (
+                reusable_decoder.acquire(device.index or 0, codec)
+                if reusable_decoder is not None
+                else RocDecoder(device.index or 0, codec)
+            )
             self.width = int(metadata.video_width)
             self.height = int(metadata.video_height)
             self._full_range = (
@@ -293,7 +355,7 @@ class _RocDecodeFrameSource:
                 or metadata.color_range == AvColorRange.JPEG
             )
         except BaseException:
-            self.close()
+            self.close(discard_decoder=True)
             raise
 
     @property
@@ -311,16 +373,15 @@ class _RocDecodeFrameSource:
         if self.bitstream_filter is not None:
             yield from self.bitstream_filter.filter(None)
 
-    def _decode_counts(self):
-        for packet in self._packets():
-            packet_pts = packet.pts if packet.pts is not None else packet.dts
-            yield self.decoder.decode(packet, 0 if packet_pts is None else packet_pts)
-        yield self.decoder.decode(None)
-
     def frames(self, seek_ts: float | None) -> Iterator[tuple[torch.Tensor, list[int]]]:
         if self._used:
             raise RocDecodeError("a rocDecode frame source can only be consumed once")
         self._used = True
+        frames = self._frames(seek_ts)
+        self._active_frames = frames
+        return frames
+
+    def _frames(self, seek_ts: float | None) -> Iterator[tuple[torch.Tensor, list[int]]]:
         if seek_ts is not None:
             target_pts = self.start_pts + round(seek_ts / self.video_stream.time_base)
             self.container.seek(target_pts, stream=self.video_stream, backward=True)
@@ -345,11 +406,19 @@ class _RocDecodeFrameSource:
         )
         frame_index = 0
         selected_pts: list[int] = []
+        sequence_ended = False
+        available_remaining = 0
 
-        for available in self._decode_counts():
+        def _consume_available(available: int):
+            nonlocal target_pts, frame_index, selected_pts, available_remaining
+            available_remaining = available
             for _ in range(available):
                 waiting_for_target = target_pts is not None
                 selected = not waiting_for_target and frame_index % self.frame_stride == 0
+                # GetFrame/ReleaseFrame consume one rocDecode output even when
+                # the bridge reports a copy/drop error. Decrement first so the
+                # cleanup path never tries to release that output twice.
+                available_remaining -= 1
                 if not waiting_for_target and not selected:
                     pts, width, height, bit_depth = self.decoder.drop_frame()
                 else:
@@ -379,8 +448,34 @@ class _RocDecodeFrameSource:
                     yield self._convert_group(packed, converter, selected_pts)
                     selected_pts = []
 
-        if selected_pts:
-            yield self._convert_group(packed, converter, selected_pts)
+        try:
+            for packet in self._packets():
+                packet_pts = packet.pts if packet.pts is not None else packet.dts
+                available = self.decoder.decode(
+                    packet,
+                    0 if packet_pts is None else packet_pts,
+                )
+                yield from _consume_available(available)
+            eos_available = self.decoder.decode(None)
+            sequence_ended = True
+            yield from _consume_available(eos_available)
+            if selected_pts:
+                yield self._convert_group(packed, converter, selected_pts)
+                selected_pts = []
+        finally:
+            # A render span normally stops in the middle of the source. End the
+            # current coded sequence and release every returned surface before
+            # lending this decoder to the next span. rocDecode's own multi-file
+            # sample uses the same EOS-then-next-sequence contract.
+            if self.decoder is not None:
+                for _ in range(available_remaining):
+                    self.decoder.drop_frame()
+                available_remaining = 0
+                if not sequence_ended:
+                    available = self.decoder.decode(None)
+                    for _ in range(available):
+                        self.decoder.drop_frame()
+            self._active_frames = None
 
     def _convert_group(self, packed, converter, pts):
         batch = torch.empty(
@@ -398,13 +493,37 @@ class _RocDecodeFrameSource:
         current_stream(self.device).synchronize()
         return batch, list(pts)
 
-    def close(self) -> None:
+    def close(self, *, discard_decoder: bool = False) -> None:
+        close_error = None
+        if self._active_frames is not None:
+            frames, self._active_frames = self._active_frames, None
+            try:
+                frames.close()
+            except BaseException as error:
+                close_error = error
+                discard_decoder = True
         if self.decoder is not None:
             decoder, self.decoder = self.decoder, None
-            decoder.close()
+            try:
+                if self._reusable_decoder is None:
+                    decoder.close()
+                else:
+                    self._reusable_decoder.release(
+                        decoder,
+                        discard=discard_decoder,
+                    )
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
         if self.container is not None:
             container, self.container = self.container, None
-            container.close()
+            try:
+                container.close()
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+        if close_error is not None:
+            raise close_error
 
 
 class NvidiaVideoReader:
@@ -418,6 +537,7 @@ class NvidiaVideoReader:
         frame_stride: int = 1,
         prefer_software_decode: bool = False,
         decode_backend: str | None = None,
+        reusable_rocdecoder: ReusableRocDecoder | None = None,
     ):
         frame_stride = int(frame_stride)
         if frame_stride <= 0:
@@ -429,6 +549,7 @@ class NvidiaVideoReader:
         self.frame_stride = frame_stride
         self.prefer_software_decode = bool(prefer_software_decode)
         self.decode_backend = decode_backend
+        self.reusable_rocdecoder = reusable_rocdecoder
         self.vendor = vendor_for_device(device)
         self._decoder_ctx = None
         self._amd_hardware_decode = False
@@ -497,6 +618,7 @@ class NvidiaVideoReader:
                         self.device,
                         self.metadata,
                         self.frame_stride,
+                        self.reusable_rocdecoder,
                     )
                 except (OSError, RuntimeError, ValueError, RocDecodeError) as exc:
                     if is_terminal_rocdecode_error(exc):
@@ -718,9 +840,11 @@ class NvidiaVideoReader:
             source, self._rocdecode_source = self._rocdecode_source, None
             source.close()
             return
-        self.container.close()
+        container, self.container = getattr(self, "container", None), None
+        if container is not None:
+            container.close()
         self._decoder_ctx = None
-        if self._raw_stream is None:
+        if getattr(self, "_raw_stream", None) is None:
             return
         result = _cuda_driver().cuStreamDestroy(ctypes.c_void_p(self._raw_stream))
         if result != 0 and exc_type is None:
@@ -807,7 +931,7 @@ class NvidiaVideoReader:
                 return
             except (OSError, RuntimeError, ValueError, RocDecodeError) as exc:
                 if is_terminal_rocdecode_error(exc):
-                    source.close()
+                    source.close(discard_decoder=True)
                     self._rocdecode_source = None
                     raise VideoDecodeError(
                         f"rocDecode entered a fatal runtime state for {self.file}: {exc}"
@@ -819,7 +943,7 @@ class NvidiaVideoReader:
                     self.file,
                     exc,
                 )
-                source.close()
+                source.close(discard_decoder=True)
                 self._rocdecode_source = None
                 self._open_pyav("auto")
                 yield from self._frames_pyav(seek_ts, after_pts=last_pts)

@@ -162,6 +162,44 @@ and 20.0367 seconds and completed full software decode. The test window added
 no rocDecode parse storm, HIP out-of-memory report or AMDGPU command-submission
 memory error.
 
+## Reused rocDecode surfaces across smart-render spans
+
+Per-video process isolation releases native state between files, but it did not
+prevent rocDecode 1.7.0 from retaining about 1.125 GiB of DRM VRAM every time
+the two 8K P010 readers were destroyed inside one video's smart-render loop.
+The restoration model, Python queues, PyAV references and PTS recovery path
+were ruled out independently. A minimal same-process test that created and
+destroyed both readers for each seek reproduced the growth; a native test that
+created the two decoders once and fed six seek sequences stayed at
+4.614--4.656 GiB against a 2.472 GiB baseline.
+
+Smart rendering now owns two reusable rocDecode slots for the lifetime of one
+video, one for detection and one for pasteback. Each span still opens its own
+PyAV demuxer and bitstream filter. When a span ends early, the active generator
+releases every unconsumed surface, sends EOS, drains and discards the remaining
+frames, and only then returns the decoder to its slot. A terminal native error
+discards the damaged decoder so the existing two bounded rocDecode retries can
+create a replacement; the exact-PTS software fallback is unchanged. Full
+renders, VALI, PyAV software decode, NVIDIA and GUI orchestration retain their
+previous lifetime and routing.
+
+The production reader path was exercised with two new worker threads per span,
+two 8192x4096 Main 10/P010 readers and six seeks. Raw DRM VRAM stayed at
+4.662--4.672 GiB after the first iteration against a 2.028 GiB baseline, and
+both readers returned identical PTS on every iteration. A real forced-fisheye
+smart render then completed three separate render spans. System VRAM after the
+spans was 13386.0, 13408.1 and 13750.1 MiB instead of growing by about
+1.125 GiB per span. The 40-second output retained all 2404 source frames,
+8192x4096 HEVC Main 10 video and strictly increasing PTS, and completed a full
+software decode without an error. The smaller final fluctuation includes the
+per-span AMF encoder and cache lifetime and is not decoder-pool accumulation.
+
+rocDecode 1.7.0 still does not return every native mapping after the two slots
+are finally destroyed. This is contained by the existing Linux AMD per-video
+child process: after the acceptance child exited, system VRAM returned to about
+2.0 GiB. The fix deliberately avoids a CPU fallback and removes only the
+within-video linear growth.
+
 The removed toolbox runtime remains recoverable from
 `/home/latiao/vr_toolbox_jasna_linux/migration_archive_vr_remove_mosaic_linux_20260802.tar.zst`
 (SHA-256 `0b9794d17ac6de0789142b6e19f8f2cfaba2344aba74be13aa63227ce82f4555`).
