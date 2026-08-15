@@ -678,6 +678,7 @@ class NvidiaVideoEncoder:
                 _drop_unsupported_nvenc_overrides(codec, overrides, self.encoder_options)
         uses_amf_hevc_cqp = (
             self.vendor is AcceleratorVendor.AMD
+            and not self.software_reference
             and codec == "hevc"
             and overrides.get("rc", self.encoder_options["rc"]) in {"cqp", "0"}
         )

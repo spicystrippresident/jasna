@@ -157,6 +157,32 @@ def test_amf_hevc_cqp_skips_source_bitrate_cap(monkeypatch, tmp_path) -> None:
     assert "bufsize" not in encoder.encoder_options
 
 
+def test_amd_software_reference_does_not_enter_amf_cqp_path(
+    monkeypatch, tmp_path
+) -> None:
+    import jasna.media.video_encoder as module
+
+    monkeypatch.setattr(
+        module,
+        "vendor_for_device",
+        lambda _device: AcceleratorVendor.AMD,
+    )
+    encoder = module.NvidiaVideoEncoder(
+        str(tmp_path / "reference.mp4"),
+        torch.device("cuda:0"),
+        _metadata(),
+        codec="hevc",
+        encoder_settings={"cq": 28},
+        encoder_backend="software-reference",
+    )
+
+    assert encoder.encoder_name == "libx265"
+    assert encoder.encoder_options["crf"] == "28"
+    assert "rc" not in encoder.encoder_options
+    assert "qp_i" not in encoder.encoder_options
+    assert "qp_p" not in encoder.encoder_options
+
+
 @pytest.mark.parametrize("rc", ["qvbr", "hqvbr", 4, 5])
 def test_amf_hevc_rejects_qvbr_for_main10(
     monkeypatch, tmp_path, rc: str | int
