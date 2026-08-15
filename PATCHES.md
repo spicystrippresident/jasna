@@ -142,13 +142,17 @@ its cause remains unconfirmed. It does show that the current evidence does not
 support a deterministic v0.10 dual-rocDecode destruction regression and does
 not justify weakening the proven decode path.
 
-A real 8-bit smart render also completed on the same 20-second 8K source with a
-5-6 second selected range, SBS fisheye, batch 8 and max clip 180. The process
-returned zero; source and output both contain 1201 HEVC video frames/packets and
-940 AAC packets, the durations differ by only 5 microseconds, full software
-decode succeeds, and VRAM returns to roughly 1.76-1.80 GiB. A prior 10-bit P010
-three-span smart render also completed with two rocDecode readers and passed
-full decode validation. Visual quality remains a user acceptance item.
+A real 8-bit selected-range assembly also completed on the same 20-second 8K
+source with a 5-6 second range, SBS fisheye, batch 8 and max clip 180. The
+process returned zero; source and output both contain 1201 HEVC video
+frames/packets and 940 AAC packets, the durations differ by only 5
+microseconds, full software decode succeeds, and VRAM returns to roughly
+1.76-1.80 GiB. Human review later confirmed that the source has no visible
+mosaic in the selected 5-6 second range, so this run validates timeline,
+direct-fragment assembly and decode stability but not restoration effect or
+visual quality. A prior 10-bit P010 three-span smart render also completed with
+two rocDecode readers and passed full decode validation. Visual quality remains
+a user acceptance item.
 
 The final GPU-hidden focused suite passed 442 tests with 66 hardware skips.
 Seventy-seven additional AMD port tests from the stable tree passed against the
