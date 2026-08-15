@@ -31,6 +31,9 @@ Every setting has a tooltip: hover the ⓘ icon next to it.
   button beside Output location to return to this mode after choosing a folder.
 - Type a folder path directly, or use the folder button. Either choice turns
   off **Same as input**.
+- **Preserve input subfolder structure** records the root selected when a folder
+  is added or dropped, then recreates each relative subfolder below the output
+  folder. Individually added files still write directly to the output folder.
 - The **filename pattern** controls output names — `{original}` stands for
   the input name. If a pattern would overwrite something, the affected queue
   items are highlighted immediately.

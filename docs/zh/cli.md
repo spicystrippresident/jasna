@@ -199,17 +199,17 @@ NVIDIA H.264 获得更多余量，因为保留修复后的细节需要更多码�
 
 | 参数 | 作用 |
 | --- | ------------ |
-| `cq` | 数值不变、作为 AMF `qvbr_quality_level` 传递的质量目标。越低越好。范围 0–51；默认 24（H.264）、25（HEVC）、32（AV1）。 |
+| `cq` | 通用质量目标，越低越好。H.264/AV1 将数值不变地传给 `qvbr_quality_level`；HEVC 全片处理将数值不变地作为 CQP 的 I/P QP；Linux AMD 的 HEVC 智能修复片段使用限制在 0–51 的 `CQ + 2`，以避开不稳定的分段 QVBR。范围 0–51；默认 24（H.264）、25（HEVC）、32（AV1）。 |
 | `qvbr_quality_level` | AMF 原生别名。省略 `--cq` 时可用于 CLI 高级设置；GUI 自定义参数中不接受。 |
 | `usage` | 编码器用途配置。默认 `high_quality`。 |
 | `quality` | 速度/质量预设: `speed`、`balanced`、`quality`（默认）。 |
-| `rc` | 码率控制模式。默认 `qvbr`。 |
+| `rc` | 码率控制模式。H.264/AV1 默认 `qvbr`，HEVC 默认 `cqp`。 |
 | `preset` | AMF 预设。 |
 | `g` | 关键帧间隔（帧数）。默认 250。 |
 | `bf` | 最大连续 B 帧数。 |
-| `preanalysis` | 预分析，默认开启。 |
-| `vbaq` | 基于方差的自适应量化，默认开启。 |
-| `maxrate` / `bufsize` | 码率上限和 VBV 缓冲区大小（比特/秒）。除非指定 `maxrate`，否则会根据源码率自动设置。 |
+| `preanalysis` | 预分析。H.264/AV1 默认开启；HEVC 默认 CQP 和 Linux AMD HEVC 智能修复片段会关闭。 |
+| `vbaq` | 基于方差的自适应量化。H.264/AV1 默认开启，HEVC CQP 关闭。 |
+| `maxrate` / `bufsize` | 码率上限和 VBV 缓冲区大小（比特/秒）。所选码率控制支持上限时会根据源码率推导；HEVC 默认 CQP 不使用 VBV 上限。 |
 | `profile` / `level` | 编解码器 profile 和 level。 |
 
 各编解码器额外参数:
