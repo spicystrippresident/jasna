@@ -1,5 +1,7 @@
 # Jasna v0.10 Linux AMD 移植说明
 
+[English](JASNA_V010_AMD_PORT.md) | 中文
+
 ## 分支与产品边界
 
 - 上游基线：`upstream/main`，基线提交 `592472b`，Jasna `0.10.0`。
