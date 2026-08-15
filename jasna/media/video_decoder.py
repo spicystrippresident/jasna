@@ -723,7 +723,7 @@ class NvidiaVideoReader:
             and int(self.metadata.video_width) * int(self.metadata.video_height)
             >= _AMD_AMF_SOFTWARE_DECODE_MIN_PIXELS
         ):
-            # On an RX 7900 XTX, the same 8K one-click scan is over twice as
+            # On an RX 7900 XTX, the same 8K segment-editor scan is over twice as
             # fast with libavcodec plus ROCm upload, while using about 5 GiB
             # less VRAM and leaving the media engine free for AMF encoding.
             source_ctx.thread_type = "AUTO"

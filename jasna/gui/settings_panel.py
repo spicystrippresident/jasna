@@ -24,7 +24,6 @@ from jasna.gui.settings_sections.advanced import (
 from jasna.gui.settings_sections.basic import BasicSection
 from jasna.gui.settings_sections.encoding import EncodingSection
 from jasna.gui.settings_sections.image_restoration import ImageRestorationSection
-from jasna.gui.settings_sections.one_click_vr import ProcessingModeSection
 from jasna.gui.settings_sections.post_export import PostExportSection
 from jasna.gui.settings_sections.secondary import SecondarySection
 
@@ -253,11 +252,6 @@ class SettingsPanel(ctk.CTkFrame):
 
     def _build_sections(self):
         self._sections = [
-            ProcessingModeSection(
-                self._scroll,
-                self._widgets,
-                self._mark_modified,
-            ),
             BasicSection(
                 self._scroll,
                 self._widgets,

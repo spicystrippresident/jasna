@@ -473,7 +473,6 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
             run_log.enqueue(
                 "INFO",
                 "Run context: "
-                f"processing_mode={settings.processing_mode} "
                 f"detection_model={settings.detection_model} codec={settings.codec} "
                 f"fp16_mode={bool(settings.fp16_mode)} vr_mode={settings.vr_mode} "
                 f"secondary_restoration={settings.secondary_restoration}",

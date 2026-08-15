@@ -44,10 +44,6 @@ class ProcessingStopped(Exception):
     """Raised inside a job when the user stopped processing."""
 
 
-class OneClickVrSkipped(Exception):
-    """Raised when a one-click VR job intentionally produces no output."""
-
-
 def _pipeline_was_stopped(pipeline) -> bool:
     return bool(pipeline.cancel_requested) and not bool(pipeline.completed)
 
@@ -477,7 +473,6 @@ class Processor:
                 overrides["detection_model"] = snapshot.detection_model
             if snapshot.detection_score_threshold is not None:
                 overrides["detection_score_threshold"] = snapshot.detection_score_threshold
-                overrides["one_click_scan_threshold"] = snapshot.detection_score_threshold
             if snapshot.vr_projection is not None:
                 overrides["vr_projection"] = snapshot.vr_projection
             if overrides:
@@ -505,66 +500,15 @@ class Processor:
             previous_output_fingerprint = (
                 self._output_fingerprint(output_path) if not is_image else None
             )
-            if is_image and job_settings.processing_mode == "one_click_vr":
-                raise OneClickVrSkipped("One-click VR accepts video inputs only")
             if is_image:
                 self._close_video_session()
             else:
                 self._close_image_session()
-            progress_start = 0.0
-            if job_settings.processing_mode == "one_click_vr":
-                if segments:
-                    self._log(
-                        "INFO",
-                        f"Using {len(segments)} manually selected one-click VR range(s)",
-                    )
-                else:
-                    plan = self._scan_one_click_vr(
-                        job.id,
-                        input_path,
-                        output_path,
-                        job_settings,
-                    )
-                    segments = plan.segments
-                    if not segments:
-                        raise OneClickVrSkipped(
-                            "No mosaic was detected above the selected confidence threshold"
-                        )
-                    progress_start = 10.0
-                    projection_evidence = plan.projection_evidence
-                    if (
-                        job_settings.vr_projection == "auto"
-                        and projection_evidence is not None
-                    ):
-                        if projection_evidence.selected is not None:
-                            job_settings = replace(
-                                job_settings,
-                                vr_projection=projection_evidence.selected,
-                            )
-                            self._log(
-                                "INFO",
-                                "One-click VR image evidence selected "
-                                f"{projection_evidence.selected} projection "
-                                f"(confidence={projection_evidence.confidence:.3f})",
-                            )
-                        else:
-                            self._log(
-                                "INFO",
-                                "One-click VR projection evidence was inconclusive; "
-                                "using Jasna automatic studio routing",
-                            )
-                    self._log(
-                        "INFO",
-                        "One-click VR scan selected "
-                        f"{len(segments)} range(s), {plan.render_seconds:.2f}s total",
-                    )
             pipeline_options = {}
             if segments:
                 pipeline_options["segments"] = segments
             if job_settings is not self._settings:
                 pipeline_options["settings"] = job_settings
-            if progress_start:
-                pipeline_options["progress_start"] = progress_start
             self._run_pipeline(
                 job.id,
                 input_path,
@@ -593,16 +537,6 @@ class Processor:
 
         except ProcessingStopped:
             self._mark_stopped(job)
-
-        except OneClickVrSkipped as e:
-            e.__traceback__ = None
-            job.status = JobStatus.SKIPPED
-            self._progress(ProgressUpdate(
-                job_id=job.id,
-                status=JobStatus.SKIPPED,
-                message=str(e),
-            ))
-            self._log("INFO", f"Skipped {job.filename}: {e}")
 
         except UnsupportedColorspaceError as e:
             e.__traceback__ = None
@@ -933,12 +867,7 @@ class Processor:
                 self._validate_isolated_completed_output(
                     job.path,
                     output_path,
-                    codec=(
-                        None
-                        if snapshot.segments
-                        or settings.processing_mode == "one_click_vr"
-                        else settings.codec
-                    ),
+                    codec=None if snapshot.segments else settings.codec,
                     previous_fingerprint=preexisting_outputs.get(output_path),
                 )
             except Exception as error:
@@ -971,7 +900,6 @@ class Processor:
         *,
         segments=(),
         settings: AppSettings | None = None,
-        progress_start: float = 0.0,
     ):
         """Run one job; raises ProcessingStopped when the user stopped it."""
         from jasna.media.image_io import IMAGE_EXTENSIONS
@@ -985,7 +913,6 @@ class Processor:
             output_path,
             segments=segments,
             settings=settings or self._settings,
-            progress_start=progress_start,
         )
 
 
@@ -1042,7 +969,6 @@ class Processor:
         *,
         segments=(),
         settings: AppSettings | None = None,
-        progress_start: float = 0.0,
     ):
         settings = settings or self._settings
         if self._stop_event.is_set():
@@ -1088,13 +1014,10 @@ class Processor:
             if self._stop_event.is_set():
                 raise ProcessingStopped("Processing stopped")
 
-            scaled_progress = progress_start + (
-                progress_pct * (100.0 - progress_start) / 100.0
-            )
             self._progress(ProgressUpdate(
                 job_id=job_id,
                 status=JobStatus.PROCESSING,
-                progress=scaled_progress,
+                progress=progress_pct,
                 fps=fps,
                 eta_seconds=eta_seconds,
                 frames_processed=frames_done,
@@ -1122,67 +1045,6 @@ class Processor:
             self._current_pipeline = None
             if pipeline is not None:
                 pipeline.close()
-
-    def _scan_one_click_vr(
-        self,
-        job_id: int,
-        input_path: Path,
-        output_path: Path,
-        settings: AppSettings,
-    ):
-        from jasna.one_click_vr.cache import (
-            load_scan_cache,
-            scan_cache_path,
-            write_scan_cache,
-        )
-        from jasna.one_click_vr.scan import (
-            OneClickVrScanStopped,
-            scan_video_for_one_click_vr,
-        )
-
-        cache_path = scan_cache_path(input_path, output_path, settings)
-        cached = load_scan_cache(cache_path, input_path, settings)
-        if cached is not None:
-            self._log("INFO", f"Reusing one-click VR scan: {cache_path}")
-            self._progress(ProgressUpdate(
-                job_id=job_id,
-                status=JobStatus.PROCESSING,
-                progress=10.0,
-                message="Reusing mosaic scan",
-            ))
-            return cached
-
-        self._log("INFO", f"Scanning {input_path.name} for mosaic ranges")
-
-        def on_progress(fraction: float, fps: float, eta_seconds: float) -> None:
-            self._pause_event.wait()
-            if self._stop_event.is_set():
-                raise OneClickVrScanStopped("One-click VR scan stopped")
-            self._progress(ProgressUpdate(
-                job_id=job_id,
-                status=JobStatus.PROCESSING,
-                progress=max(0.0, min(10.0, float(fraction) * 10.0)),
-                fps=fps,
-                eta_seconds=eta_seconds,
-                message="Scanning for mosaic ranges",
-            ))
-
-        try:
-            plan = scan_video_for_one_click_vr(
-                input_path,
-                settings,
-                stop_event=self._stop_event,
-                on_progress=on_progress,
-                on_status=lambda message: self._log("INFO", message),
-            )
-            try:
-                write_scan_cache(cache_path, input_path, settings, plan)
-                self._log("INFO", f"Saved one-click VR scan: {cache_path}")
-            except (OSError, ValueError) as exc:
-                self._log("WARNING", f"Could not save one-click VR scan: {exc}")
-            return plan
-        except OneClickVrScanStopped as exc:
-            raise ProcessingStopped(str(exc)) from exc
 
     def _prepare_job_detector(
         self,
