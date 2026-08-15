@@ -13,6 +13,7 @@ from jasna.media.splice import (
     SpliceSpan,
     concatenate_fragments,
     create_copy_fragment,
+    mux_fragments_final_output,
     mux_final_output,
     normalize_fragment,
     probe_keyframes,
@@ -148,11 +149,13 @@ def test_mixed_encoder_splice_decodes_with_exact_duration_and_audio(
     ("suffix", "expected_subtitle_codec", "expected_attachments"),
     [(".mkv", "srt", 1), (".mp4", "mov_text", 0)],
 )
+@pytest.mark.parametrize("fragment_route", [False, True])
 def test_final_mux_preserves_compatible_source_structure(
     tmp_path: Path,
     suffix: str,
     expected_subtitle_codec: str,
     expected_attachments: int,
+    fragment_route: bool,
 ) -> None:
     subtitle = tmp_path / "subtitle.srt"
     subtitle.write_text(
@@ -210,7 +213,16 @@ def test_final_mux_preserves_compatible_source_structure(
     )
     output = tmp_path / f"output{suffix}"
 
-    mux_final_output(assembled, source, output, codec="h264")
+    if fragment_route:
+        mux_fragments_final_output(
+            [(assembled, 2.0)],
+            source,
+            output,
+            manifest=tmp_path / "fragments.ffconcat",
+            codec="h264",
+        )
+    else:
+        mux_final_output(assembled, source, output, codec="h264")
 
     with av.open(str(output)) as container:
         assert container.metadata["title"] == "Source title"

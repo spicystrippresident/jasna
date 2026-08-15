@@ -864,6 +864,61 @@ def mux_final_output(
     codec: str,
 ) -> None:
     temporary = destination.with_name(f".{destination.stem}.smart-render{destination.suffix}")
+    args = _final_mux_args(
+        ["-i", str(video), "-i", str(source)],
+        source,
+        destination,
+        codec=codec,
+        source_input_index=1,
+    )
+    args.append(str(temporary))
+    _run_ffmpeg(args, purpose=f"mux smart-render output {destination.name}")
+    _commit_smart_output(temporary, destination, source=source, codec=codec)
+
+
+def mux_fragments_final_output(
+    fragments: list[tuple[Path, float]],
+    source: Path,
+    destination: Path,
+    *,
+    manifest: Path,
+    codec: str,
+) -> None:
+    """Concatenate video fragments and mux all compatible source streams."""
+    _write_concat_manifest(fragments, manifest)
+    temporary = destination.with_name(f".{destination.stem}.smart-render{destination.suffix}")
+    args = _final_mux_args(
+        [
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(manifest),
+            "-i", str(source),
+        ],
+        source,
+        destination,
+        codec=codec,
+        source_input_index=1,
+    )
+    args.append(str(temporary))
+    _run_ffmpeg(args, purpose=f"assemble smart-render output {destination.name}")
+    _commit_smart_output(
+        temporary,
+        destination,
+        source=source,
+        codec=codec,
+    )
+
+
+def _final_mux_args(
+    video_input_args: list[str],
+    source: Path,
+    destination: Path,
+    *,
+    codec: str,
+    source_input_index: int,
+) -> list[str]:
+    """Build the final smart-render mux without losing source side streams."""
+
     output_format = {
         ".mkv": "matroska",
         ".mov": "mov",
@@ -872,15 +927,11 @@ def mux_final_output(
     with av.open(BytesIO(), "w", format=output_format) as probe:
         supported_codecs = probe.supported_codecs
 
-    args = [
-        "-i", str(video),
-        "-i", str(source),
-        "-map", "0:v:0",
-    ]
+    args = [*video_input_args, "-map", "0:v:0"]
     with av.open(str(source)) as container:
         primary_video_index = container.streams.video[0].index
         copied_streams = []
-        transcoded_subtitles = {}
+        transcoded_subtitles: dict[int, str] = {}
         source_formats = set(container.format.name.split(","))
         source_chapters = container.chapters()
         for stream in container.streams:
@@ -940,18 +991,18 @@ def mux_final_output(
             )
 
         for stream in copied_streams:
-            args += ["-map", f"1:{stream.index}"]
+            args += ["-map", f"{source_input_index}:{stream.index}"]
 
         args += [
-            "-map_metadata", "1",
-            "-map_metadata:s:v:0", "1:s:v:0",
-            "-map_chapters", "1",
+            "-map_metadata", str(source_input_index),
+            "-map_metadata:s:v:0", f"{source_input_index}:s:v:0",
+            "-map_chapters", str(source_input_index),
             "-c", "copy",
         ]
         for output_index, stream in enumerate(copied_streams, start=1):
             args += [
                 f"-map_metadata:s:{output_index}",
-                f"1:s:{stream.index}",
+                f"{source_input_index}:s:{stream.index}",
             ]
         audio_streams = [
             stream for stream in copied_streams if stream.type == "audio"
@@ -972,54 +1023,4 @@ def mux_final_output(
     if destination.suffix.lower() in {".mp4", ".mov"}:
         tag = {"h264": "avc3", "hevc": "hev1", "av1": "av01"}[codec]
         args += ["-tag:v:0", tag, "-movflags", "+faststart"]
-    args.append(str(temporary))
-    _run_ffmpeg(args, purpose=f"mux smart-render output {destination.name}")
-    _commit_smart_output(
-        temporary,
-        destination,
-        source=source,
-        codec=codec,
-    )
-
-
-def mux_fragments_final_output(
-    fragments: list[tuple[Path, float]],
-    source: Path,
-    destination: Path,
-    *,
-    manifest: Path,
-    codec: str,
-) -> None:
-    """Concatenate video fragments and mux source audio without an assembled copy."""
-    _write_concat_manifest(fragments, manifest)
-    temporary = destination.with_name(f".{destination.stem}.smart-render{destination.suffix}")
-    args = [
-        "-f", "concat",
-        "-safe", "0",
-        "-i", str(manifest),
-        "-i", str(source),
-        "-map", "0:v:0",
-        "-map", "1:a?",
-        "-map_metadata", "1",
-        "-map_metadata:s:v:0", "1:s:v:0",
-        "-c:v", "copy",
-    ]
-    with av.open(str(source)) as container:
-        audio_streams = list(container.streams.audio)
-        for output_index, stream in enumerate(audio_streams):
-            name = stream.codec_context.name
-            if needs_audio_reencode(name, destination.suffix):
-                args += [f"-c:a:{output_index}", "aac", f"-b:a:{output_index}", "256k"]
-            else:
-                args += [f"-c:a:{output_index}", "copy"]
-    if destination.suffix.lower() in {".mp4", ".mov"}:
-        tag = {"h264": "avc3", "hevc": "hev1", "av1": "av01"}[codec]
-        args += ["-tag:v", tag, "-movflags", "+faststart"]
-    args.append(str(temporary))
-    _run_ffmpeg(args, purpose=f"assemble smart-render output {destination.name}")
-    _commit_smart_output(
-        temporary,
-        destination,
-        source=source,
-        codec=codec,
-    )
+    return args
