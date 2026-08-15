@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from jasna.gui.mosaic_scan import (
     MosaicScanResult,
+    MosaicScanWorker,
     _ScanTensorCollector,
     scan_sample_stride,
     segments_from_scores,
 )
+from jasna.gui.models import AppSettings
 from jasna.gui.segment_editor_state import SegmentEditorState
 from jasna.segments import SegmentRange
 
@@ -18,6 +22,72 @@ def test_stride_follows_fps():
     assert scan_sample_stride(30.0, seconds=0.0) == 1
     assert scan_sample_stride(1.0) == 1
     assert scan_sample_stride(0.1) == 1
+
+
+def test_editor_scan_does_not_emit_checkpoint_events_by_default():
+    worker = MosaicScanWorker(
+        "video.mp4",
+        object(),
+        AppSettings(),
+        stride_seconds=1.0,
+    )
+
+    assert worker.emit_checkpoints is False
+    assert worker.known_sample_scores == {}
+    assert worker.serve_only is False
+
+
+def test_boundary_score_window_uses_one_reusable_decoder(monkeypatch):
+    import torch
+    import jasna.media.video_decoder as video_decoder
+
+    opened = []
+
+    class FakeReader:
+        def __init__(self, *args, **kwargs):
+            opened.append((args, kwargs))
+            self.start_pts = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def frames(self, seek_ts=None):
+            assert seek_ts == pytest.approx(0.1)
+            yield torch.zeros((2, 3, 2, 2), dtype=torch.uint8), [100, 200]
+            yield torch.zeros((2, 3, 2, 2), dtype=torch.uint8), [300, 400]
+
+    class FakeDetector:
+        def scan_scores_masks(self, batch, *, mask_hw):
+            count = batch.shape[0]
+            return torch.arange(1, count + 1, dtype=torch.float32) / 10, torch.zeros(
+                (count, *mask_hw), dtype=torch.bool
+            )
+
+    monkeypatch.setattr(video_decoder, "NvidiaVideoReader", FakeReader)
+    worker = MosaicScanWorker(
+        "video.mp4",
+        SimpleNamespace(duration=1.0, time_base=0.001),
+        AppSettings(batch_size=2),
+        stride_seconds=0.5,
+    )
+    reusable = object()
+    worker._reusable_rocdecoder = reusable
+
+    event = worker._detect_scores(
+        FakeDetector(),
+        SimpleNamespace(start_seconds=0.1, end_seconds=0.3, generation=7),
+    )
+
+    assert event.times == pytest.approx((0.1, 0.2, 0.3))
+    assert event.scores == pytest.approx((0.1, 0.2, 0.1))
+    assert event.generation == 7
+    assert len(opened) == 1
+    assert opened[0][1]["frame_stride"] == 1
+    assert opened[0][1]["prefer_software_decode"] is True
+    assert opened[0][1]["reusable_rocdecoder"] is reusable
 
 
 def test_consecutive_hits_merge_into_one_range():

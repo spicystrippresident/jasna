@@ -14,7 +14,7 @@ import math
 import queue
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -185,6 +185,15 @@ class ScanProgress:
 
 
 @dataclass(frozen=True)
+class ScanCheckpoint:
+    """One completed detector batch suitable for durable pre-scan caching."""
+
+    sample_keys: tuple[int, ...]
+    times: tuple[float, ...]
+    scores: tuple[float, ...]
+
+
+@dataclass(frozen=True)
 class ScanCompleted:
     result: MosaicScanResult
     stopped: bool
@@ -201,10 +210,26 @@ class ScanMaskReady:
     score: float
     mask: object
     generation: int
+    sample_key: int | None = None
 
 
 @dataclass(frozen=True)
 class ScanMaskFailed:
+    message: str
+    generation: int
+
+
+@dataclass(frozen=True)
+class ScanScoresReady:
+    """Detector scores for one continuously decoded source-time window."""
+
+    times: tuple[float, ...]
+    scores: tuple[float, ...]
+    generation: int
+
+
+@dataclass(frozen=True)
+class ScanScoresFailed:
     message: str
     generation: int
 
@@ -243,6 +268,13 @@ class _MaskRequest:
 
 
 @dataclass(frozen=True)
+class _ScoresRequest:
+    start_seconds: float
+    end_seconds: float
+    generation: int
+
+
+@dataclass(frozen=True)
 class _ProjectionRequest:
     candidates: tuple[
         tuple[float, tuple[float, float, float, float], float], ...
@@ -258,10 +290,13 @@ class _Close:
 ScanEvent = (
     ScanStatus
     | ScanProgress
+    | ScanCheckpoint
     | ScanCompleted
     | ScanFailed
     | ScanMaskReady
     | ScanMaskFailed
+    | ScanScoresReady
+    | ScanScoresFailed
     | ScanProjectionReady
     | ScanProjectionFailed
     | ScanStorageSpilled
@@ -432,6 +467,10 @@ class MosaicScanWorker:
         on_stopped: Callable[[], None] | None = None,
         decode_strategy: str | None = None,
         max_duration_seconds: float | None = None,
+        start_seconds: float = 0.0,
+        known_sample_scores: Mapping[int, float] | None = None,
+        emit_checkpoints: bool = False,
+        serve_only: bool = False,
     ) -> None:
         self.path = Path(path)
         self.metadata = metadata
@@ -439,16 +478,25 @@ class MosaicScanWorker:
         self.stride_seconds = float(stride_seconds)
         self._on_stopped = on_stopped
         self.decode_strategy = decode_strategy
+        self.start_seconds = max(0.0, float(start_seconds))
+        self.known_sample_scores = {
+            int(sample_key): float(score)
+            for sample_key, score in (known_sample_scores or {}).items()
+        }
+        self.emit_checkpoints = bool(emit_checkpoints)
+        self.serve_only = bool(serve_only)
         self.max_duration_seconds = (
             None if max_duration_seconds is None else float(max_duration_seconds)
         )
         if self.max_duration_seconds is not None and self.max_duration_seconds <= 0:
             raise ValueError("max_duration_seconds must be greater than zero")
+        if any(not 0.0 <= score <= 1.0 for score in self.known_sample_scores.values()):
+            raise ValueError("known sample scores must be between zero and one")
         self.events: queue.Queue[ScanEvent] = queue.Queue()
         self._stop_scan = threading.Event()
         self._closed = threading.Event()
         self._commands: queue.Queue[
-            _MaskRequest | _ProjectionRequest | _Close
+            _MaskRequest | _ScoresRequest | _ProjectionRequest | _Close
         ] = queue.Queue(maxsize=1)
         self._mask_generation = 0
         self._thread = threading.Thread(
@@ -481,6 +529,13 @@ class MosaicScanWorker:
         self._replace_command(_MaskRequest(max(0.0, float(seconds)), self._mask_generation))
         return self._mask_generation
 
+    def request_scores(self, start_seconds: float, end_seconds: float) -> int:
+        start = max(0.0, float(start_seconds))
+        end = max(start, float(end_seconds))
+        self._mask_generation += 1
+        self._replace_command(_ScoresRequest(start, end, self._mask_generation))
+        return self._mask_generation
+
     def request_projection_comparison(
         self,
         candidates: tuple[
@@ -503,7 +558,7 @@ class MosaicScanWorker:
 
     def _replace_command(
         self,
-        command: _MaskRequest | _ProjectionRequest | _Close,
+        command: _MaskRequest | _ScoresRequest | _ProjectionRequest | _Close,
         *,
         allow_closed: bool = False,
     ) -> None:
@@ -520,6 +575,9 @@ class MosaicScanWorker:
             pass
 
     def _run(self) -> None:
+        from jasna.media.video_decoder import ReusableRocDecoder
+
+        self._reusable_rocdecoder = ReusableRocDecoder()
         try:
             self.events.put(ScanStatus("loading_models"))
             detector = self._build_detector()
@@ -529,9 +587,29 @@ class MosaicScanWorker:
                 self._on_stopped()
             return
         try:
-            self._scan(detector)
-            if self._on_stopped is not None:
-                self._on_stopped()
+            if self.serve_only:
+                duration = float(self.metadata.duration)
+                stride = scan_sample_stride(
+                    float(self.metadata.video_fps),
+                    seconds=self.stride_seconds,
+                ) / float(self.metadata.video_fps)
+                self.events.put(
+                    ScanCompleted(
+                        MosaicScanResult(
+                            times=(),
+                            scores=(),
+                            masks=(),
+                            stride=stride,
+                            duration=duration,
+                            completed_until=duration,
+                        ),
+                        stopped=False,
+                    )
+                )
+            else:
+                self._scan(detector)
+                if self._on_stopped is not None:
+                    self._on_stopped()
             self._serve_requests(detector)
         except Exception as exc:
             if not self._closed.is_set():
@@ -539,6 +617,9 @@ class MosaicScanWorker:
             if self._on_stopped is not None:
                 self._on_stopped()
         finally:
+            reusable_rocdecoder = self._reusable_rocdecoder
+            self._reusable_rocdecoder = None
+            reusable_rocdecoder.close()
             if hasattr(detector, "close"):
                 detector.close()
             import gc
@@ -623,6 +704,10 @@ class MosaicScanWorker:
             if self.max_duration_seconds is None
             else min(source_duration, self.max_duration_seconds)
         )
+        scan_start = min(self.start_seconds, duration)
+        if scan_start >= duration:
+            raise ValueError("scan start must be before the scan end")
+        scan_span = duration - scan_start
         bounded_scan = duration < source_duration
         time_base = float(metadata.time_base)
         frame_stride = scan_sample_stride(metadata.video_fps, seconds=self.stride_seconds)
@@ -630,12 +715,13 @@ class MosaicScanWorker:
         batch_size = int(self.settings.batch_size)
         frame_count = int(metadata.num_frames)
         if bounded_scan:
-            expected_samples = math.ceil(duration / sample_stride_seconds)
+            expected_samples = math.ceil(scan_span / sample_stride_seconds)
         elif frame_count > 0:
-            expected_samples = math.ceil(frame_count / frame_stride)
+            remaining_frames = max(1, frame_count - round(scan_start * metadata.video_fps))
+            expected_samples = math.ceil(remaining_frames / frame_stride)
         else:
             estimated_rate = max(float(metadata.average_fps), float(metadata.video_fps))
-            expected_samples = math.ceil(duration * estimated_rate / frame_stride)
+            expected_samples = math.ceil(scan_span * estimated_rate / frame_stride)
         expected_samples = max(1, expected_samples)
 
         decode_backends = scan_decode_backends(
@@ -648,7 +734,7 @@ class MosaicScanWorker:
         decoders = len(decode_backends)
         sample_bounds = scan_segment_sample_bounds(expected_samples, decode_backends)
         bounds = [
-            min(duration, sample_index * sample_stride_seconds)
+            min(duration, scan_start + sample_index * sample_stride_seconds)
             for sample_index in sample_bounds
         ]
         bounds[-1] = duration
@@ -695,6 +781,7 @@ class MosaicScanWorker:
                             if len(keep) < len(sample_times):
                                 batch = batch[keep]
                             kept_times = [sample_times[i] for i in keep]
+                            kept_keys = [int(pts_list[i]) - int(start_pts) for i in keep]
                             segment_samples += len(kept_times)
                             if batch.device.type != "cpu":
                                 # The AMD reader combines native HIP copies with
@@ -703,11 +790,11 @@ class MosaicScanWorker:
                                 # thread; a Torch event alone does not cover that
                                 # mixed-runtime boundary reliably on ROCm.
                                 _synchronize_scan_decode_batch(batch)
-                            batches.put((index, batch, kept_times))
+                            batches.put((index, batch, kept_times, kept_keys))
                         if (not is_last or bounded_scan) and sample_times[-1] >= end_s:
                             break
             except BaseException as exc:
-                batches.put((index, exc, None))
+                batches.put((index, exc, None, None))
                 return
             finally:
                 self._last_scan_segment_stats[index] = {
@@ -717,7 +804,7 @@ class MosaicScanWorker:
                     "samples": segment_samples,
                     "wall_seconds": time.monotonic() - segment_started,
                 }
-            batches.put((index, None, None))
+            batches.put((index, None, None, None))
 
         seg_times: list[list[float]] = [[] for _ in range(decoders)]
         collectors: list[_ScanTensorCollector | None] = [None] * decoders
@@ -738,7 +825,7 @@ class MosaicScanWorker:
             for thread in threads:
                 thread.start()
             while active:
-                index, payload, sample_times = batches.get()
+                index, payload, sample_times, sample_keys = batches.get()
                 if payload is None:
                     active -= 1
                     continue
@@ -752,11 +839,49 @@ class MosaicScanWorker:
                 if batch.shape[0] < batch_size:
                     pad = batch[-1:].expand(batch_size - batch.shape[0], -1, -1, -1)
                     batch = torch.cat((batch, pad))
-                detection_batch = self._prepare_detection_batch(batch)
-                batch_scores, batch_masks = detector.scan_scores_masks(
-                    detection_batch, mask_hw=SCAN_MASK_HW
-                )
-                batch_masks = self._source_projection_masks(batch_masks)
+                sample_count = len(sample_times)
+                if not self.known_sample_scores:
+                    detection_batch = self._prepare_detection_batch(batch)
+                    detected_scores, detected_masks = detector.scan_scores_masks(
+                        detection_batch, mask_hw=SCAN_MASK_HW
+                    )
+                    batch_scores = detected_scores[:sample_count]
+                    batch_masks = self._source_projection_masks(detected_masks)[
+                        :sample_count
+                    ]
+                else:
+                    unknown = [
+                        position
+                        for position, sample_key in enumerate(sample_keys)
+                        if sample_key not in self.known_sample_scores
+                    ]
+                    batch_scores = torch.empty(
+                        (sample_count,), dtype=torch.float32, device=device
+                    )
+                    batch_masks = torch.zeros(
+                        (sample_count, *SCAN_MASK_HW), dtype=torch.uint8, device=device
+                    )
+                    for position, sample_key in enumerate(sample_keys):
+                        known_score = self.known_sample_scores.get(sample_key)
+                        if known_score is not None:
+                            batch_scores[position] = known_score
+                if self.known_sample_scores and unknown:
+                    detection_input = batch[unknown]
+                    if detection_input.shape[0] < batch_size:
+                        pad = detection_input[-1:].expand(
+                            batch_size - detection_input.shape[0], -1, -1, -1
+                        )
+                        detection_input = torch.cat((detection_input, pad))
+                    detection_batch = self._prepare_detection_batch(detection_input)
+                    detected_scores, detected_masks = detector.scan_scores_masks(
+                        detection_batch, mask_hw=SCAN_MASK_HW
+                    )
+                    detected_masks = self._source_projection_masks(detected_masks)
+                    for detected_position, target_position in enumerate(unknown):
+                        batch_scores[target_position] = detected_scores[detected_position]
+                        batch_masks[target_position] = detected_masks[detected_position].to(
+                            torch.uint8
+                        )
                 if collectors[index] is None:
                     collectors[index] = _ScanTensorCollector(
                         torch,
@@ -769,6 +894,14 @@ class MosaicScanWorker:
                 collectors[index].add(
                     batch_scores, batch_masks, count=len(sample_times)
                 )
+                if self.emit_checkpoints:
+                    self.events.put(
+                        ScanCheckpoint(
+                            tuple(int(value) for value in sample_keys),
+                            tuple(float(value) for value in sample_times),
+                            tuple(float(value) for value in batch_scores.cpu().tolist()),
+                        )
+                    )
                 seg_times[index].extend(sample_times)
                 total_samples += len(sample_times)
                 fraction = min(1.0, total_samples / expected_samples)
@@ -830,11 +963,15 @@ class MosaicScanWorker:
             try:
                 if isinstance(command, _ProjectionRequest):
                     event = self._compare_projections(detector, command)
+                elif isinstance(command, _ScoresRequest):
+                    event = self._detect_scores(detector, command)
                 else:
                     event = self._detect_mask(detector, command)
             except Exception as exc:
                 if isinstance(command, _ProjectionRequest):
                     event = ScanProjectionFailed(str(exc), command.generation)
+                elif isinstance(command, _ScoresRequest):
+                    event = ScanScoresFailed(str(exc), command.generation)
                 else:
                     event = ScanMaskFailed(str(exc), command.generation)
             if not self._closed.is_set():
@@ -853,6 +990,7 @@ class MosaicScanWorker:
             batch_size,
             device,
             metadata,
+            reusable_rocdecoder=self._reusable_rocdecoder,
         )
         with reader:
             batch_and_pts = next(reader.frames(seek_ts=command.seconds), None)
@@ -878,7 +1016,79 @@ class MosaicScanWorker:
                 score=float(scores[0].cpu()),
                 mask=masks[0].to(torch.uint8).cpu(),
                 generation=command.generation,
+                sample_key=int(pts_list[0]) - int(start_pts),
             )
+
+    def _detect_scores(
+        self,
+        detector,
+        command: _ScoresRequest,
+    ) -> ScanScoresReady:
+        """Decode a boundary window once and score its frames in full batches.
+
+        rocDecode keeps native surface mappings alive after decoder destruction
+        on affected AMD stacks.  Reopening one decoder per 8K frame therefore
+        exhausts command-submission memory.  One continuous reader plus the
+        worker-level reusable decoder keeps that allocation bounded.
+        """
+
+        import torch
+
+        from jasna.media.video_decoder import NvidiaVideoReader
+
+        metadata = self.metadata
+        device = torch.device("cuda:0")
+        batch_size = int(self.settings.batch_size)
+        duration = float(metadata.duration)
+        start_seconds = min(duration, max(0.0, command.start_seconds))
+        end_seconds = min(duration, max(start_seconds, command.end_seconds))
+        epsilon = max(abs(float(metadata.time_base)), 1e-9)
+        times: list[float] = []
+        score_values: list[float] = []
+        reader = NvidiaVideoReader(
+            str(self.path),
+            batch_size,
+            device,
+            metadata,
+            frame_stride=1,
+            prefer_software_decode=True,
+            decode_backend=self.decode_strategy,
+            reusable_rocdecoder=self._reusable_rocdecoder,
+        )
+        with reader:
+            start_pts = reader.start_pts
+            for batch, pts_list in reader.frames(seek_ts=start_seconds):
+                batch_times = [
+                    max(0.0, (pts - start_pts) * float(metadata.time_base))
+                    for pts in pts_list
+                ]
+                keep = [
+                    index
+                    for index, seconds in enumerate(batch_times)
+                    if seconds + epsilon >= start_seconds
+                    and seconds <= end_seconds + epsilon
+                ]
+                if keep:
+                    if batch.shape[0] < batch_size:
+                        pad = batch[-1:].expand(batch_size - batch.shape[0], -1, -1, -1)
+                        batch = torch.cat((batch, pad))
+                    detection_batch = self._prepare_detection_batch(batch)
+                    scores, masks = detector.scan_scores_masks(
+                        detection_batch,
+                        mask_hw=SCAN_MASK_HW,
+                    )
+                    detected = scores.detach().float().cpu().tolist()
+                    times.extend(batch_times[index] for index in keep)
+                    score_values.extend(float(detected[index]) for index in keep)
+                    del masks, scores, detection_batch, detected
+                if batch_times and batch_times[-1] + epsilon >= end_seconds:
+                    break
+        if not times:
+            raise RuntimeError(
+                "Could not decode frames in the requested boundary window "
+                f"{start_seconds:.3f}-{end_seconds:.3f}s"
+            )
+        return ScanScoresReady(tuple(times), tuple(score_values), command.generation)
 
     def _compare_projections(
         self,
@@ -931,6 +1141,7 @@ class MosaicScanWorker:
                 batch_size,
                 device,
                 metadata,
+                reusable_rocdecoder=self._reusable_rocdecoder,
             )
             with reader:
                 batch_and_pts = next(reader.frames(seek_ts=seconds), None)

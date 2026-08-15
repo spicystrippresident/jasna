@@ -67,6 +67,19 @@ def _fake_section_widgets() -> dict:
         "fp16_mode": _FakeWidget(1),
         "detection_model": _FakeWidget("rfdetr-v6"),
         "detection_score_threshold": _FakeWidget(0.35),
+        "pre_scan_policy": _FakeValueMenu(
+            {"auto": "Automatic", "scan": "Always scan", "off": "No scan"},
+            "auto",
+        ),
+        "pre_scan_full_threshold": _FakeWidget(0.85),
+        "pre_scan_coarse_interval": _FakeValueMenu(
+            {"0.5": "0.5 s", "1.0": "1.0 s", "2.0": "2.0 s", "3.0": "3.0 s", "5.0": "5.0 s"},
+            "2.0",
+        ),
+        "pre_scan_fine_interval": _FakeValueMenu(
+            {"0.25": "0.25 s", "0.5": "0.5 s", "1.0": "1.0 s"},
+            "0.5",
+        ),
         "compile_basicvsrpp": _FakeWidget(1),
         "file_conflict": _FakeValueMenu({"auto_rename": "A", "overwrite": "B", "skip": "C"}, "skip"),
         "temporal_overlap": _FakeWidget(8),
@@ -74,6 +87,7 @@ def _fake_section_widgets() -> dict:
         "min_detection_duration": _FakeWidget(2),
         "scene_detection": _FakeWidget(0),
         "enable_crossfade": _FakeWidget(0),
+        "save_run_log": _FakeWidget(0),
         "vr_mode": _FakeValueMenu({"auto": "自動", "off": "オフ"}, "off"),
         "denoise_strength": _FakeValueMenu({"none": "なし", "high": "高"}, "high"),
         "denoise_step": _FakeValueMenu({"after_primary": "一", "after_secondary": "二"}, "after_secondary"),
@@ -125,6 +139,10 @@ def test_sections_collect_internal_values_without_translation_lookups() -> None:
     values = _collect_all(_fake_section_widgets())
 
     assert values["file_conflict"] == "skip"
+    assert values["pre_scan_policy"] == "auto"
+    assert values["pre_scan_full_threshold"] == pytest.approx(0.85)
+    assert values["pre_scan_coarse_interval"] == pytest.approx(2.0)
+    assert values["pre_scan_fine_interval"] == pytest.approx(0.5)
     assert values["vr_mode"] == "off"
     assert values["denoise_strength"] == "high"
     assert values["denoise_step"] == "after_secondary"

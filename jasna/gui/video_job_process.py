@@ -18,6 +18,7 @@ from jasna.gui.models import (
     JobItem,
     JobProcessingSnapshot,
     JobStatus,
+    SegmentSelectionMode,
 )
 from jasna.segments import SegmentRange
 
@@ -45,6 +46,7 @@ def build_video_job_request(
             "input_root": str(job.input_root) if job.input_root is not None else None,
             "duration_seconds": job.duration_seconds,
             "segments": [asdict(segment) for segment in snapshot.segments],
+            "segment_selection_mode": snapshot.segment_selection_mode.value,
             "detection_model": snapshot.detection_model,
             "detection_score_threshold": snapshot.detection_score_threshold,
             "vr_projection": snapshot.vr_projection,
@@ -119,6 +121,12 @@ def _load_request(path: Path) -> tuple[JobItem, AppSettings, dict[str, Any]]:
         segments=tuple(
             SegmentRange(float(segment["start"]), float(segment["end"]))
             for segment in raw_job.get("segments", ())
+        ),
+        segment_selection_mode=SegmentSelectionMode(
+            raw_job.get(
+                "segment_selection_mode",
+                "manual" if raw_job.get("segments") else "default",
+            )
         ),
         detection_model=raw_job.get("detection_model"),
         detection_score_threshold=raw_job.get("detection_score_threshold"),
@@ -223,6 +231,9 @@ def run_video_job_file(
             if output_path is None:
                 raise RuntimeError("completed video job did not record its output path")
             result["output_path"] = str(output_path)
+            result["processing_path"] = (
+                processor.completed_processing_path(job.id) or "full"
+            )
         _emit_event(output_stream, result)
         return 0
     except Exception as error:
