@@ -275,6 +275,7 @@ ZH = {
         "pre_scan_interval_1_0": "1.0 秒",
         "pre_scan_interval_2_0": "2.0 秒",
         "pre_scan_interval_3_0": "3.0 秒",
+        "pre_scan_interval_4_0": "4.0 秒",
         "pre_scan_interval_5_0": "5.0 秒",
         "fp16_mode": "FP16 模式",
         "compile_basicvsrpp": "编译 BasicVSR++",
@@ -479,7 +480,7 @@ ZH = {
 
         "tip_pre_scan_policy": "控制处理前使用的扫描方式。自动模式先按设定的粗扫描间隔取样，根据结果选择全视频处理或精确扫描；始终扫描会按设定的精确扫描间隔取样，并跳过没有马赛克的区间；不单独扫描会直接处理完整视频。扫描会自动支持从磁盘检查点继续。",
         "tip_pre_scan_full_threshold": "在自动模式中，检测到的时间覆盖率达到或超过此归一化数值时选择全视频处理；覆盖率较低时使用精确扫描。默认值：85%（0.85）。",
-        "tip_pre_scan_coarse_interval": "自动模式第一阶段路由扫描的取样间隔。间隔越大越快，但细节越少。默认值：2.0 秒。",
+        "tip_pre_scan_coarse_interval": "自动模式自适应粗扫的目标间隔。相近关键帧直接取样；关键帧过密时跳过多余 GOP，过疏时补充目标点。默认值：4.0 秒。",
         "tip_pre_scan_fine_interval": "精确预扫描的取样间隔。间隔越小越准确，但速度越慢。默认值：0.5 秒。",
 
         # Preset button tooltips

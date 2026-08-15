@@ -275,6 +275,7 @@ EN = {
         "pre_scan_interval_1_0": "1.0 s",
         "pre_scan_interval_2_0": "2.0 s",
         "pre_scan_interval_3_0": "3.0 s",
+        "pre_scan_interval_4_0": "4.0 s",
         "pre_scan_interval_5_0": "5.0 s",
         "fp16_mode": "FP16 Mode",
         "compile_basicvsrpp": "Compile BasicVSR++",
@@ -479,7 +480,7 @@ EN = {
         
         "tip_pre_scan_policy": "Controls the scan used before restoration. Auto uses the configured coarse interval to choose full-video processing or a precise scan. Always scan uses the configured precise interval and skips mosaic-free ranges. No separate scan processes the full video directly. Scanning automatically supports resuming from on-disk checkpoints.",
         "tip_pre_scan_full_threshold": "In Auto mode, the normalized detected-time coverage at or above this value selects full-video processing; lower coverage uses the precise scan. Default: 85% (0.85).",
-        "tip_pre_scan_coarse_interval": "Sampling spacing for Auto's first routing scan. Larger intervals are faster but provide less detail. Default: 2.0 seconds.",
+        "tip_pre_scan_coarse_interval": "Target spacing for Auto's adaptive coarse scan. Nearby keyframes are sampled directly; dense GOPs are skipped and sparse GOPs fill target samples. Default: 4.0 seconds.",
         "tip_pre_scan_fine_interval": "Sampling spacing for the precise pre-scan. Smaller intervals are more accurate but slower. Default: 0.5 seconds.",
 
         # Preset button tooltips

@@ -166,10 +166,17 @@ The Basic settings page adds **Pre-scan policy** with three values:
 
 Routing and defaults:
 
-- Auto samples one frame every `2.0s`. Zero hits select an atomic FFmpeg source
-  remux. Coverage at or above `85%` selects full restoration. Anything between
-  those cases enters the precise scan. The threshold and coarse interval are
-  configurable.
+- Auto uses a configurable coarse target interval of `4.0s`. A local GOP whose
+  keyframe gap is within `S ± 25%` is sampled directly at its keyframe. Dense
+  GOP runs select the keyframes nearest the target cadence; sparse GOPs retain
+  `S`-spaced targets but decode all targets in one seek per GOP. A small
+  frame/time-base epsilon accepts ordinary NTSC timestamp drift such as
+  `5.005s` without integer rounding.
+- Irregular keyframe samples are weighted by the time represented between
+  adjacent midpoints, so scene-cut regions with more keyframes do not bias the
+  coverage estimate. Zero hits select an atomic FFmpeg source remux. Coverage
+  at or above `85%` selects full restoration. Anything between those cases
+  enters the precise scan; the threshold remains configurable.
 - Scan skips the coarse pass and samples every `0.5s`. Auto uses the same
   precise interval after choosing the scan route. The precise interval is
   configurable.
@@ -182,12 +189,22 @@ Routing and defaults:
 - Automatic ranges fall back to full restoration when the source is not smart-
   render compatible. Manual ranges preserve strict failure behavior.
 
+The coarse default was increased from `2.0s` to `4.0s` after a full-length run
+showed that the old sparse stride still decoded the complete source. The
+adaptive route now skips dense GOPs and seeks regular/sparse GOPs instead of
+decoding every intervening frame. This changes only Auto's initial coverage
+estimate; videos routed to precise scanning still use the `0.5s` pass and
+continuous boundary checks.
+
 Checkpoints are always written; there is intentionally no additional toggle:
 
 - The signature binds source identity, output path, detector name and weights,
   threshold, FP16, VR mode, and every scan setting.
 - Detector batches persist exact source PTS and scores, allowing stop, failure,
   or system-restart resume without shifting the sample grid.
+- The signature includes the adaptive GOP policy, tolerance ratio, and
+  duration-weighted coverage policy, invalidating incompatible old coarse
+  checkpoints.
 - Boundary request-frame keys are persisted so an interrupted refinement does
   not decode the same window again.
 - The isolated result includes the actual output path and the final
@@ -265,6 +282,15 @@ Primary implementation paths:
 - The transition route restored `21.468-51.468s` (1,888 processing frames).
   Source and final output both contained 3,085 frames at 8192x4096, HEVC Main
   10, `yuv420p10le`. Source/output durations were `51.515s` and `51.518s`.
+- The adaptive coarse route was then measured on a complete 8192x4096,
+  59.94 fps, 10-bit HEVC SBS source: `1610.542s`, 96,536 frames. It planned 327
+  keyframe samples and completed in `65.393s` with `51.1788%` time-weighted
+  coverage. The previous 2-second sequential coarse pass on the same source
+  took about `549s` and reported `50.5%`, so the adaptive route was about
+  `8.4x` faster with a `+0.68` percentage-point coverage difference. The
+  route-only harness lowered only the full-route threshold so it stopped after
+  coarse scanning; detector/model settings were unchanged. It generated no
+  media output and reported no rocDecode, OOM, or detector error.
 
 ### AMD boundary-refinement failure and fix
 

@@ -256,6 +256,7 @@ KO = {
         "pre_scan_interval_1_0": "1.0초",
         "pre_scan_interval_2_0": "2.0초",
         "pre_scan_interval_3_0": "3.0초",
+        "pre_scan_interval_4_0": "4.0초",
         "pre_scan_interval_5_0": "5.0초",
         "fp16_mode": "FP16 모드",
         "compile_basicvsrpp": "BasicVSR++ 컴파일",
@@ -459,7 +460,7 @@ KO = {
 
         "tip_pre_scan_policy": "복원 전에 사용할 스캔 방식을 정합니다. 자동은 설정한 거친 스캔 간격으로 확인해 전체 영상 처리와 정밀 스캔 중 하나를 선택합니다. 항상 스캔은 설정한 정밀 스캔 간격으로 확인하고 모자이크가 없는 구간을 건너뜁니다. 별도 스캔 안 함은 추가 스캔 없이 전체 영상을 처리합니다. 스캔은 디스크 체크포인트에서 자동으로 재개됩니다.",
         "tip_pre_scan_full_threshold": "자동 모드에서 감지된 시간 범위의 정규화된 커버리지가 이 값 이상이면 전체 영상 처리를 선택하고, 낮으면 정밀 스캔을 사용합니다. 기본값: 85% (0.85).",
-        "tip_pre_scan_coarse_interval": "자동 모드의 첫 라우팅 스캔에서 사용할 샘플 간격입니다. 간격이 길수록 빠르지만 세부 정보가 줄어듭니다. 기본값: 2.0초.",
+        "tip_pre_scan_coarse_interval": "자동 모드의 적응형 대략 스캔 목표 간격입니다. 가까운 키프레임을 직접 사용하고, 조밀한 GOP는 건너뛰며, 성긴 GOP에는 목표 지점을 보충합니다. 기본값: 4.0초.",
         "tip_pre_scan_fine_interval": "정밀 사전 스캔에서 사용할 샘플 간격입니다. 짧을수록 정확하지만 느려집니다. 기본값: 0.5초.",
 
         # Preset button tooltips

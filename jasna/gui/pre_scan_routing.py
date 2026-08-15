@@ -20,7 +20,10 @@ from typing import Callable, Literal
 
 from jasna.gui.models import AppSettings
 from jasna.gui.mosaic_scan import (
+    ADAPTIVE_COARSE_POLICY_VERSION,
+    ADAPTIVE_COARSE_TOLERANCE_RATIO,
     SCAN_SCORE_FLOOR,
+    AdaptiveCoarsePlan,
     MosaicScanResult,
     MosaicScanWorker,
     ScanCheckpoint,
@@ -30,14 +33,16 @@ from jasna.gui.mosaic_scan import (
     ScanScoresFailed,
     ScanScoresReady,
     ScanStatus,
+    plan_adaptive_coarse_scan,
     scan_sample_stride,
 )
+from jasna.media.splice import probe_keyframes
 from jasna.segments import SegmentRange, normalize_segments, segments_from_scores
 from jasna.smart_render_workspace import _write_json_atomic, source_identity
 
 
 PRE_SCAN_SCHEMA_VERSION = 1
-PRE_SCAN_ALGORITHM_VERSION = "jasna-pre-scan-v1"
+PRE_SCAN_ALGORITHM_VERSION = "jasna-pre-scan-v2-adaptive-coarse"
 CHECKPOINT_SAMPLE_BATCH = 256
 CHECKPOINT_MAX_SECONDS = 30.0
 TIMELINE_HEAD_TAIL_PAD_SECONDS = 5.0
@@ -81,17 +86,65 @@ def sampled_coverage(
     *,
     threshold: float,
 ) -> float:
-    """Estimate covered time from uniform sample bins, not a raw hit count."""
+    """Estimate hit coverage from sample time, not an unweighted hit count.
 
-    bins = segments_from_scores(
-        result.times,
-        result.scores,
-        threshold=float(threshold),
-        stride=float(result.stride),
-        duration=float(result.duration),
-        pad=0.0,
+    The established fixed-grid scanner remains byte-for-byte equivalent to its
+    old [sample, sample + stride) bins.  Adaptive coarse samples are irregular
+    (keyframes and sparse-GOP targets), so their duration is apportioned by
+    midpoint cells; dense scene-cut regions then carry only the short time they
+    actually represent.
+    """
+
+    times = tuple(float(value) for value in result.times)
+    scores = tuple(float(value) for value in result.scores)
+    if len(times) != len(scores):
+        raise ValueError("scan times and scores must have the same length")
+    duration = float(result.duration)
+    stride = float(result.stride)
+    threshold = float(threshold)
+    if not math.isfinite(duration) or duration < 0:
+        raise ValueError("scan duration must be finite and non-negative")
+    if not math.isfinite(stride) or stride <= 0:
+        raise ValueError("scan stride must be finite and positive")
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError("scan threshold must be between zero and one")
+    if not times:
+        return 0.0
+    if any(
+        not math.isfinite(seconds)
+        or seconds < 0
+        or (index and seconds < times[index - 1])
+        for index, seconds in enumerate(times)
+    ):
+        raise ValueError("scan sample times must be ordered finite non-negative values")
+    if any(not math.isfinite(score) or not 0.0 <= score <= 1.0 for score in scores):
+        raise ValueError("scan scores must be finite values between zero and one")
+
+    # Existing precise and legacy fixed-grid coarse scans retain their exact
+    # coverage behavior, including the terminal bin's historical stride.
+    grid_epsilon = max(1e-9, min(0.01, stride * 0.001))
+    uniform = len(times) <= 1 or all(
+        abs((current - previous) - stride) <= grid_epsilon
+        for previous, current in zip(times, times[1:])
     )
-    return segment_coverage(bins, result.duration)
+    if uniform:
+        bins = segments_from_scores(
+            times,
+            scores,
+            threshold=threshold,
+            stride=stride,
+            duration=duration,
+            pad=0.0,
+        )
+        return segment_coverage(bins, duration)
+
+    covered = 0.0
+    for index, (seconds, score) in enumerate(zip(times, scores)):
+        left = 0.0 if index == 0 else (times[index - 1] + seconds) / 2.0
+        right = duration if index + 1 == len(times) else (seconds + times[index + 1]) / 2.0
+        if score >= threshold:
+            covered += max(0.0, min(duration, right) - max(0.0, left))
+    return min(1.0, covered / duration) if duration > 0 else 0.0
 
 
 def normalize_scan_segments(
@@ -459,6 +512,11 @@ def _checkpoint_signature(
             "full_threshold": float(settings.pre_scan_full_threshold),
             "coarse_interval": float(settings.pre_scan_coarse_interval),
             "fine_interval": float(settings.pre_scan_fine_interval),
+            "adaptive_coarse": {
+                "policy_version": ADAPTIVE_COARSE_POLICY_VERSION,
+                "tolerance_ratio": ADAPTIVE_COARSE_TOLERANCE_RATIO,
+                "coverage_policy": "duration-weighted-midpoints-v1",
+            },
             "vr_mode": str(settings.vr_mode),
             "pad_seconds": TIMELINE_HEAD_TAIL_PAD_SECONDS,
             "merge_gap_seconds": TIMELINE_MERGE_GAP_SECONDS,
@@ -572,8 +630,12 @@ class PreScanCoordinator:
             raise PreScanFailed("扫描间隔必须大于 0 秒")
         if policy == "auto":
             coarse_interval = coarse_setting
-            self._log("INFO", f"阶段：自动粗扫（每 {coarse_interval:g} 秒一帧）")
-            coarse, _worker = self._run_stage("coarse", coarse_interval)
+            self._log("INFO", f"阶段：自动粗扫（目标间隔 {coarse_interval:g} 秒）")
+            coarse, _worker = self._run_stage(
+                "coarse",
+                coarse_interval,
+                adaptive_coarse=True,
+            )
             coverage = sampled_coverage(coarse, threshold=threshold)
             self._log("INFO", f"粗扫有码覆盖率：{coverage:.1%}")
             route = coarse_route(
@@ -627,6 +689,40 @@ class PreScanCoordinator:
         self._log("INFO", f"最终路线：{outcome.processing_path}")
         return outcome
 
+    def _adaptive_coarse_plan(self, target_interval: float) -> AdaptiveCoarsePlan:
+        """Build a fresh deterministic plan only when coarse work is needed."""
+
+        if self._stopped():
+            raise PreScanStopped("pre-scan stopped")
+        self._log("INFO", "粗扫：读取安全关键帧索引")
+        try:
+            index = probe_keyframes(self.source, self.metadata)
+            plan = plan_adaptive_coarse_scan(
+                index,
+                duration=float(self.metadata.duration),
+                target_interval=float(target_interval),
+                fps=float(self.metadata.video_fps),
+                time_base=float(self.metadata.time_base),
+            )
+        except PreScanStopped:
+            raise
+        except Exception as exc:
+            # No sequential/CPU fallback is trustworthy here: a partial or
+            # unsafe keyframe index would invalidate the adaptive coverage.
+            raise PreScanFailed(f"粗扫关键帧索引失败：{exc}") from exc
+        if self._stopped():
+            raise PreScanStopped("pre-scan stopped")
+        regular_groups = sum(group.mode == "regular" for group in plan.groups)
+        dense_groups = sum(group.mode == "dense" for group in plan.groups)
+        sparse_groups = sum(group.mode == "sparse" for group in plan.groups)
+        self._log(
+            "INFO",
+            "粗扫关键帧计划："
+            f"{plan.sample_count} 个采样点，{len(plan.groups)} 次 seek，"
+            f"常规/密集/稀疏 GOP={regular_groups}/{dense_groups}/{sparse_groups}",
+        )
+        return plan
+
     def _run_stage(
         self,
         name: str,
@@ -634,37 +730,50 @@ class PreScanCoordinator:
         *,
         seed_samples: dict[int, tuple[float, float]] | None = None,
         keep_worker: bool = False,
+        adaptive_coarse: bool = False,
     ) -> tuple[MosaicScanResult, object | None]:
         fps = float(self.metadata.video_fps)
         actual_stride = scan_sample_stride(fps, seconds=requested_stride) / fps
         duration = float(self.metadata.duration)
-        saved = self.checkpoint.samples(name, actual_stride)
-        if self.checkpoint.stage_complete(name, actual_stride):
-            result = _result_from_samples(saved, stride=actual_stride, duration=duration)
+        # A keyframe plan uses the requested S exactly.  Fine scanning retains
+        # its historical frame-rounded stride and is deliberately unchanged.
+        stage_stride = float(requested_stride) if adaptive_coarse else actual_stride
+        saved = self.checkpoint.samples(name, stage_stride)
+        if self.checkpoint.stage_complete(name, stage_stride):
+            result = _result_from_samples(saved, stride=stage_stride, duration=duration)
             self._log("INFO", f"扫描断点：复用 {name} 的 {len(saved)} 个采样点")
             worker = self._start_service_worker(actual_stride, saved, seed_samples) if keep_worker else None
             return result, worker
 
         known = dict(seed_samples or {})
         known.update(saved)
+        adaptive_plan = (
+            self._adaptive_coarse_plan(requested_stride) if adaptive_coarse else None
+        )
         # Seeking into an incomplete stage re-anchors frame-stride sampling in
         # the decoder and can produce a different sample grid.  Decode from the
         # beginning and let MosaicScanWorker skip detector inference only for
         # checkpointed exact source PTS values.  Decode is cheap compared with
         # inference and this also resumes safely after non-contiguous batches.
+        worker_kwargs = {
+            "stride_seconds": requested_stride,
+            "start_seconds": 0.0,
+            "known_sample_scores": {key: value[1] for key, value in known.items()},
+            "emit_checkpoints": True,
+        }
+        if adaptive_plan is not None:
+            worker_kwargs["adaptive_coarse_plan"] = adaptive_plan
         worker = self._worker_factory(
             self.source,
             self.metadata,
             self.settings,
-            stride_seconds=requested_stride,
-            start_seconds=0.0,
-            known_sample_scores={key: value[1] for key, value in known.items()},
-            emit_checkpoints=True,
+            **worker_kwargs,
         )
         self._active_worker = worker
         worker.start()
         stopped_requested = False
         retained_worker = False
+        received_checkpoint = False
         try:
             while True:
                 if self._stopped() and not stopped_requested:
@@ -675,9 +784,10 @@ class PreScanCoordinator:
                 except queue.Empty:
                     continue
                 if isinstance(event, ScanCheckpoint):
+                    received_checkpoint = True
                     self.checkpoint.add_stage_samples(
                         name,
-                        actual_stride,
+                        stage_stride,
                         event.times,
                         event.scores,
                         sample_keys=event.sample_keys,
@@ -689,19 +799,24 @@ class PreScanCoordinator:
                 elif isinstance(event, ScanFailed):
                     raise PreScanFailed(event.message)
                 elif isinstance(event, ScanCompleted):
-                    self.checkpoint.add_stage_samples(
-                        name,
-                        actual_stride,
-                        event.result.times,
-                        event.result.scores,
-                    )
+                    # Adaptive coarse checkpoints carry exact decoded PTS
+                    # keys.  Do not append a time-base-rounded copy of the
+                    # final result over them.  Fine scanning deliberately
+                    # retains its established completion behavior.
+                    if not adaptive_coarse or not received_checkpoint:
+                        self.checkpoint.add_stage_samples(
+                            name,
+                            stage_stride,
+                            event.result.times,
+                            event.result.scores,
+                        )
                     self.checkpoint.flush()
                     if event.stopped or self._stopped():
                         raise PreScanStopped("pre-scan stopped")
-                    self.checkpoint.mark_stage_complete(name, actual_stride)
-                    saved = self.checkpoint.samples(name, actual_stride)
+                    self.checkpoint.mark_stage_complete(name, stage_stride)
+                    saved = self.checkpoint.samples(name, stage_stride)
                     result = _result_from_samples(
-                        saved, stride=actual_stride, duration=duration
+                        saved, stride=stage_stride, duration=duration
                     )
                     if keep_worker:
                         retained_worker = True

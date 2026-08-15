@@ -191,7 +191,7 @@ class AppSettings:
     detection_score_threshold: float = 0.35
     pre_scan_policy: str = "auto"  # auto, scan, off
     pre_scan_full_threshold: float = 0.85
-    pre_scan_coarse_interval: float = 2.0
+    pre_scan_coarse_interval: float = 4.0
     pre_scan_fine_interval: float = 0.5
     max_detection_gap: int = 2
     min_detection_duration: int = 2

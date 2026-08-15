@@ -14,9 +14,10 @@ import math
 import queue
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from jasna.gui.models import AppSettings
 from jasna.media import VideoMetadata
@@ -26,6 +27,12 @@ SCAN_SCORE_FLOOR = 0.05
 SCAN_MASK_HW = (90, 160)
 SCAN_VRAM_RESERVE_BYTES = 750 * 1024**2
 SCAN_SPILL_CHUNK_BYTES = 64 * 1024**2
+
+# The automatic pre-scan has a separate, keyframe-aware coarse route.  Keep
+# its policy values explicit: they are part of the durable checkpoint
+# signature in pre_scan_routing.py.
+ADAPTIVE_COARSE_POLICY_VERSION = "keyframe-gop-v1"
+ADAPTIVE_COARSE_TOLERANCE_RATIO = 0.25
 
 
 @dataclass(frozen=True)
@@ -64,6 +71,287 @@ def scan_sample_stride(fps: float, *, seconds: float = 1.0) -> int:
     """Frame stride for one detection sample roughly every ``seconds``."""
 
     return max(1, round(float(fps) * float(seconds)))
+
+
+@dataclass(frozen=True)
+class AdaptiveCoarseDecodeGroup:
+    """One keyframe seek plus every coarse sample it can produce.
+
+    ``target_pts`` are source PTS values relative to ``start_pts`` in the
+    enclosing plan.  Direct-keyframe groups have one target.  Sparse GOPs can
+    hold multiple S-spaced targets so a decoder is opened only once for that
+    GOP, rather than once for every target.
+    """
+
+    mode: Literal["regular", "dense", "sparse"]
+    start_seconds: float
+    end_seconds: float
+    target_seconds: tuple[float, ...]
+    target_pts: tuple[int, ...]
+    frame_stride: int
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"regular", "dense", "sparse"}:
+            raise ValueError(f"unknown adaptive coarse group mode {self.mode!r}")
+        if not math.isfinite(self.start_seconds) or self.start_seconds < 0:
+            raise ValueError("adaptive coarse group start must be finite and non-negative")
+        if not math.isfinite(self.end_seconds) or self.end_seconds <= self.start_seconds:
+            raise ValueError("adaptive coarse group end must be after its start")
+        if not self.target_pts or len(self.target_pts) != len(self.target_seconds):
+            raise ValueError("adaptive coarse group targets must be non-empty and aligned")
+        if self.frame_stride <= 0:
+            raise ValueError("adaptive coarse group frame stride must be positive")
+        previous_seconds = -1.0
+        previous_pts = -1
+        for seconds, pts in zip(self.target_seconds, self.target_pts):
+            if not math.isfinite(seconds) or seconds < self.start_seconds:
+                raise ValueError("adaptive coarse target must be finite and within its GOP")
+            if seconds < previous_seconds or int(pts) < previous_pts:
+                raise ValueError("adaptive coarse targets must be ordered")
+            previous_seconds = float(seconds)
+            previous_pts = int(pts)
+
+
+@dataclass(frozen=True)
+class AdaptiveCoarsePlan:
+    """Deterministic keyframe/GOP-aware sampling plan for one coarse scan."""
+
+    target_interval: float
+    tolerance: float
+    classification_epsilon: float
+    start_pts: int
+    time_base: float
+    duration: float
+    groups: tuple[AdaptiveCoarseDecodeGroup, ...]
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.target_interval) or self.target_interval <= 0:
+            raise ValueError("adaptive coarse target interval must be positive")
+        if not math.isfinite(self.tolerance) or self.tolerance < 0:
+            raise ValueError("adaptive coarse tolerance must be finite and non-negative")
+        if not math.isfinite(self.classification_epsilon) or self.classification_epsilon < 0:
+            raise ValueError("adaptive coarse epsilon must be finite and non-negative")
+        if not math.isfinite(self.time_base) or self.time_base <= 0:
+            raise ValueError("adaptive coarse time base must be positive")
+        if not math.isfinite(self.duration) or self.duration <= 0:
+            raise ValueError("adaptive coarse duration must be positive")
+
+    @property
+    def sample_count(self) -> int:
+        return sum(len(group.target_pts) for group in self.groups)
+
+
+def adaptive_coarse_gop_epsilon(
+    *,
+    target_interval: float,
+    fps: float,
+    time_base: float,
+) -> float:
+    """Return a deliberately small timestamp tolerance for GOP classification.
+
+    A half frame accommodates common CFR timestamp/fps disagreement (for
+    example 59.94 fps material whose measured 5.005 s GOP is nominally 5 s),
+    while the caps keep this from turning a materially sparse/dense GOP into a
+    regular one.  This intentionally compares real seconds; it never rounds a
+    GOP duration to an integer.
+    """
+
+    target_interval = float(target_interval)
+    fps = float(fps)
+    time_base = abs(float(time_base))
+    if not math.isfinite(target_interval) or target_interval <= 0:
+        raise ValueError("adaptive coarse target interval must be positive")
+    if not math.isfinite(fps) or fps <= 0:
+        raise ValueError("adaptive coarse fps must be positive")
+    if not math.isfinite(time_base) or time_base <= 0:
+        raise ValueError("adaptive coarse time base must be positive")
+    tolerance = target_interval * ADAPTIVE_COARSE_TOLERANCE_RATIO
+    # 50 ms is safely below a normal coarse tolerance, and 10% of that
+    # tolerance protects very small user-configured intervals.
+    return min(max(time_base * 2.0, 0.5 / fps), 0.05, tolerance * 0.1)
+
+
+def plan_adaptive_coarse_scan(
+    index,
+    *,
+    duration: float,
+    target_interval: float,
+    fps: float,
+    time_base: float | None = None,
+) -> AdaptiveCoarsePlan:
+    """Plan the automatic coarse scan from a safe keyframe index.
+
+    The decision is made for each GOP, not from a whole-file GOP statistic:
+
+    * regular GOPs (S +/- 25%) sample their opening keyframe;
+    * dense runs choose the keyframes nearest S-spaced local targets; and
+    * sparse GOPs keep S-spaced targets in one grouped seek/decode operation.
+
+    The returned target PTS values are deterministic source-time keys.  Sparse
+    targets are resolved to the first decoded source frame at or after their
+    target PTS during execution; that exact PTS is what reaches checkpoints.
+    """
+
+    duration = float(duration)
+    target_interval = float(target_interval)
+    fps = float(fps)
+    index_time_base = float(index.time_base if time_base is None else time_base)
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError("adaptive coarse duration must be positive")
+    if not math.isfinite(target_interval) or target_interval <= 0:
+        raise ValueError("adaptive coarse target interval must be positive")
+    if not math.isfinite(fps) or fps <= 0:
+        raise ValueError("adaptive coarse fps must be positive")
+    if not math.isfinite(index_time_base) or index_time_base <= 0:
+        raise ValueError("adaptive coarse time base must be positive")
+
+    start_pts = int(index.start_pts)
+    tolerance = target_interval * ADAPTIVE_COARSE_TOLERANCE_RATIO
+    epsilon = adaptive_coarse_gop_epsilon(
+        target_interval=target_interval,
+        fps=fps,
+        time_base=index_time_base,
+    )
+    lower = target_interval - tolerance
+    upper = target_interval + tolerance
+    keyframes = tuple(sorted({int(pts) for pts in index.pts if int(pts) >= start_pts}))
+    if not keyframes:
+        raise ValueError("adaptive coarse scan requires at least one keyframe")
+
+    gops: list[dict[str, float | int | str]] = []
+    for position, pts in enumerate(keyframes):
+        start_seconds = max(0.0, (pts - start_pts) * index_time_base)
+        if start_seconds >= duration - epsilon:
+            continue
+        next_pts = keyframes[position + 1] if position + 1 < len(keyframes) else None
+        end_seconds = (
+            duration
+            if next_pts is None
+            else min(duration, max(start_seconds, (next_pts - start_pts) * index_time_base))
+        )
+        gap = end_seconds - start_seconds
+        if gap <= epsilon:
+            continue
+        if gap < lower - epsilon:
+            mode = "dense"
+        elif gap > upper + epsilon:
+            mode = "sparse"
+        else:
+            mode = "regular"
+        gops.append(
+            {
+                "mode": mode,
+                "start_pts": pts,
+                "start_seconds": start_seconds,
+                "end_seconds": end_seconds,
+            }
+        )
+    if not gops:
+        raise ValueError("adaptive coarse scan found no usable keyframe GOPs")
+
+    direct_groups: dict[int, AdaptiveCoarseDecodeGroup] = {}
+
+    def add_direct_group(gop: dict[str, float | int | str], mode: Literal["regular", "dense"]):
+        pts = int(gop["start_pts"])
+        seconds = float(gop["start_seconds"])
+        direct_groups.setdefault(
+            pts,
+            AdaptiveCoarseDecodeGroup(
+                mode=mode,
+                start_seconds=seconds,
+                end_seconds=float(gop["end_seconds"]),
+                target_seconds=(seconds,),
+                target_pts=(pts - start_pts,),
+                frame_stride=1,
+            ),
+        )
+
+    sparse_groups: list[AdaptiveCoarseDecodeGroup] = []
+    for gop in gops:
+        mode = str(gop["mode"])
+        if mode == "regular":
+            add_direct_group(gop, "regular")
+            continue
+        if mode != "sparse":
+            continue
+        start_seconds = float(gop["start_seconds"])
+        end_seconds = float(gop["end_seconds"])
+        start_key = int(gop["start_pts"]) - start_pts
+        target_seconds: list[float] = []
+        target_pts: list[int] = []
+        step = 0
+        while True:
+            seconds = start_seconds + step * target_interval
+            if seconds >= end_seconds - epsilon:
+                break
+            target_seconds.append(seconds)
+            target_pts.append(
+                start_key if step == 0 else max(0, round(seconds / index_time_base))
+            )
+            step += 1
+        if not target_pts:
+            # The GOP opening keyframe is always a safe sample, even for a
+            # duration shorter than the jitter guard above.
+            target_seconds.append(start_seconds)
+            target_pts.append(start_key)
+        sparse_groups.append(
+            AdaptiveCoarseDecodeGroup(
+                mode="sparse",
+                start_seconds=start_seconds,
+                end_seconds=end_seconds,
+                target_seconds=tuple(target_seconds),
+                target_pts=tuple(target_pts),
+                frame_stride=scan_sample_stride(fps, seconds=target_interval),
+            )
+        )
+
+    # A dense run is one local cadence.  Targets are intentionally not based
+    # on a whole-video median or a global frame number: scene-cut keyframes in
+    # one run must not change selection in a later unrelated GOP.
+    position = 0
+    while position < len(gops):
+        if gops[position]["mode"] != "dense":
+            position += 1
+            continue
+        run_start = position
+        while position + 1 < len(gops) and gops[position + 1]["mode"] == "dense":
+            position += 1
+        run_end = position
+        candidates = gops[run_start : run_end + 1]
+        run_start_seconds = float(candidates[0]["start_seconds"])
+        run_end_seconds = float(candidates[-1]["end_seconds"])
+        target = run_start_seconds
+        selected_pts: set[int] = set()
+        while target < run_end_seconds - epsilon:
+            candidate = min(
+                candidates,
+                key=lambda item: (
+                    abs(float(item["start_seconds"]) - target),
+                    float(item["start_seconds"]),
+                ),
+            )
+            candidate_pts = int(candidate["start_pts"])
+            if candidate_pts not in selected_pts:
+                add_direct_group(candidate, "dense")
+                selected_pts.add(candidate_pts)
+            target += target_interval
+        position += 1
+
+    groups = tuple(
+        sorted(
+            (*direct_groups.values(), *sparse_groups),
+            key=lambda group: (group.start_seconds, group.target_pts[0]),
+        )
+    )
+    return AdaptiveCoarsePlan(
+        target_interval=target_interval,
+        tolerance=tolerance,
+        classification_epsilon=epsilon,
+        start_pts=start_pts,
+        time_base=index_time_base,
+        duration=duration,
+        groups=groups,
+    )
 
 
 SCAN_PARALLEL_DECODERS = 2
@@ -447,6 +735,158 @@ class _ScanTensorCollector:
         return scores, masks
 
 
+class _AdaptiveCoarseBatchBuffer:
+    """Accumulate Torch-owned selected frames into detector-sized batches.
+
+    All current ``NvidiaVideoReader`` paths return newly allocated Torch
+    tensors: rocDecode's ``_convert_group``, VALI's frame loop, and both PyAV
+    conversion paths each construct a ``torch.empty`` output batch.  A direct
+    full batch can therefore be used immediately.  Samples spanning reader
+    closures are copied into this Torch-owned accumulator only because their
+    independent allocations must be combined before one detector invocation.
+    """
+
+    def __init__(self, torch_mod, batch_size: int) -> None:
+        self._torch = torch_mod
+        self.batch_size = int(batch_size)
+        if self.batch_size <= 0:
+            raise ValueError("adaptive coarse detector batch size must be positive")
+        self._frames = None
+        self._pts: list[int] = []
+        self._count = 0
+
+    def add(self, batch, pts_list: list[int] | tuple[int, ...]):
+        """Add source-time-ordered samples and return completed detector batches."""
+
+        if batch.shape[0] != len(pts_list):
+            raise RuntimeError("Adaptive coarse decoder returned misaligned samples")
+        ready: list[tuple[object, tuple[int, ...]]] = []
+        offset = 0
+        total = len(pts_list)
+        while offset < total:
+            remaining = total - offset
+            if self._count == 0 and remaining >= self.batch_size:
+                end = offset + self.batch_size
+                # The source reader already owns this tensor.  It is consumed
+                # before the reader advances or closes, so no extra copy is
+                # required for a full detector batch.
+                ready.append((batch[offset:end], tuple(int(value) for value in pts_list[offset:end])))
+                offset = end
+                continue
+            if self._frames is None:
+                self._frames = self._torch.empty(
+                    (self.batch_size, *batch.shape[1:]),
+                    dtype=batch.dtype,
+                    device=batch.device,
+                )
+            take = min(self.batch_size - self._count, remaining)
+            self._frames[self._count : self._count + take].copy_(
+                batch[offset : offset + take]
+            )
+            self._pts.extend(int(value) for value in pts_list[offset : offset + take])
+            self._count += take
+            offset += take
+            if self._count == self.batch_size:
+                ready.append((self._frames, tuple(self._pts)))
+                self._frames = None
+                self._pts = []
+                self._count = 0
+        return tuple(ready)
+
+    def finish(self):
+        """Return the final short detector batch, if any."""
+
+        if not self._count:
+            return None
+        frames = self._frames[: self._count]
+        pts = tuple(self._pts)
+        self.discard()
+        return frames, pts
+
+    def discard(self) -> None:
+        self._frames = None
+        self._pts = []
+        self._count = 0
+
+
+def _decode_adaptive_coarse_group(
+    path: Path,
+    metadata: VideoMetadata,
+    device,
+    batch_size: int,
+    plan: AdaptiveCoarsePlan,
+    group: AdaptiveCoarseDecodeGroup,
+    *,
+    decode_backend: str | None,
+    reusable_rocdecoder,
+    stopped: Callable[[], bool],
+) -> Iterator[tuple[object, list[int]]]:
+    """Yield only planned samples from one keyframe-seeked GOP.
+
+    The reader is deliberately opened once per ``group``.  A sparse group
+    holds all of that GOP's S-spaced targets, so it cannot regress into the old
+    one-reader-per-target pattern.  The reader's source-side frame stride makes
+    rocDecode drop unneeded frames before RGB conversion; the PTS comparison
+    keeps the selected samples stable despite ordinary frame-rate jitter.
+    """
+
+    from jasna.media.video_decoder import NvidiaVideoReader
+
+    target_index = 0
+    # Decoder batches are independent of detector batches.  Returning after
+    # each selected source frame lets cancellation take effect before another
+    # S-long interval, while the one reader/seek remains alive for the entire
+    # grouped GOP.  The worker combines these owned frames into configured
+    # detector batches across GOP boundaries.
+    reader_batch_size = 1
+    with NvidiaVideoReader(
+        str(path),
+        reader_batch_size,
+        device,
+        metadata,
+        frame_stride=group.frame_stride,
+        prefer_software_decode=False,
+        decode_backend=decode_backend,
+        reusable_rocdecoder=reusable_rocdecoder,
+    ) as reader:
+        for batch, pts_list in reader.frames(seek_ts=group.start_seconds):
+            if stopped():
+                return
+            selected: list[int] = []
+            for position, pts in enumerate(pts_list):
+                sample_key = int(pts) - int(plan.start_pts)
+                if target_index >= len(group.target_pts):
+                    break
+                if sample_key < group.target_pts[target_index]:
+                    continue
+                # A source may have a VFR timestamp jump.  One decoded frame
+                # represents all passed requested targets, but it is emitted
+                # once so checkpoint keys remain unique and exact.
+                selected.append(position)
+                while (
+                    target_index < len(group.target_pts)
+                    and group.target_pts[target_index] <= sample_key
+                ):
+                    target_index += 1
+            if selected:
+                yield batch[selected], [int(pts_list[position]) for position in selected]
+                if target_index >= len(group.target_pts):
+                    return
+            if pts_list:
+                last_seconds = max(
+                    0.0,
+                    (int(pts_list[-1]) - int(plan.start_pts)) * plan.time_base,
+                )
+                if last_seconds >= group.end_seconds + plan.classification_epsilon:
+                    break
+        if not stopped() and target_index < len(group.target_pts):
+            target = group.target_seconds[target_index]
+            raise RuntimeError(
+                "Adaptive coarse GOP decode did not reach its planned sample "
+                f"at {target:.6f}s before the next keyframe"
+            )
+
+
 class MosaicScanWorker:
     """One-shot background scan of a whole video with the detection model.
 
@@ -454,7 +894,9 @@ class MosaicScanWorker:
     detector on every sampled frame at the ``SCAN_SCORE_FLOOR`` threshold, and
     collects per-sample scores plus merged low-res masks into preallocated
     tensors. A 750 MiB VRAM reserve switches collection to a reusable GPU
-    chunk backed by CPU storage. Stopping keeps everything scanned so far.
+    chunk backed by CPU storage.  Automatic coarse pre-scans may instead pass
+    an ``AdaptiveCoarsePlan`` to seek safe keyframes and group sparse-GOP
+    targets. Stopping keeps everything scanned so far.
     """
 
     def __init__(
@@ -471,6 +913,7 @@ class MosaicScanWorker:
         known_sample_scores: Mapping[int, float] | None = None,
         emit_checkpoints: bool = False,
         serve_only: bool = False,
+        adaptive_coarse_plan: AdaptiveCoarsePlan | None = None,
     ) -> None:
         self.path = Path(path)
         self.metadata = metadata
@@ -485,6 +928,7 @@ class MosaicScanWorker:
         }
         self.emit_checkpoints = bool(emit_checkpoints)
         self.serve_only = bool(serve_only)
+        self.adaptive_coarse_plan = adaptive_coarse_plan
         self.max_duration_seconds = (
             None if max_duration_seconds is None else float(max_duration_seconds)
         )
@@ -692,6 +1136,10 @@ class MosaicScanWorker:
 
     def _scan(self, detector) -> None:
         import torch
+
+        if self.adaptive_coarse_plan is not None:
+            self._scan_adaptive_coarse(detector, self.adaptive_coarse_plan)
+            return
 
         from jasna.accelerator import is_amd_device
         from jasna.media.video_decoder import NvidiaVideoReader
@@ -949,6 +1397,215 @@ class MosaicScanWorker:
             stride=sample_stride_seconds,
             duration=duration,
             completed_until=completed_until,
+        )
+        self.events.put(ScanCompleted(result, stopped))
+
+    def _scan_adaptive_coarse(
+        self,
+        detector,
+        plan: AdaptiveCoarsePlan,
+    ) -> None:
+        """Run the coarse-only keyframe/GOP plan without a sequential scan."""
+
+        import torch
+
+        from jasna.accelerator import is_amd_device
+
+        metadata = self.metadata
+        device = torch.device("cuda:0")
+        batch_size = int(self.settings.batch_size)
+        expected_samples = plan.sample_count
+        if expected_samples <= 0:
+            raise RuntimeError("Adaptive coarse scan planned no detection samples")
+
+        # The production AMD path must either use rocDecode or fail visibly;
+        # do not turn a native decoder failure into a hidden CPU scan.  Other
+        # vendors keep their existing reader backend routing.
+        decode_backend = "rocdecode" if is_amd_device(device) else None
+        collector: _ScanTensorCollector | None = None
+        times: list[float] = []
+        scores: list[float] = []
+        total_samples = 0
+        started = time.monotonic()
+        last_progress = -1.0
+        self._last_scan_segment_stats = []
+        batch_buffer = _AdaptiveCoarseBatchBuffer(torch, batch_size)
+
+        def record_detected_batch(batch, pts_list: tuple[int, ...]) -> None:
+            """Detect one completed adaptive batch and durably report its PTS."""
+
+            nonlocal collector, last_progress, total_samples
+            sample_count = len(pts_list)
+            if sample_count <= 0 or batch.shape[0] != sample_count:
+                raise RuntimeError("Adaptive coarse detector batch is misaligned")
+            if total_samples + sample_count > expected_samples:
+                raise RuntimeError("Adaptive coarse decoder returned more planned samples")
+            sample_keys = tuple(int(pts) - int(plan.start_pts) for pts in pts_list)
+            if any(sample_key < 0 for sample_key in sample_keys):
+                raise RuntimeError("Adaptive coarse decoder returned a PTS before stream start")
+
+            if not self.known_sample_scores:
+                detection_input = batch
+                if sample_count < batch_size:
+                    pad = detection_input[-1:].expand(
+                        batch_size - sample_count, -1, -1, -1
+                    )
+                    detection_input = torch.cat((detection_input, pad))
+                detected_scores, detected_masks = detector.scan_scores_masks(
+                    self._prepare_detection_batch(detection_input),
+                    mask_hw=SCAN_MASK_HW,
+                )
+                batch_scores = detected_scores[:sample_count]
+                batch_masks = self._source_projection_masks(detected_masks)[:sample_count]
+            else:
+                unknown = [
+                    position
+                    for position, sample_key in enumerate(sample_keys)
+                    if sample_key not in self.known_sample_scores
+                ]
+                batch_scores = torch.empty(
+                    (sample_count,), dtype=torch.float32, device=device
+                )
+                batch_masks = torch.zeros(
+                    (sample_count, *SCAN_MASK_HW), dtype=torch.uint8, device=device
+                )
+                for position, sample_key in enumerate(sample_keys):
+                    known_score = self.known_sample_scores.get(sample_key)
+                    if known_score is not None:
+                        batch_scores[position] = known_score
+                if unknown:
+                    detection_input = batch[unknown]
+                    if detection_input.shape[0] < batch_size:
+                        pad = detection_input[-1:].expand(
+                            batch_size - detection_input.shape[0], -1, -1, -1
+                        )
+                        detection_input = torch.cat((detection_input, pad))
+                    detected_scores, detected_masks = detector.scan_scores_masks(
+                        self._prepare_detection_batch(detection_input),
+                        mask_hw=SCAN_MASK_HW,
+                    )
+                    detected_masks = self._source_projection_masks(detected_masks)
+                    for detected_position, target_position in enumerate(unknown):
+                        batch_scores[target_position] = detected_scores[detected_position]
+                        batch_masks[target_position] = detected_masks[detected_position].to(
+                            torch.uint8
+                        )
+
+            if collector is None:
+                collector = _ScanTensorCollector(
+                    torch,
+                    capacity=expected_samples,
+                    mask_hw=SCAN_MASK_HW,
+                    batch_size=batch_size,
+                    device=device,
+                    on_spill=lambda: self.events.put(ScanStorageSpilled()),
+                )
+            collector.add(batch_scores, batch_masks, count=sample_count)
+            sample_times = tuple(
+                max(0.0, sample_key * plan.time_base) for sample_key in sample_keys
+            )
+            score_values = tuple(
+                float(value) for value in batch_scores.detach().float().cpu().tolist()
+            )
+            if self.emit_checkpoints:
+                self.events.put(ScanCheckpoint(sample_keys, sample_times, score_values))
+            times.extend(sample_times)
+            scores.extend(score_values)
+            total_samples += sample_count
+            fraction = min(1.0, total_samples / expected_samples)
+            if fraction - last_progress >= 0.01:
+                last_progress = fraction
+                elapsed = max(1e-6, time.monotonic() - started)
+                sample_rate = total_samples / elapsed
+                self.events.put(
+                    ScanProgress(
+                        fraction,
+                        total_samples * plan.target_interval / elapsed,
+                        (expected_samples - total_samples) / max(sample_rate, 1e-6),
+                    )
+                )
+
+        for group in plan.groups:
+            if self._stop_scan.is_set():
+                break
+            group_started = time.monotonic()
+            group_samples = 0
+            batches = _decode_adaptive_coarse_group(
+                self.path,
+                metadata,
+                device,
+                batch_size,
+                plan,
+                group,
+                decode_backend=decode_backend,
+                reusable_rocdecoder=self._reusable_rocdecoder,
+                stopped=self._stop_scan.is_set,
+            )
+            try:
+                for batch, pts_list in batches:
+                    if self._stop_scan.is_set():
+                        break
+                    sample_count = len(pts_list)
+                    if sample_count <= 0 or batch.shape[0] != sample_count:
+                        raise RuntimeError("Adaptive coarse decoder returned misaligned samples")
+                    group_samples += sample_count
+                    completed_batches = batch_buffer.add(batch, pts_list)
+                    for detection_batch, detection_pts in completed_batches:
+                        if self._stop_scan.is_set():
+                            break
+                        record_detected_batch(detection_batch, detection_pts)
+                    # Cross-reader samples have been copied into the owned
+                    # accumulator; direct full batches have already been
+                    # detected.  Drop this reader result before its context
+                    # closes so no source batch remains needlessly live.
+                    completed_batches = ()
+                    detection_batch = None
+                    detection_pts = ()
+                    del batch
+                    if self._stop_scan.is_set():
+                        break
+            finally:
+                batches.close()
+                self._last_scan_segment_stats.append(
+                    {
+                        "mode": group.mode,
+                        "start_seconds": group.start_seconds,
+                        "end_seconds": group.end_seconds,
+                        "samples": group_samples,
+                        "wall_seconds": time.monotonic() - group_started,
+                    }
+                )
+            if self._stop_scan.is_set():
+                break
+
+        stopped = self._stop_scan.is_set()
+        if not stopped:
+            tail = batch_buffer.finish()
+            if tail is not None and not self._stop_scan.is_set():
+                record_detected_batch(*tail)
+            stopped = self._stop_scan.is_set()
+        if stopped:
+            # Pending decoded-but-undetected samples are intentionally not
+            # checkpointed: the resume route will decode them again and retain
+            # only exact completed work.
+            batch_buffer.discard()
+        if not stopped and total_samples != expected_samples:
+            raise RuntimeError(
+                "Adaptive coarse scan completed without all planned samples "
+                f"({total_samples}/{expected_samples})"
+            )
+        if collector is None:
+            masks = torch.empty((0, *SCAN_MASK_HW), dtype=torch.uint8, device="cpu")
+        else:
+            collected_scores, masks = collector.finish()
+            scores = list(collected_scores)
+        result = MosaicScanResult(
+            times=tuple(times),
+            scores=tuple(scores),
+            masks=masks,
+            stride=plan.target_interval,
+            duration=plan.duration,
+            completed_until=times[-1] if times else 0.0,
         )
         self.events.put(ScanCompleted(result, stopped))
 

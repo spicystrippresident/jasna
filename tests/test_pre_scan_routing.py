@@ -7,10 +7,20 @@ from types import SimpleNamespace
 import pytest
 
 from jasna.gui.models import AppSettings
-from jasna.gui.mosaic_scan import MosaicScanResult, ScanCompleted, ScanScoresReady
+from jasna.gui.mosaic_scan import (
+    MosaicScanResult,
+    ScanCheckpoint,
+    ScanCompleted,
+    ScanFailed,
+    ScanScoresReady,
+)
 from jasna.gui.pre_scan_routing import (
+    PRE_SCAN_ALGORITHM_VERSION,
+    PreScanFailed,
     PreScanCoordinator,
+    PreScanStopped,
     _ScanCheckpointStore,
+    _checkpoint_signature,
     coarse_route,
     hit_sample_groups,
     normalize_scan_segments,
@@ -55,6 +65,21 @@ def test_coarse_zero_hits_selects_source_copy():
         detection_threshold=0.35,
         full_threshold=0.85,
     ) == "copy"
+
+
+def test_sampled_coverage_duration_weights_irregular_samples():
+    result = MosaicScanResult(
+        times=(0.0, 1.0, 2.0, 10.0),
+        scores=(0.9, 0.9, 0.0, 0.0),
+        masks=(),
+        stride=4.0,
+        duration=20.0,
+        completed_until=10.0,
+    )
+
+    # Midpoint cells are [0,.5), [.5,1.5), [1.5,6), [6,20): two
+    # dense keyframe hits therefore account for 1.5 s, not 50% of samples.
+    assert sampled_coverage(result, threshold=0.35) == pytest.approx(1.5 / 20.0)
 
 
 def test_fine_hit_groups_split_at_non_hits():
@@ -276,3 +301,193 @@ def test_incomplete_stage_decodes_from_start_and_reuses_exact_pts(tmp_path):
     assert created["start_seconds"] == 0.0
     assert created["known_sample_scores"] == {45_046: 0.8, 90_090: 0.4}
     assert created["emit_checkpoints"] is True
+
+
+def test_adaptive_coarse_checkpoint_keeps_exact_pts_and_reuses_completed_stage(tmp_path):
+    checkpoint = _ScanCheckpointStore(
+        tmp_path / "scan" / "manifest.json",
+        {"source": "demo", "algorithm": "adaptive"},
+        fps=59.94,
+        time_base=0.01,
+    )
+    created = []
+    plan = object()
+
+    class FakeWorker:
+        def __init__(self, *args, **kwargs):
+            created.append(kwargs)
+            self.events = queue.Queue()
+            self.events.put(ScanCheckpoint((0, 401), (0.0, 4.01), (0.1, 0.8)))
+            self.events.put(
+                ScanCompleted(
+                    MosaicScanResult(
+                        times=(0.0, 4.01),
+                        scores=(0.1, 0.8),
+                        masks=(),
+                        stride=4.0,
+                        duration=8.0,
+                        completed_until=4.01,
+                    ),
+                    stopped=False,
+                )
+            )
+
+        def start(self):
+            pass
+
+        def close(self):
+            pass
+
+        def join(self):
+            pass
+
+    coordinator = PreScanCoordinator.__new__(PreScanCoordinator)
+    coordinator.source = tmp_path / "video.mp4"
+    coordinator.output = tmp_path / "output.mp4"
+    coordinator.metadata = SimpleNamespace(video_fps=59.94, duration=8.0, time_base=0.01)
+    coordinator.settings = AppSettings()
+    coordinator._stopped = lambda: False
+    coordinator._log = lambda *_args: None
+    coordinator._progress = None
+    coordinator._worker_factory = FakeWorker
+    coordinator._active_worker = None
+    coordinator.checkpoint = checkpoint
+    coordinator._adaptive_coarse_plan = lambda _interval: plan
+
+    result, _worker = coordinator._run_stage("coarse", 4.0, adaptive_coarse=True)
+
+    assert result.stride == pytest.approx(4.0)
+    assert created[0]["adaptive_coarse_plan"] is plan
+    assert checkpoint.samples("coarse", 4.0) == {0: (0.0, 0.1), 401: (4.01, 0.8)}
+    assert checkpoint.stage_complete("coarse", 4.0)
+
+    # A complete stage neither re-probes its GOP policy nor opens a worker.
+    reused, _worker = coordinator._run_stage("coarse", 4.0, adaptive_coarse=True)
+    assert reused.times == pytest.approx((0.0, 4.01))
+    assert len(created) == 1
+
+
+def test_adaptive_coarse_cancellation_persists_completed_batches(tmp_path):
+    checkpoint = _ScanCheckpointStore(
+        tmp_path / "scan" / "manifest.json",
+        {"source": "demo", "algorithm": "adaptive"},
+        fps=60.0,
+        time_base=0.01,
+    )
+
+    class FakeWorker:
+        def __init__(self, *args, **kwargs):
+            self.events = queue.Queue()
+            self.events.put(ScanCheckpoint((0,), (0.0,), (0.8,)))
+            self.events.put(
+                ScanCompleted(
+                    MosaicScanResult(
+                        times=(0.0,),
+                        scores=(0.8,),
+                        masks=(),
+                        stride=4.0,
+                        duration=8.0,
+                        completed_until=0.0,
+                    ),
+                    stopped=True,
+                )
+            )
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def close(self):
+            pass
+
+        def join(self):
+            pass
+
+    coordinator = PreScanCoordinator.__new__(PreScanCoordinator)
+    coordinator.source = tmp_path / "video.mp4"
+    coordinator.output = tmp_path / "output.mp4"
+    coordinator.metadata = SimpleNamespace(video_fps=60.0, duration=8.0, time_base=0.01)
+    coordinator.settings = AppSettings()
+    coordinator._stopped = lambda: False
+    coordinator._log = lambda *_args: None
+    coordinator._progress = None
+    coordinator._worker_factory = FakeWorker
+    coordinator._active_worker = None
+    coordinator.checkpoint = checkpoint
+    coordinator._adaptive_coarse_plan = lambda _interval: object()
+
+    with pytest.raises(PreScanStopped):
+        coordinator._run_stage("coarse", 4.0, adaptive_coarse=True)
+
+    assert checkpoint.samples("coarse", 4.0) == {0: (0.0, 0.8)}
+    assert not checkpoint.stage_complete("coarse", 4.0)
+
+
+def test_adaptive_coarse_native_failure_is_reported_without_second_worker(tmp_path):
+    checkpoint = _ScanCheckpointStore(
+        tmp_path / "scan" / "manifest.json",
+        {"source": "demo", "algorithm": "adaptive"},
+        fps=60.0,
+        time_base=0.01,
+    )
+    created = []
+
+    class FakeWorker:
+        def __init__(self, *args, **kwargs):
+            created.append(kwargs)
+            self.events = queue.Queue()
+            self.events.put(ScanFailed("rocDecode failed: native decoder error"))
+
+        def start(self):
+            pass
+
+        def close(self):
+            pass
+
+        def join(self):
+            pass
+
+    coordinator = PreScanCoordinator.__new__(PreScanCoordinator)
+    coordinator.source = tmp_path / "video.mp4"
+    coordinator.output = tmp_path / "output.mp4"
+    coordinator.metadata = SimpleNamespace(video_fps=60.0, duration=8.0, time_base=0.01)
+    coordinator.settings = AppSettings()
+    coordinator._stopped = lambda: False
+    coordinator._log = lambda *_args: None
+    coordinator._progress = None
+    coordinator._worker_factory = FakeWorker
+    coordinator._active_worker = None
+    coordinator.checkpoint = checkpoint
+    coordinator._adaptive_coarse_plan = lambda _interval: object()
+
+    with pytest.raises(PreScanFailed, match="native decoder error"):
+        coordinator._run_stage("coarse", 4.0, adaptive_coarse=True)
+
+    assert len(created) == 1
+    assert "adaptive_coarse_plan" in created[0]
+
+
+def test_checkpoint_signature_versions_adaptive_coarse_policy(monkeypatch, tmp_path):
+    import jasna.mosaic.detection_registry as registry
+
+    source = tmp_path / "输入视频.mp4"
+    source.write_bytes(b"source")
+    weights = tmp_path / "detector.pt"
+    weights.write_bytes(b"weights")
+    monkeypatch.setattr(registry, "coerce_detection_model_name", lambda _name: "fake")
+    monkeypatch.setattr(registry, "require_detection_model_weights", lambda _name: weights)
+
+    signature = _checkpoint_signature(
+        source,
+        tmp_path / "output.mp4",
+        AppSettings(pre_scan_coarse_interval=4.0),
+    )
+
+    assert signature["algorithm_version"] == PRE_SCAN_ALGORITHM_VERSION
+    assert signature["scan"]["adaptive_coarse"] == {
+        "policy_version": "keyframe-gop-v1",
+        "tolerance_ratio": 0.25,
+        "coverage_policy": "duration-weighted-midpoints-v1",
+    }

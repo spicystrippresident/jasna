@@ -21,7 +21,7 @@ CLIP_SIZE_STEP = 10
 PRE_SCAN_FULL_THRESHOLD_MIN = 0.50
 PRE_SCAN_FULL_THRESHOLD_MAX = 1.00
 PRE_SCAN_FULL_THRESHOLD_STEP = 0.01
-PRE_SCAN_COARSE_INTERVALS = (0.5, 1.0, 2.0, 3.0, 5.0)
+PRE_SCAN_COARSE_INTERVALS = (0.5, 1.0, 2.0, 3.0, 4.0, 5.0)
 PRE_SCAN_FINE_INTERVALS = (0.25, 0.5, 1.0)
 
 
@@ -235,7 +235,7 @@ class BasicSection:
             width=120,
         )
         self._widgets["pre_scan_coarse_interval"].pack(side="right")
-        self._widgets["pre_scan_coarse_interval"].set_value("2.0")
+        self._widgets["pre_scan_coarse_interval"].set_value("4.0")
 
         pre_scan_fine_row = ctk.CTkFrame(inner, fg_color="transparent")
         pre_scan_fine_row.pack(fill="x", pady=(0, Sizing.PADDING_SMALL))
