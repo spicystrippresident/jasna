@@ -3,6 +3,7 @@ from __future__ import annotations
 import heapq
 import logging
 import queue
+import sys
 import threading
 from collections import deque
 from dataclasses import dataclass, field
@@ -148,7 +149,7 @@ DEFAULT_AMF_AV1_ENCODER_OPTIONS: dict[str, str] = {
     ),
     "g": "250",
     "preanalysis": "1",
-    "vbaq": "1",
+    "aq_mode": "caq",
     "profile": "main",
     "bitdepth": "10",
 }
@@ -490,6 +491,18 @@ class NvidiaVideoEncoder:
 
         self.encoder_options = dict(spec.default_options)
         overrides: dict[str, str] = {}
+        self._target_bit_rate: int | None = None
+        linux_amd_av1_main10 = (
+            self.vendor is AcceleratorVendor.AMD
+            and sys.platform == "linux"
+            and codec == "av1"
+            and spec.ten_bit
+        )
+        if linux_amd_av1_main10:
+            # Linux AMF 1.4.37 cannot open P010 AV1 while PreAnalysis is
+            # enabled. Keep the hardware encoder and disable only the
+            # incompatible analysis stage.
+            self.encoder_options["preanalysis"] = "0"
         if encoder_settings:
             overrides = {k: _option_value(v) for k, v in encoder_settings.items()}
             # FFmpeg accepts both spellings for HEVC/H.264, but their defaults
@@ -520,6 +533,23 @@ class NvidiaVideoEncoder:
                 )
             )
         self.encoder_options.update(overrides)
+        if linux_amd_av1_main10:
+            # Without PreAnalysis, AMF QVBR ignores maxrate/bufsize and can
+            # exceed 600 Mbps on 8K input. Peak VBR plus codec_context.bit_rate
+            # preserves the existing source-tied rate contract at the same
+            # measured encoder throughput.
+            self.encoder_options["rc"] = "vbr_peak"
+            self.encoder_options["preanalysis"] = "0"
+            self.encoder_options.pop("qvbr_quality_level", None)
+            pixel_rate = (
+                int(metadata.video_width)
+                * int(metadata.video_height)
+                * float(metadata.video_fps)
+            )
+            self._target_bit_rate = int(
+                metadata.video_bitrate
+                or max(2_000_000, min(100_000_000, round(pixel_rate * 0.02)))
+            )
         if self.smart_fragment:
             self.encoder_options.update(spec.smart_fragment_options)
 
@@ -562,6 +592,8 @@ class NvidiaVideoEncoder:
         out_v.height = self.metadata.video_height
         out_v.time_base = self.metadata.time_base
         ctx = out_v.codec_context
+        if self._target_bit_rate is not None:
+            ctx.bit_rate = self._target_bit_rate
         ctx.time_base = self.metadata.time_base
         ctx.framerate = self.output_fps
         ctx.pix_fmt = (

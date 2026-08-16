@@ -111,8 +111,8 @@ Still images route here automatically; `--restoration-model-name` is video-only.
   8-bit only, larger files at the same quality. Also the codec used for
   streaming.
 - **`av1`**: best compression — smallest files at the same quality, 10-bit.
-  Needs a GPU generation that provides AV1 encoding (NVIDIA RTX 40-series or
-  newer) and a reasonably modern player.
+  Needs a recent NVIDIA or AMD GPU that provides AV1 encoding and a reasonably
+  modern player.
 
 With `--segments`, the codec is locked to the input video's codec and
 `--codec` does not apply.
@@ -122,6 +122,11 @@ With `--segments`, the codec is locked to the input video's codec and
 `--cq` is the main quality control. The number shown in the GUI or supplied on
 the command line is sent to the active encoder unchanged; switching codecs does
 not translate it. Lower values improve quality and increase file size.
+
+Linux AMD 10-bit AV1 is an exception: AMF cannot open P010 with PreAnalysis,
+and QVBR without PreAnalysis does not honor the bitrate ceiling. Jasna therefore
+uses source-tied peak VBR for that combination; `--cq` is accepted for interface
+compatibility but is not applied as a QVBR quality target.
 
 | GPU | H.264 default | HEVC default | AV1 default | Accepted range |
 | --- | ---: | ---: | ---: | --- |
@@ -209,16 +214,16 @@ Per-codec extras:
 
 | Key | What it does |
 | --- | ------------ |
-| `cq` | Quality target passed unchanged as AMF's `qvbr_quality_level`. Lower = better. Range 0–51; defaults 24 (H.264), 25 (HEVC), 32 (AV1). |
+| `cq` | Quality target passed unchanged as AMF's `qvbr_quality_level`. Lower = better. Range 0–51; defaults 24 (H.264), 25 (HEVC), 32 (AV1). Linux AMD 10-bit AV1 uses the source-tied peak-VBR exception above. |
 | `qvbr_quality_level` | AMF's native alias. Accepted in CLI advanced settings when `--cq` is omitted; not accepted in the GUI custom-args field. |
 | `usage` | Encoder usage profile. Default `high_quality`. |
 | `quality` | Speed/quality preset: `speed`, `balanced`, `quality` (default). |
-| `rc` | Rate-control mode. Default `qvbr`. |
+| `rc` | Rate-control mode. Default `qvbr`; Linux AMD 10-bit AV1 is forced to `vbr_peak`. |
 | `preset` | AMF preset. |
 | `g` | Keyframe interval in frames. Default 250. |
 | `bf` | Max consecutive B-frames. |
-| `preanalysis` | Pre-analysis pass, enabled by default. |
-| `vbaq` | Variance-based adaptive quantization, enabled by default. |
+| `preanalysis` | Pre-analysis pass, enabled by default and forced off for Linux AMD 10-bit AV1. |
+| `vbaq` | Variance-based adaptive quantization for H.264/HEVC. AV1 uses `aq_mode`. |
 | `maxrate` / `bufsize` | Bitrate cap and VBV buffer size, in bits per second. Set automatically from the source bitrate unless you pass `maxrate`. |
 | `profile` / `level` | Codec profile and level. |
 
@@ -228,7 +233,7 @@ Per-codec extras:
 | ----- | ---------- |
 | `hevc` | `tier`, `bitdepth` (default 10) |
 | `h264` | `coder`, `bf_ref` (B-frame references), `pa_adaptive_mini_gop` (adaptive B-frame placement) |
-| `av1` | `bitdepth` (default 10) |
+| `av1` | `bitdepth` (default 10), `aq_mode` (`caq` by default) |
 
 ## Streaming
 

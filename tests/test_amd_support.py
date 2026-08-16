@@ -94,6 +94,115 @@ def test_amf_hevc_uses_compatible_defaults() -> None:
     assert "qvbr_quality_level" not in options
 
 
+def test_amf_av1_uses_codec_specific_adaptive_quantization() -> None:
+    from jasna.media.video_encoder import AMF_ENCODER_SPECS
+
+    options = AMF_ENCODER_SPECS["av1"].default_options
+    assert options["aq_mode"] == "caq"
+    assert "vbaq" not in options
+    assert validate_encoder_settings(
+        {"aq_mode": "caq"},
+        codec="av1",
+        vendor=AcceleratorVendor.AMD,
+    ) == {"aq_mode": "caq"}
+    with pytest.raises(ValueError, match="vbaq"):
+        validate_encoder_settings(
+            {"vbaq": 1},
+            codec="av1",
+            vendor=AcceleratorVendor.AMD,
+        )
+
+
+@pytest.mark.parametrize(
+    ("source_bitrate", "expected_target"),
+    [(20_000_000, 20_000_000), (0, 2_000_000)],
+)
+def test_linux_amf_av1_main10_uses_peak_vbr_without_preanalysis(
+    monkeypatch, tmp_path, source_bitrate: int, expected_target: int
+) -> None:
+    import jasna.media.video_encoder as module
+
+    monkeypatch.setattr(
+        module,
+        "vendor_for_device",
+        lambda _device: AcceleratorVendor.AMD,
+    )
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    encoder = module.NvidiaVideoEncoder(
+        str(tmp_path / "out.mp4"),
+        torch.device("cuda:0"),
+        replace(_metadata(), is_10bit=True, video_bitrate=source_bitrate),
+        codec="av1",
+        encoder_settings={},
+    )
+
+    assert encoder.encoder_name == "av1_amf"
+    assert encoder.spec.frame_format == "p010le"
+    assert encoder.encoder_options["rc"] == "vbr_peak"
+    assert encoder.encoder_options["preanalysis"] == "0"
+    assert "qvbr_quality_level" not in encoder.encoder_options
+    assert encoder._target_bit_rate == expected_target
+
+
+def test_amf_av1_rate_workaround_is_linux_main10_only(
+    monkeypatch, tmp_path
+) -> None:
+    import jasna.media.video_encoder as module
+
+    monkeypatch.setattr(
+        module,
+        "vendor_for_device",
+        lambda _device: AcceleratorVendor.AMD,
+    )
+    monkeypatch.setattr(module.sys, "platform", "win32")
+    windows_encoder = module.NvidiaVideoEncoder(
+        str(tmp_path / "windows.mp4"),
+        torch.device("cuda:0"),
+        replace(_metadata(), is_10bit=True, video_bitrate=20_000_000),
+        codec="av1",
+        encoder_settings={},
+    )
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    eight_bit_encoder = module.NvidiaVideoEncoder(
+        str(tmp_path / "eight-bit.mp4"),
+        torch.device("cuda:0"),
+        replace(_metadata(), is_10bit=False, video_bitrate=20_000_000),
+        codec="av1",
+        encoder_settings={},
+        match_input_bit_depth=True,
+    )
+
+    for encoder in (windows_encoder, eight_bit_encoder):
+        assert encoder.encoder_options["rc"] == "qvbr"
+        assert encoder.encoder_options["preanalysis"] == "1"
+        assert encoder.encoder_options["qvbr_quality_level"] == "32"
+        assert encoder._target_bit_rate is None
+
+
+def test_linux_av1_nvenc_rate_policy_is_unchanged(monkeypatch, tmp_path) -> None:
+    import jasna.media.video_encoder as module
+
+    monkeypatch.setattr(
+        module,
+        "vendor_for_device",
+        lambda _device: AcceleratorVendor.NVIDIA,
+    )
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    encoder = module.NvidiaVideoEncoder(
+        str(tmp_path / "out.mp4"),
+        torch.device("cuda:0"),
+        replace(_metadata(), is_10bit=True, video_bitrate=20_000_000),
+        codec="av1",
+        encoder_settings={},
+    )
+
+    assert encoder.encoder_name == "av1_nvenc"
+    assert encoder.encoder_options["rc"] == "vbr"
+    assert encoder.encoder_options["cq"] == "35"
+    assert "preanalysis" not in encoder.encoder_options
+    assert encoder._target_bit_rate is None
+
+
 def test_video_encoder_selects_amf_and_normalizes_cq(monkeypatch, tmp_path) -> None:
     import jasna.media.video_encoder as module
 
