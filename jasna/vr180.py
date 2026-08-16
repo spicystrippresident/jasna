@@ -41,6 +41,7 @@ class VrModeResolution:
     reason: str
     display_aspect: float
     projection: str
+    fisheye_mask_geometry: bool
 
     @property
     def is_sbs(self) -> bool:
@@ -169,16 +170,29 @@ def resolve_vr_mode(
     else:
         resolved_projection = resolve_projection(input_path)
 
+    source_projection = resolve_projection(input_path) if resolved == "sbs" else "none"
     result = VrModeResolution(
         requested,
         resolved,
         reason,
         aspect,
         resolved_projection,
+        resolved == "sbs"
+        and (
+            requested == "sbs-fisheye"
+            or source_projection == "fisheye"
+            or resolved_projection == "fisheye"
+        ),
     )
     message = (
-        "VR mode: requested=%s resolved=%s projection=%s reason=%s"
-        % (result.requested, result.resolved, result.projection, result.reason)
+        "VR mode: requested=%s resolved=%s projection=%s mask_geometry=%s reason=%s"
+        % (
+            result.requested,
+            result.resolved,
+            result.projection,
+            "adaptive-fisheye" if result.fisheye_mask_geometry else "fixed",
+            result.reason,
+        )
     )
     if "unusual SBS" in result.reason:
         log.warning(message)

@@ -204,7 +204,15 @@ def _run_streaming_pass(
     metadata_queue: Queue[FrameMeta | object] = Queue(maxsize=pipeline.max_clip_size * 5)
 
     error_holder: list[BaseException] = []
-    blend_buffer = BlendBuffer(device=device, vr_projector=pipeline._vr_projector)
+    blend_buffer = BlendBuffer(
+        device=device,
+        vr_projector=pipeline._vr_projector,
+        fisheye_eye_width=(
+            int(metadata.video_width) // 2
+            if pipeline._vr_resolution.fisheye_mask_geometry
+            else None
+        ),
+    )
     crop_buffers: dict[int, CropBuffer] = {}
     crop_lock = threading.Lock()
     primary_idle_event = threading.Event()
@@ -247,6 +255,7 @@ def _run_streaming_pass(
                 seek_ts=seek_ts,
                 vr_mode=pipeline._vr_resolution.resolved,
                 vr_projector=pipeline._vr_projector,
+                fisheye_mask_geometry=pipeline._vr_resolution.fisheye_mask_geometry,
             ),
             name="StreamDecodeDetect", daemon=True,
         ),

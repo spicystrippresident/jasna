@@ -4,10 +4,14 @@ import torch
 import torch.nn.functional as F
 
 from jasna.accelerator import is_nvidia_device
+from jasna.vr_mask_geometry import (
+    SBS_CENTER_DILATION_RATIO,
+    sbs_fisheye_dilation_ratios,
+)
 
 _KERNEL_CACHE: dict[tuple[str, torch.dtype, str, int], torch.Tensor] = {}
 
-BLEND_DILATION_RATIO = 0.028
+BLEND_DILATION_RATIO = SBS_CENTER_DILATION_RATIO
 BLEND_FALLOFF_RATIO = 0.028
 
 
@@ -77,6 +81,9 @@ def create_blend_mask(
     frame_height: int,
     scale_y: float,
     scale_x: float,
+    *,
+    dilation_ratio_y: float | None = None,
+    dilation_ratio_x: float | None = None,
 ) -> torch.Tensor:
     """Create blend mask from detection mask with dilation and falloff.
 
@@ -92,11 +99,14 @@ def create_blend_mask(
     mask = crop_mask.reshape(crop_mask.shape[-2], crop_mask.shape[-1])
     blend_dtype = mask.dtype if mask.is_floating_point() else torch.get_default_dtype()
 
-    dilation_px = max(3, round(frame_height * BLEND_DILATION_RATIO))
+    ratio_y = BLEND_DILATION_RATIO if dilation_ratio_y is None else dilation_ratio_y
+    ratio_x = BLEND_DILATION_RATIO if dilation_ratio_x is None else dilation_ratio_x
+    dilation_px_y = max(3, round(frame_height * ratio_y))
+    dilation_px_x = max(3, round(frame_height * ratio_x))
     falloff_px = max(3, round(frame_height * BLEND_FALLOFF_RATIO))
 
-    dilation_y = max(1, round(dilation_px / scale_y))
-    dilation_x = max(1, round(dilation_px / scale_x))
+    dilation_y = max(1, round(dilation_px_y / scale_y))
+    dilation_x = max(1, round(dilation_px_x / scale_x))
     falloff_y = max(1, round(falloff_px / scale_y))
     falloff_x = max(1, round(falloff_px / scale_x))
 
@@ -112,6 +122,8 @@ def create_bbox_blend_mask(
     mask_lr: torch.Tensor,
     bbox_xyxy: tuple[int, int, int, int],
     frame_shape: tuple[int, int],
+    *,
+    fisheye_eye_width: int | None = None,
 ) -> torch.Tensor:
     """Blend mask for a frame-coords bbox, returned at bbox resolution.
 
@@ -129,7 +141,19 @@ def create_bbox_blend_mask(
     mx2 = ((x2 - 1) * wm) // frame_w + 1
     mask_slice = mask_lr[my1:my2, mx1:mx2]
 
-    blend_lr = create_blend_mask(mask_slice, frame_h, frame_h / hm, frame_w / wm)
+    dilation_ratio_y = dilation_ratio_x = None
+    if fisheye_eye_width is not None:
+        dilation_ratio_y, dilation_ratio_x = sbs_fisheye_dilation_ratios(
+            bbox_xyxy, frame_h, fisheye_eye_width
+        )
+    blend_lr = create_blend_mask(
+        mask_slice,
+        frame_h,
+        frame_h / hm,
+        frame_w / wm,
+        dilation_ratio_y=dilation_ratio_y,
+        dilation_ratio_x=dilation_ratio_x,
+    )
     return F.interpolate(
         blend_lr.unsqueeze(0).unsqueeze(0),
         size=(y2 - y1, x2 - x1),
