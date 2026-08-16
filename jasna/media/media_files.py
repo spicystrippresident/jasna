@@ -8,6 +8,7 @@ VIDEO_EXTENSIONS: frozenset[str] = frozenset(
     {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm"}
 )
 MEDIA_EXTENSIONS: frozenset[str] = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
+IGNORED_RECURSIVE_MEDIA_DIRECTORIES: frozenset[str] = frozenset({".jasna-logs"})
 
 
 def is_image(path: str | Path) -> bool:
@@ -35,11 +36,23 @@ def folder_media_in_processing_order(folder: str | Path) -> list[Path]:
     """Return recursive media files grouped by model type: images first, then videos."""
     folder = Path(folder)
 
+    def is_ignored(path: Path) -> bool:
+        try:
+            return bool(
+                IGNORED_RECURSIVE_MEDIA_DIRECTORIES
+                & set(path.relative_to(folder).parts[:-1])
+            )
+        except ValueError:
+            return False
+
     def sort_key(path: Path) -> tuple[int, str]:
         relative = path.relative_to(folder)
         return len(relative.parts), relative.as_posix().casefold()
 
-    entries = sorted((p for p in folder.rglob("*") if p.is_file()), key=sort_key)
+    entries = sorted(
+        (p for p in folder.rglob("*") if p.is_file() and not is_ignored(p)),
+        key=sort_key,
+    )
     images = [p for p in entries if is_image(p)]
     videos = [p for p in entries if is_video(p)]
     return images + videos
