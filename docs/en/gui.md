@@ -86,6 +86,13 @@ On the first launch of each version, Jasna runs a system check (GPU, driver,
 memory, install path). You can re-run it any time from the header — useful
 after a driver update or when something misbehaves.
 
+## Linux AMD job isolation
+
+The GUI runs each Linux AMD video in a separate process. This releases native
+decoder/encoder mappings and the ROCm context when a file finishes, while the
+queue, progress, pause, stop, logs, and per-video post-export command remain in
+the main GUI. Images, Windows, and NVIDIA keep the existing in-process route.
+
 ## Other bits worth knowing
 
 - **Language**: switch the interface language from the header dropdown
