@@ -63,6 +63,7 @@ EN = {
         "btn_clear": "Clear",
         "btn_clear_completed": "✓ Clear Done",
         "output_location": "OUTPUT LOCATION",
+        "preserve_input_structure": "Preserve input subfolder structure",
         "output_pattern": "OUTPUT PATTERN",
         "output_pattern_placeholder": "{original}_restored.mp4",
         "same_as_input": "Same as input",
@@ -480,6 +481,7 @@ EN = {
         "tip_post_export_action": "Optional action after the whole queue finishes.\n\nNone: do nothing.\nShutdown PC: powers off the computer.\nCustom Command: runs the command below in the system shell.",
         "tip_post_export_video_command": "Runs in the system shell after each successful video export and waits for it to finish. Leave empty to disable. Paths are already quoted.\n\nPlaceholders: {input}, {output}, {output_dir}, {output_stem}, {output_suffix}",
         "tip_output_location": "Folder where processed videos are saved.\nLeave empty to save next to the original file.",
+        "tip_preserve_input_structure": "For jobs added from a folder, recreate its subfolder structure inside the selected output folder. Individually added files are unaffected.",
         "tip_output_pattern": "Filename template for output files.\nUse {original} as a placeholder for the input filename (without extension).\n\nExample: {original}_restored.mp4 → my_video_restored.mp4",
         
         "tip_pre_scan_policy": "Controls the scan used before restoration. Auto uses the configured coarse interval to choose full-video processing or a precise scan. Always scan uses the configured precise interval and skips mosaic-free ranges. No separate scan processes the full video directly. Scanning automatically supports resuming from on-disk checkpoints.",

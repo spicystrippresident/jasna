@@ -62,6 +62,7 @@ KO = {
         "btn_clear": "비우기",
         "btn_clear_completed": "✓ 완료 항목 제거",
         "output_location": "출력 위치",
+        "preserve_input_structure": "입력 폴더의 하위 폴더 구조 유지",
         "output_pattern": "출력 파일명 템플릿",
         "output_pattern_placeholder": "{original}_restored.mp4",
         "same_as_input": "입력과 동일",
@@ -460,6 +461,7 @@ KO = {
         "tip_post_export_action": "전체 대기열이 완료된 뒤 실행할 선택 작업입니다.\n\n없음: 아무 작업도 하지 않습니다.\nPC 종료: 컴퓨터 전원을 끕니다.\n사용자 정의 명령: 아래 명령을 시스템 셸에서 실행합니다.",
         "tip_post_export_video_command": "각 비디오 내보내기가 성공한 뒤 시스템 셸에서 실행하고 완료될 때까지 기다립니다. 비워 두면 사용하지 않습니다. 경로는 이미 따옴표로 보호됩니다.\n\n자리표시자: {input}, {output}, {output_dir}, {output_stem}, {output_suffix}",
         "tip_output_location": "처리된 동영상을 저장할 폴더.\n비워두면 원본 파일 옆에 저장됩니다.",
+        "tip_preserve_input_structure": "폴더에서 추가한 작업은 선택한 출력 폴더 안에 하위 폴더 구조를 다시 만듭니다. 개별적으로 추가한 파일에는 영향을 주지 않습니다.",
         "tip_output_pattern": "출력 파일의 이름 템플릿.\n{original}은 입력 파일명(확장자 제외)의 자리 표시자입니다.\n\n예: {original}_restored.mp4 → my_video_restored.mp4",
 
         "tip_pre_scan_policy": "복원 전에 사용할 스캔 방식을 정합니다. 자동은 설정한 거친 스캔 간격으로 확인해 전체 영상 처리와 정밀 스캔 중 하나를 선택합니다. 항상 스캔은 설정한 정밀 스캔 간격으로 확인하고 모자이크가 없는 구간을 건너뜁니다. 별도 스캔 안 함은 추가 스캔 없이 전체 영상을 처리합니다. 스캔은 디스크 체크포인트에서 자동으로 재개됩니다.",

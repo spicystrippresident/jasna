@@ -173,6 +173,12 @@ class SettingsPanel(ctk.CTkFrame):
     def set_last_output_pattern(self, pattern: str):
         self._preset_manager.set_last_output_pattern(pattern)
 
+    def get_last_preserve_input_structure(self) -> bool:
+        return self._preset_manager.get_last_preserve_input_structure()
+
+    def set_last_preserve_input_structure(self, enabled: bool):
+        self._preset_manager.set_last_preserve_input_structure(enabled)
+
     def _update_button_states(self):
         """Update button states based on current preset."""
         is_factory = self._preset_manager.is_factory_preset(self._current_preset)

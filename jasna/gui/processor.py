@@ -94,6 +94,7 @@ class Processor:
         self._settings: AppSettings | None = None
         self._output_folder: str = ""
         self._output_pattern: str = "{original}_restored.mp4"
+        self._preserve_input_structure = False
         self._disable_basicvsrpp_tensorrt_for_run = False
 
         # Heavy models are loaded once and reused across consecutive jobs of the
@@ -116,6 +117,7 @@ class Processor:
         output_pattern: str,
         *,
         disable_basicvsrpp_tensorrt: bool,
+        preserve_input_structure: bool = False,
     ):
         if self._thread and self._thread.is_alive():
             return
@@ -124,6 +126,7 @@ class Processor:
         self._settings = settings
         self._output_folder = output_folder
         self._output_pattern = output_pattern
+        self._preserve_input_structure = bool(preserve_input_structure)
         self._disable_basicvsrpp_tensorrt_for_run = bool(disable_basicvsrpp_tensorrt)
         self._completed_processing_paths.clear()
         
@@ -270,6 +273,55 @@ class Processor:
 
         return job.path.suffix.lower() not in IMAGE_EXTENSIONS
 
+    def _final_output_path(self, job: JobItem) -> Path:
+        """Resolve the exact final output path for a queued job."""
+
+        input_path = job.path
+        output_dir = (
+            Path(self._output_folder)
+            if self._output_folder
+            else input_path.parent
+        )
+        from jasna.media.media_files import folder_output_path
+
+        return folder_output_path(
+            output_dir,
+            input_path,
+            self._output_pattern,
+            input_root=job.input_root,
+            preserve_structure=(
+                bool(self._output_folder) and self._preserve_input_structure
+            ),
+        )
+
+    def _skip_existing_final_output(
+        self,
+        job: JobItem,
+        output_path: Path,
+        *,
+        file_conflict: str,
+    ) -> bool:
+        """Skip completed preserved-folder outputs when a batch is resumed."""
+
+        preserved_folder_batch = (
+            job.input_root is not None
+            and bool(self._output_folder)
+            and self._preserve_input_structure
+        )
+        should_skip = file_conflict == "skip" or (
+            preserved_folder_batch and file_conflict == "auto_rename"
+        )
+        if not should_skip or not output_path.is_file():
+            return False
+        job.status = JobStatus.SKIPPED
+        self._progress(ProgressUpdate(
+            job_id=job.id,
+            status=JobStatus.SKIPPED,
+            message=f"Output file already exists: {output_path.name}",
+        ))
+        self._log("WARNING", f"Skipped {job.filename}: output file already exists")
+        return True
+
     def _run(self):
         self._log("INFO", "Processing started")
 
@@ -343,32 +395,19 @@ class Processor:
             if overrides:
                 job_settings = replace(job_settings, **overrides)
 
-        # Determine output path
-        if self._output_folder:
-            output_dir = Path(self._output_folder)
-        else:
-            output_dir = input_path.parent
-
-        output_name = self._output_pattern.replace("{original}", input_path.stem)
-        output_path = output_dir / output_name
-        if is_image:
-            # The video output pattern carries a video extension; images keep their own.
-            output_path = output_path.with_suffix(input_path.suffix)
+        output_path = self._final_output_path(job)
         
         # Handle file conflict based on settings
-        file_conflict = self._settings.file_conflict if self._settings else "auto_rename"
+        file_conflict = job_settings.file_conflict
         
+        if self._skip_existing_final_output(
+            job,
+            output_path,
+            file_conflict=file_conflict,
+        ):
+            return
         if output_path.exists():
-            if file_conflict == "skip":
-                job.status = JobStatus.SKIPPED
-                self._progress(ProgressUpdate(
-                    job_id=job.id,
-                    status=JobStatus.SKIPPED,
-                    message=f"Output file already exists: {output_path.name}",
-                ))
-                self._log("WARNING", f"Skipped {job.filename}: output file already exists")
-                return
-            elif file_conflict == "auto_rename":
+            if file_conflict == "auto_rename":
                 output_path = self._get_unique_output_path(output_path)
                 self._log("INFO", f"Renamed output to {output_path.name} to avoid overwrite")
             # "overwrite" - just proceed and let the file be replaced

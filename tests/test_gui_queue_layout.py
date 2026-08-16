@@ -53,7 +53,7 @@ def test_reset_jobs_for_run_prepares_every_status_and_preserves_job_options(
         _find_job_index_by_id=lambda job_id: next(
             index for index, job in enumerate(jobs) if job.id == job_id
         ),
-        _get_output_path=lambda path: tmp_path / f"{path.stem}-restored.mp4",
+        _get_output_path=lambda job: tmp_path / f"{job.path.stem}-restored.mp4",
         _set_widget_action_options=lambda *_args: None,
     )
     panel.update_job_status = MethodType(QueuePanel.update_job_status, panel)
@@ -339,7 +339,7 @@ def test_same_as_input_clears_output_and_refreshes_conflicts(tmp_path: Path) -> 
         assert panel.get_output_folder() == ""
         assert panel._jobs[0].has_conflict
         assert panel._same_as_input_btn.cget("state") == "normal"
-        changed.assert_called_once_with("", panel.get_output_pattern())
+        changed.assert_called_once_with("", panel.get_output_pattern(), False)
 
         changed.reset_mock()
         panel._output_entry.insert(0, str(tmp_path / "manual"))
@@ -347,7 +347,9 @@ def test_same_as_input_clears_output_and_refreshes_conflicts(tmp_path: Path) -> 
 
         assert panel.get_output_folder() == str(tmp_path / "manual")
         assert panel._same_as_input_btn.cget("fg_color") == Colors.BG_CARD
-        changed.assert_called_once_with(str(tmp_path / "manual"), panel.get_output_pattern())
+        changed.assert_called_once_with(
+            str(tmp_path / "manual"), panel.get_output_pattern(), False
+        )
 
         panel.set_running(True, processing_job_id=panel._jobs[0].id)
         assert panel._same_as_input_btn.cget("state") == "disabled"
@@ -411,6 +413,7 @@ def test_repeated_running_state_does_not_reconfigure_queue_rows() -> None:
         _output_entry=control(),
         _same_as_input_btn=control(),
         _pattern_entry=control(),
+        _preserve_structure_checkbox=control(),
         _add_files_btn=control(),
         _add_folder_btn=control(),
         _jobs=jobs,
