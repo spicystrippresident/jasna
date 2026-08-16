@@ -63,6 +63,7 @@ def test_flat_auto_rename_behavior_is_unchanged(tmp_path: Path) -> None:
     )
     processor._output_pattern = "{original}_restored.mp4"
     processor._run_pipeline = MagicMock()
+    processor._validate_completed_video_output = MagicMock()
 
     with patch("jasna.gui.processor._cleanup_torch"):
         processor._process_job(job)

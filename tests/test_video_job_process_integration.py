@@ -10,8 +10,10 @@ from jasna.gui.models import (
 )
 from jasna.gui.processor import Processor
 from jasna.gui.video_job_process import (
+    RESULT_SCHEMA_VERSION,
     _load_request,
     build_video_job_request,
+    parse_video_job_result,
     write_video_job_request,
 )
 from jasna.segments import SegmentRange
@@ -56,7 +58,7 @@ def test_isolated_request_round_trips_scan_and_batch_provenance(tmp_path: Path):
     assert payload["preserve_input_structure"] is True
 
 
-def test_isolated_progress_and_result_preserve_phase_and_processing_path(tmp_path: Path):
+def test_isolated_progress_preserves_phase_and_result_processing_path(tmp_path: Path):
     updates = []
     processor = Processor(on_progress=updates.append)
     job = JobItem(tmp_path / "video.mp4")
@@ -74,16 +76,21 @@ def test_isolated_progress_and_result_preserve_phase_and_processing_path(tmp_pat
             },
         },
     )
-    completed = processor._apply_isolated_event(
-        job,
-        {
-            "type": "result",
-            "status": JobStatus.COMPLETED.value,
-            "output_path": str(tmp_path / "video_restored.mp4"),
-            "processing_path": "smart",
-        },
+    output = tmp_path / "video_restored.mp4"
+    event = {
+        "type": "result",
+        "schema_version": RESULT_SCHEMA_VERSION,
+        "status": JobStatus.COMPLETED.value,
+        "output_path": str(output),
+        "processing_path": "smart",
+    }
+    completed = processor._apply_isolated_event(job, event)
+    result = parse_video_job_result(
+        event,
+        expected_output_path=output,
     )
 
     assert updates[-1].phase == "coarse_scan"
     assert completed is True
-    assert processor.completed_processing_path(job.id) == "smart"
+    assert processor.completed_processing_path(job.id) is None
+    assert result.processing_path == "smart"
