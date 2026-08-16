@@ -16,7 +16,7 @@ from jasna.frame_queue import FrameQueue
 import psutil
 import torch
 
-from jasna.accelerator import AcceleratorVendor, vendor_for_device
+from jasna.accelerator import AcceleratorVendor, is_amd_device, vendor_for_device
 from jasna.media import UnsupportedColorspaceError, get_video_meta_data
 from jasna.media.video_encoder import NvidiaVideoEncoder
 from jasna.media.video_decoder import ReusableRocDecoder
@@ -422,7 +422,7 @@ class Pipeline:
         if output_frame_count is None:
             output_frame_count = frame_rate.output_frame_count(metadata.num_frames)
 
-        clip_queue = FrameQueue(max_frames=self.max_clip_size)
+        clip_queue = FrameQueue(max_frames=self._primary_clip_queue_capacity())
         secondary_queue = FrameQueue(max_frames=self.max_clip_size * secondary_workers)
         encode_queue = FrameQueue(max_frames=self.max_clip_size)
         metadata_queue: Queue[FrameMeta | object] = Queue(maxsize=self.max_clip_size * 5)
@@ -624,6 +624,16 @@ class Pipeline:
 
         if err is not None:
             raise err
+
+    def _primary_clip_queue_capacity(self) -> int:
+        """Keep enough queued frames for the active ROCm primary batch."""
+        if not is_amd_device(self.device):
+            return self.max_clip_size
+        primary_batch_size = max(
+            1,
+            int(self.restoration_pipeline.independent_clip_batch_size),
+        )
+        return self.max_clip_size * primary_batch_size
 
     def _validate_metadata(self, metadata) -> None:
         from av.video.reformatter import Colorspace as AvColorspace

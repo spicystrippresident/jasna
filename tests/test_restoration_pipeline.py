@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from jasna.crop_buffer import RawCrop, extract_crop, scale_offsets, _torch_pad_reflect
+from jasna.pipeline_items import ClipRestoreItem
 from jasna.restorer.denoise import DenoiseStep, DenoiseStrength
 from jasna.restorer.restoration_pipeline import RestorationPipeline
 from jasna.tracking.clip_tracker import TrackedClip
@@ -91,6 +92,25 @@ class _CaptureRestorer:
         for f in crops:
             stacked.append(f.to(dtype=torch.float32).div(255.0))
         return torch.stack(stacked, dim=0)
+
+
+class _BatchCaptureRestorer(_IdentityRestorer):
+    independent_clip_batch_max_padding_frames = 4
+
+    def __init__(self) -> None:
+        self.captured_batches: list[list[torch.Tensor]] | None = None
+
+    def raw_process_batch(
+        self,
+        batches: list[list[torch.Tensor]],
+    ) -> list[torch.Tensor]:
+        self.captured_batches = [list(batch) for batch in batches]
+        return [
+            torch.stack(
+                [frame.to(dtype=torch.float32).div(255.0) for frame in batch]
+            )
+            for batch in batches
+        ]
 
 
 class _Upscale2xSecondary:
@@ -531,6 +551,18 @@ def _make_clip_and_frames(monkeypatch, *, t=3, frame_hw=(30, 40)):
     return clip, frames, raw_crops
 
 
+def _make_clip_restore_item(monkeypatch, *, t: int) -> ClipRestoreItem:
+    clip, _frames, raw_crops = _make_clip_and_frames(monkeypatch, t=t)
+    return ClipRestoreItem(
+        clip=clip,
+        raw_crops=raw_crops,
+        frame_shape=(30, 40),
+        keep_start=0,
+        keep_end=t,
+        crossfade_weights=None,
+    )
+
+
 def test_prepare_and_run_primary(monkeypatch) -> None:
     clip, frames, raw_crops = _make_clip_and_frames(monkeypatch)
     pipeline = RestorationPipeline(restorer=_IdentityRestorer())  # type: ignore[arg-type]
@@ -562,6 +594,52 @@ def test_prepare_and_run_primary_with_denoise(monkeypatch) -> None:
 
     result = pipeline.prepare_and_run_primary(clip, raw_crops, (30, 40), 0, 3, None)
     assert result.primary_raw.shape[0] == 3
+
+
+def test_prepare_primary_batch_pads_within_limit_and_trims_results(monkeypatch) -> None:
+    restorer = _BatchCaptureRestorer()
+    pipeline = RestorationPipeline(restorer=restorer)  # type: ignore[arg-type]
+    long_item = _make_clip_restore_item(monkeypatch, t=5)
+    short_item = _make_clip_restore_item(monkeypatch, t=1)
+
+    results = pipeline.prepare_and_run_primary_batch([long_item, short_item])
+
+    assert restorer.captured_batches is not None
+    assert [len(batch) for batch in restorer.captured_batches] == [5, 5]
+    assert restorer.captured_batches[1][-1] is restorer.captured_batches[1][0]
+    assert [result.frame_count for result in results] == [5, 1]
+    assert [result.primary_raw.shape[0] for result in results] == [5, 1]
+
+
+def test_prepare_primary_batch_rejects_padding_over_limit(monkeypatch) -> None:
+    restorer = _BatchCaptureRestorer()
+    pipeline = RestorationPipeline(restorer=restorer)  # type: ignore[arg-type]
+    long_item = _make_clip_restore_item(monkeypatch, t=6)
+    short_item = _make_clip_restore_item(monkeypatch, t=1)
+
+    with pytest.raises(ValueError, match="padding exceeds the configured limit"):
+        pipeline.prepare_and_run_primary_batch([long_item, short_item])
+
+    assert restorer.captured_batches is None
+
+
+def test_prepare_primary_batch_rejects_empty_clip(monkeypatch) -> None:
+    restorer = _BatchCaptureRestorer()
+    pipeline = RestorationPipeline(restorer=restorer)  # type: ignore[arg-type]
+    item = _make_clip_restore_item(monkeypatch, t=1)
+    empty_item = ClipRestoreItem(
+        clip=item.clip,
+        raw_crops=[],
+        frame_shape=item.frame_shape,
+        keep_start=0,
+        keep_end=0,
+        crossfade_weights=None,
+    )
+
+    with pytest.raises(ValueError, match="require non-empty clips"):
+        pipeline.prepare_and_run_primary_batch([item, empty_item])
+
+    assert restorer.captured_batches is None
 
 
 def _build_sr(pipeline, pr):
@@ -700,6 +778,4 @@ def test_build_secondary_result_with_denoise(monkeypatch) -> None:
 
     assert len(sr.restored_frames) == 3
     assert sr.restored_frames[0].dtype == torch.uint8
-
-
 

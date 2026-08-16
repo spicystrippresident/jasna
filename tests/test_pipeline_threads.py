@@ -6,6 +6,7 @@ import threading
 import time
 from fractions import Fraction
 from queue import Queue, Empty
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -110,6 +111,100 @@ class _RecordingWriter:
 
     def after_write(self, frames_written: int) -> None:
         self.after_write_calls.append(frames_written)
+
+
+def _primary_restore_item(track_id: int, frame_count: int) -> ClipRestoreItem:
+    clip = TrackedClip(
+        track_id=track_id,
+        start_frame=0,
+        mask_resolution=(2, 2),
+        bboxes=[np.array([1, 1, 5, 5], dtype=np.float32)] * frame_count,
+        masks=[torch.zeros((2, 2), dtype=torch.bool)] * frame_count,
+    )
+    raw_crops = [
+        RawCrop(
+            crop=torch.zeros(3, 4, 4, dtype=torch.uint8),
+            enlarged_bbox=(1, 1, 5, 5),
+            crop_shape=(4, 4),
+        )
+        for _ in range(frame_count)
+    ]
+    return ClipRestoreItem(
+        clip=clip,
+        raw_crops=raw_crops,
+        frame_shape=(8, 8),
+        keep_start=0,
+        keep_end=frame_count,
+        crossfade_weights=None,
+    )
+
+
+class _BatchingPrimaryPipeline:
+    secondary_prefers_cpu_input = False
+
+    def __init__(
+        self,
+        *,
+        batch_size: int = 2,
+        min_frames: int = 60,
+        max_padding_frames: int = 4,
+        min_free_bytes: int = 768 * 1024**2,
+    ) -> None:
+        self.independent_clip_batch_size = batch_size
+        self.independent_clip_batch_min_frames = min_frames
+        self.independent_clip_batch_max_padding_frames = max_padding_frames
+        self.independent_clip_batch_min_free_bytes = min_free_bytes
+        self.batch_calls: list[list[ClipRestoreItem]] = []
+        self.single_calls: list[SimpleNamespace] = []
+
+    @staticmethod
+    def _result(item: ClipRestoreItem) -> SimpleNamespace:
+        return SimpleNamespace(
+            keep_start=item.keep_start,
+            keep_end=item.keep_end,
+        )
+
+    def prepare_and_run_primary_batch(
+        self,
+        items: list[ClipRestoreItem],
+    ) -> list[SimpleNamespace]:
+        self.batch_calls.append(items)
+        return [self._result(item) for item in items]
+
+    def prepare_and_run_primary(
+        self,
+        clip: TrackedClip,
+        raw_crops: list[RawCrop],
+        frame_shape: tuple[int, int],
+        keep_start: int,
+        keep_end: int,
+        crossfade_weights: dict[int, float] | None,
+    ) -> SimpleNamespace:
+        del clip, raw_crops, frame_shape, crossfade_weights
+        item = SimpleNamespace(keep_start=keep_start, keep_end=keep_end)
+        self.single_calls.append(item)
+        return item
+
+
+def _run_primary_restore_loop(
+    pipeline: _BatchingPrimaryPipeline,
+    items: list[ClipRestoreItem],
+) -> tuple[FrameQueue, list[BaseException]]:
+    clip_queue = FrameQueue(max_frames=999)
+    secondary_queue = FrameQueue(max_frames=999)
+    for item in items:
+        clip_queue.put(item, frame_count=len(item.raw_crops))
+    clip_queue.put(_SENTINEL)
+    error_holder: list[BaseException] = []
+    primary_restore_loop(
+        device=torch.device("cuda:0"),
+        restoration_pipeline=pipeline,
+        clip_queue=clip_queue,
+        secondary_queue=secondary_queue,
+        error_holder=error_holder,
+        primary_idle_event=threading.Event(),
+    )
+    return secondary_queue, error_holder
 
 
 # ---------------------------------------------------------------------------
@@ -703,6 +798,93 @@ class TestPrimaryRestoreLoop:
         item = secondary_queue.get()
         assert item is not _SENTINEL
         assert item.primary_raw.device.type == "cpu"
+
+    def test_rocm_batches_clips_within_padding_limit_at_vram_margin(self):
+        required_free_bytes = 768 * 1024**2
+        pipeline = _BatchingPrimaryPipeline()
+        items = [
+            _primary_restore_item(track_id=1, frame_count=60),
+            _primary_restore_item(track_id=2, frame_count=64),
+        ]
+
+        with (
+            patch("jasna.pipeline_threads.is_amd_device", return_value=True),
+            patch("jasna.pipeline_threads.torch.cuda.set_device"),
+            patch(
+                "jasna.pipeline_threads.torch.cuda.mem_get_info",
+                return_value=(required_free_bytes, 24 * 1024**3),
+            ) as mem_get_info,
+        ):
+            secondary_queue, error_holder = _run_primary_restore_loop(pipeline, items)
+
+        assert not error_holder
+        assert pipeline.batch_calls == [items]
+        assert pipeline.single_calls == []
+        mem_get_info.assert_called_once_with(torch.device("cuda:0"))
+        assert secondary_queue.get() is not _SENTINEL
+        assert secondary_queue.get() is not _SENTINEL
+        assert secondary_queue.get() is _SENTINEL
+
+    def test_rocm_keeps_batches_individual_below_vram_margin(self):
+        required_free_bytes = 768 * 1024**2
+        pipeline = _BatchingPrimaryPipeline()
+        items = [
+            _primary_restore_item(track_id=1, frame_count=60),
+            _primary_restore_item(track_id=2, frame_count=64),
+        ]
+
+        with (
+            patch("jasna.pipeline_threads.is_amd_device", return_value=True),
+            patch("jasna.pipeline_threads.torch.cuda.set_device"),
+            patch(
+                "jasna.pipeline_threads.torch.cuda.mem_get_info",
+                return_value=(required_free_bytes - 1, 24 * 1024**3),
+            ) as mem_get_info,
+        ):
+            _secondary_queue, error_holder = _run_primary_restore_loop(pipeline, items)
+
+        assert not error_holder
+        assert pipeline.batch_calls == []
+        assert len(pipeline.single_calls) == 2
+        mem_get_info.assert_called_once_with(torch.device("cuda:0"))
+
+    def test_rocm_does_not_batch_clips_beyond_padding_limit(self):
+        pipeline = _BatchingPrimaryPipeline()
+        items = [
+            _primary_restore_item(track_id=1, frame_count=60),
+            _primary_restore_item(track_id=2, frame_count=65),
+        ]
+
+        with (
+            patch("jasna.pipeline_threads.is_amd_device", return_value=True),
+            patch("jasna.pipeline_threads.torch.cuda.set_device"),
+            patch("jasna.pipeline_threads.torch.cuda.mem_get_info") as mem_get_info,
+        ):
+            _secondary_queue, error_holder = _run_primary_restore_loop(pipeline, items)
+
+        assert not error_holder
+        assert pipeline.batch_calls == []
+        assert len(pipeline.single_calls) == 2
+        mem_get_info.assert_not_called()
+
+    def test_nvidia_never_uses_rocm_batch_or_vram_policy(self):
+        pipeline = _BatchingPrimaryPipeline()
+        items = [
+            _primary_restore_item(track_id=1, frame_count=60),
+            _primary_restore_item(track_id=2, frame_count=64),
+        ]
+
+        with (
+            patch("jasna.pipeline_threads.is_amd_device", return_value=False),
+            patch("jasna.pipeline_threads.torch.cuda.set_device"),
+            patch("jasna.pipeline_threads.torch.cuda.mem_get_info") as mem_get_info,
+        ):
+            _secondary_queue, error_holder = _run_primary_restore_loop(pipeline, items)
+
+        assert not error_holder
+        assert pipeline.batch_calls == []
+        assert len(pipeline.single_calls) == 2
+        mem_get_info.assert_not_called()
 
     def test_logs_timing_summary(self, caplog):
         clip_queue = FrameQueue(max_frames=999)
