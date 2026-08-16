@@ -447,6 +447,7 @@ def test_app_prepares_entire_queue_before_starting_processor() -> None:
     app._control_bar = MagicMock()
     app._video_player_btn = MagicMock()
     app._log_panel = MagicMock()
+    app._run_log = None
     app._job_start_times = {}
     app._processing_start_time = 0.0
     calls = []
