@@ -20,6 +20,7 @@ import torch
 from jasna.accelerator import AcceleratorVendor, vendor_for_device
 from jasna.media import UnsupportedColorspaceError, get_video_meta_data
 from jasna.media.video_encoder import NvidiaVideoEncoder
+from jasna.media.video_decoder import ReusableRocDecoder
 from jasna.media.frame_rate import resolve_frame_rate_retarget
 from jasna.media.splice import (
     SplicePlan,
@@ -349,6 +350,9 @@ class Pipeline:
         end_pts: int | None = None,
         effect_ranges: tuple[tuple[int, int], ...] | None = None,
         output_frame_count: int | None = None,
+        reusable_rocdecoders: tuple[
+            ReusableRocDecoder, ReusableRocDecoder
+        ] | None = None,
     ) -> None:
         device = self.device
         secondary_workers = max(1, int(self.restoration_pipeline.secondary_num_workers))
@@ -451,6 +455,11 @@ class Pipeline:
                     vr_mode=self._vr_resolution.resolved,
                     vr_projector=self._vr_projector,
                     cancel_event=self._cancel_event,
+                    reusable_rocdecoder=(
+                        reusable_rocdecoders[0]
+                        if reusable_rocdecoders is not None
+                        else None
+                    ),
                 ),
                 name="DecodeDetect", daemon=True,
             ),
@@ -483,6 +492,11 @@ class Pipeline:
                     frame_stride=frame_rate.frame_stride,
                     seek_ts=seek_ts,
                     cancel_event=self._cancel_event,
+                    reusable_rocdecoder=(
+                        reusable_rocdecoders[1]
+                        if reusable_rocdecoders is not None
+                        else None
+                    ),
                 ),
                 name="BlendEncode", daemon=True,
             ),
@@ -650,6 +664,10 @@ class Pipeline:
         self.output_video.parent.mkdir(parents=True, exist_ok=True)
         work_root = self.working_dir or self.output_video.parent
         work_root.mkdir(parents=True, exist_ok=True)
+        reusable_rocdecoders = (
+            ReusableRocDecoder(),
+            ReusableRocDecoder(),
+        )
 
         try:
             with TemporaryDirectory(
@@ -688,6 +706,7 @@ class Pipeline:
                             end_pts=span.end_pts,
                             effect_ranges=span.effect_ranges,
                             output_frame_count=max(1, round(duration * metadata.video_fps)),
+                            reusable_rocdecoders=reusable_rocdecoders,
                         )
                     else:
                         create_copy_fragment(self.input_video, span, index, raw, codec=codec)
@@ -710,6 +729,8 @@ class Pipeline:
                     codec=codec,
                 )
         finally:
+            for reusable_decoder in reusable_rocdecoders:
+                reusable_decoder.close()
             progress.close(ensure_completed_bar=True)
 
     def run(self) -> None:
