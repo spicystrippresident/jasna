@@ -311,6 +311,7 @@ def test_build_pipeline_passes_through_config_and_session() -> None:
         restoration_pipeline=MagicMock(),
         secondary_restorer=None,
     )
+    session.restoration_pipeline.restorer.use_tensorrt = True
     segments = (SegmentRange(1, 2),)
     splice_plan = MagicMock()
     progress_callback = MagicMock()
@@ -359,7 +360,9 @@ def test_build_pipeline_passes_through_config_and_session() -> None:
     assert signature["device"] == "cuda:0"
     assert signature["denoise_strength"] == "none"
     assert signature["denoise_step"] == "after_primary"
+    assert signature["primary_tensorrt"] is True
     assert signature["secondary_restoration"] == "none"
+    assert signature["secondary_restoration_settings"] == {}
     assert signature["vr_projection"] == "gnomonic"
 
 
@@ -403,3 +406,60 @@ def test_build_pipeline_reuses_session_detector_across_sequential_videos() -> No
 
     session.close()
     detector.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        (
+            _config(
+                secondary_restoration="tvai",
+                tvai_ffmpeg_path="custom-ffmpeg",
+                tvai_model="iris-x",
+                tvai_scale=2,
+                tvai_args="noise=3",
+                tvai_denoise=True,
+            ),
+            {
+                "ffmpeg_path": "custom-ffmpeg",
+                "model": "iris-x",
+                "scale": 2,
+                "args": "noise=3",
+                "denoise": True,
+            },
+        ),
+        (
+            _config(
+                secondary_restoration="rtx-super-res",
+                rtx_scale=2,
+                rtx_quality="ultra",
+                rtx_denoise="low",
+                rtx_deblur="high",
+            ),
+            {
+                "scale": 2,
+                "quality": "ultra",
+                "denoise": "low",
+                "deblur": "high",
+            },
+        ),
+    ],
+)
+def test_build_pipeline_signs_active_secondary_restoration_settings(
+    config: SessionConfig,
+    expected: dict[str, object],
+) -> None:
+    session = RestorationSession(
+        device=MagicMock(),
+        detection_model_name="rfdetr-v5",
+        detection_model_path=Path("det.onnx"),
+        restoration_pipeline=MagicMock(),
+        secondary_restorer=MagicMock(),
+    )
+
+    with patch("jasna.pipeline.Pipeline") as pipeline_cls:
+        build_pipeline(config, session, Path("in.mp4"), Path("out.mp4"))
+
+    signature = pipeline_cls.call_args.kwargs["processing_signature"]
+    assert signature["secondary_restoration"] == config.secondary_restoration
+    assert signature["secondary_restoration_settings"] == expected

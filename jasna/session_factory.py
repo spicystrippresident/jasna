@@ -196,6 +196,23 @@ def build_pipeline(
     from jasna import __version__
     from jasna.pipeline import Pipeline
 
+    secondary_signature: dict[str, object] = {}
+    if config.secondary_restoration == "tvai":
+        secondary_signature = {
+            "ffmpeg_path": config.tvai_ffmpeg_path,
+            "model": config.tvai_model,
+            "scale": int(config.tvai_scale),
+            "args": config.tvai_args,
+            "denoise": bool(config.tvai_denoise),
+        }
+    elif config.secondary_restoration == "rtx-super-res":
+        secondary_signature = {
+            "scale": int(config.rtx_scale),
+            "quality": config.rtx_quality,
+            "denoise": config.rtx_denoise,
+            "deblur": config.rtx_deblur,
+        }
+
     processing_signature = {
         "jasna_version": __version__,
         "device": config.device,
@@ -211,7 +228,11 @@ def build_pipeline(
         "enable_crossfade": bool(config.enable_crossfade),
         "denoise_strength": config.denoise_strength,
         "denoise_step": config.denoise_step,
+        "primary_tensorrt": bool(
+            getattr(session.restoration_pipeline.restorer, "use_tensorrt", False)
+        ),
         "secondary_restoration": config.secondary_restoration,
+        "secondary_restoration_settings": secondary_signature,
         "vr_mode": config.vr_mode,
         "vr_projection": config.vr_projection,
         "sharpen_strength": float(config.sharpen_strength),
