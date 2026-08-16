@@ -334,6 +334,38 @@ Primary implementation paths:
   route-only harness lowered only the full-route threshold so it stopped after
   coarse scanning; detector/model settings were unchanged. It generated no
   media output and reported no rocDecode, OOM, or detector error.
+- Ordinary 2D H.264 was validated with a real 1920x1080, 29.97 fps,
+  `yuv420p` 8-bit clip (`31.7407s`, 951 video frames, 1,366 AAC packets). The
+  4-second automatic coarse scan sampled 11 points in four GOP seeks, measured
+  `52.6%`, and entered the 0.5-second precise scan. Confidence normalization
+  retained `12.513-26.526s` (`44.2%`) and routed to Smart Render. The scan took
+  `12.86s`; the isolated Smart Render took `56.65s` and its keyframe-aligned
+  render spans processed 701 frames. A separate no-scan full route took
+  `76.06s`. Both outputs retained all 951 video frames and 1,366 AAC packets,
+  the `31.7317s` video timeline, and passed strict complete decoding. The full
+  route peaked at about 2.8 GiB VRAM with no offload. Smart Render printed one
+  AMF H.264 parser assertion while seeking, but no frame, duration, or decode
+  mismatch followed; retain it as a warning to watch on additional sources.
+- Ordinary 2D AV1 was validated with a real 1920x1080, 23.976 fps, AV1 Main
+  `yuv420p10le` 10-bit clip (`38.829s`, 931 video frames, 1,819 AAC packets).
+  The 4-second automatic coarse scan used 12 samples in four GOP seeks, took
+  `11.55s`, measured `0%`, and correctly selected source copy; the isolated
+  copy route took `3.52s`. A no-scan full AV1 AMF route took `30.56s` and a
+  manual `12-16s` Smart Render expanded to one keyframe GOP, rendered 240
+  frames, and took `14.36s`. Copy, full, and Smart Render outputs retained all
+  931 video frames and 1,819 AAC packets; full and Smart Render remained AV1
+  Main 10-bit with BT.709 tags, matched the source duration within 1 ms, and
+  passed strict complete decoding. Full processing peaked at about 2.3 GiB
+  VRAM with no offload.
+- The repeated AV1 `hardware accelerated decoding` / `Missing Sequence Header`
+  messages seen before those successful routes are not emitted by the active
+  production decoder. The source omits `nb_frames`, so metadata collection
+  falls back to OpenCV `CAP_PROP_FRAME_COUNT`; that OpenCV probe reproduces the
+  messages by itself and still returns the correct 931 count. The production
+  reader then explicitly selects FFmpeg software AV1 decode plus ROCm upload on
+  Linux AMD. This is a noisy metadata-probe limitation to fix, not evidence of
+  dropped frames. After the serial tests, system VRAM returned to about 1.0 GiB
+  and available RAM to about 20 GiB.
 
 ### AMD boundary-refinement retirement
 
@@ -370,9 +402,14 @@ paths are not committed.
 
 ## Known limits and remaining validation
 
-- The automatic three-route real-video test currently covers 10-bit HEVC SBS.
-- Automatic `copy/full/smart` still needs short real clips for 8-bit NV12,
-  H.264, AV1, and ordinary 2D inputs.
+- The automatic three-route real-video test still covers 10-bit HEVC SBS.
+  Ordinary 2D now additionally covers automatic H.264 Smart Render, forced
+  H.264 full processing, automatic AV1 copy, and forced AV1 full/Smart Render.
+  Those forced routes validate processing and mux behavior but do not replace
+  automatic route-decision coverage.
+- Remaining format/route gaps include ordinary 2D HEVC, AV1 8-bit, 4K/8K AV1,
+  automatic H.264 copy/full decisions, and automatic AV1 smart/full decisions.
+  No eligible 2D HEVC source was present in the accepted local sample set.
 - 10-bit engineering validation is complete for the three routes, but final
   visual quality review and a long multi-video batch remain user acceptance
   items.
