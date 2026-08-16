@@ -492,6 +492,7 @@ def test_app_start_persists_the_active_working_directory() -> None:
     app._control_bar = MagicMock()
     app._video_player_btn = MagicMock()
     app._log_panel = MagicMock()
+    app._run_log = None
     app._job_start_times = {}
     app._processing_start_time = 0.0
     preflight = SimpleNamespace(missing=(), should_warn_first_run_slow=False)
