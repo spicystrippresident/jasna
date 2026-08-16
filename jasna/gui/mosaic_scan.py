@@ -12,6 +12,7 @@ from __future__ import annotations
 import bisect
 import math
 import queue
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -330,6 +331,65 @@ def plan_adaptive_coarse_scan(
 SCAN_PARALLEL_DECODERS = 2
 SCAN_PARALLEL_MIN_PIXELS = 3840 * 2160
 SCAN_PARALLEL_MIN_DURATION = 10.0
+SCAN_AMD_PARALLEL_MIN_PIXELS = 30_000_000
+
+# Two native sessions expose both RX 7900 XTX media engines and are the accepted
+# production route for large Linux AMD scans.  The other policies remain
+# explicit fallbacks for machines or sources that cannot sustain two rocDecode
+# sessions.
+AMD_SCAN_DECODE_STRATEGY = "dual-rocdecode"
+AMD_SCAN_DECODE_STRATEGIES = {
+    "single-rocdecode": ("auto",),
+    "dual-rocdecode": ("auto", "auto"),
+    "rocdecode-software": ("auto", "pyav-sw"),
+}
+
+
+def _is_linux_amd_rocdecode_scan_device(device) -> bool:
+    """Return whether this worker may select the Linux rocDecode scan route."""
+
+    if sys.platform != "linux":
+        return False
+    from jasna.accelerator import is_amd_device
+
+    return is_amd_device(device)
+
+
+def scan_decode_backends(
+    video_width: int,
+    video_height: int,
+    duration: float,
+    *,
+    amd: bool,
+    linux_amd: bool = False,
+    amd_strategy: str | None = None,
+) -> tuple[str, ...]:
+    """Return the decode backend assigned to each precise-scan reader.
+
+    ``linux_amd`` is deliberately separate from ``amd``: AMD hardware on an
+    unsupported platform retains the established single-reader path instead of
+    receiving a second AMF/rocDecode session by accident.
+    """
+
+    pixels = int(video_width) * int(video_height)
+    if duration < SCAN_PARALLEL_MIN_DURATION:
+        return ("auto",)
+    if not amd:
+        return (
+            ("auto",) * SCAN_PARALLEL_DECODERS
+            if pixels >= SCAN_PARALLEL_MIN_PIXELS
+            else ("auto",)
+        )
+    if not linux_amd or pixels < SCAN_AMD_PARALLEL_MIN_PIXELS:
+        return ("auto",)
+    strategy = amd_strategy or AMD_SCAN_DECODE_STRATEGY
+    try:
+        return AMD_SCAN_DECODE_STRATEGIES[strategy]
+    except KeyError as exc:
+        choices = ", ".join(sorted(AMD_SCAN_DECODE_STRATEGIES))
+        raise ValueError(
+            f"Unknown AMD scan decode strategy {strategy!r}; expected one of {choices}"
+        ) from exc
 
 
 def scan_decoder_count(
@@ -338,21 +398,19 @@ def scan_decoder_count(
     duration: float,
     *,
     amd: bool,
+    linux_amd: bool = False,
 ) -> int:
-    """Parallel decoders for a scan.
+    """Return the production decoder count for this scan input."""
 
-    Scans of 4K+ material are NVDEC-bound while the GPU has more than one
-    NVDEC unit (NVDEC decodes every frame regardless of stride), so split the
-    video across decoders. Smaller resolutions are detection- or
-    loop-overhead-bound and AMD decode sessions are not known to be safe to
-    duplicate, so those stay on one decoder.
-    """
-
-    if amd or duration < SCAN_PARALLEL_MIN_DURATION:
-        return 1
-    if video_width * video_height < SCAN_PARALLEL_MIN_PIXELS:
-        return 1
-    return SCAN_PARALLEL_DECODERS
+    return len(
+        scan_decode_backends(
+            video_width,
+            video_height,
+            duration,
+            amd=amd,
+            linux_amd=linux_amd,
+        )
+    )
 
 
 def segment_sample_indices(
@@ -686,15 +744,9 @@ def _decode_adaptive_coarse_group(
     reusable_rocdecoder=None,
     stopped: Callable[[], bool],
 ) -> Iterator[tuple[object, list[int]]]:
-    """Decode all requested samples in one GOP with one reader/seek.
+    """Decode all requested samples in one GOP with one reader/seek."""
 
-    ``decode_backend`` and ``reusable_rocdecoder`` are accepted so the later
-    rocDecode reuse follow-up can extend this route without changing the plan
-    contract. This independent candidate intentionally uses the upstream
-    ``NvidiaVideoReader`` API only.
-    """
-
-    del batch_size, decode_backend, reusable_rocdecoder
+    del batch_size
     from jasna.media.video_decoder import NvidiaVideoReader
 
     target_index = 0
@@ -704,6 +756,8 @@ def _decode_adaptive_coarse_group(
         device,
         metadata,
         frame_stride=group.frame_stride,
+        decode_backend=decode_backend,
+        reusable_rocdecoder=reusable_rocdecoder,
     ) as reader:
         for batch, pts_list in reader.frames(seek_ts=group.start_seconds):
             if stopped():
@@ -780,6 +834,7 @@ class MosaicScanWorker:
         self.events: queue.Queue[ScanEvent] = queue.Queue()
         self._stop_scan = threading.Event()
         self._closed = threading.Event()
+        self._reusable_rocdecoder = None
         self._commands: queue.Queue[_MaskRequest | _Close] = queue.Queue(maxsize=1)
         self._mask_generation = 0
         self._thread = threading.Thread(
@@ -828,15 +883,14 @@ class MosaicScanWorker:
             pass
 
     def _run(self) -> None:
+        from jasna.media.video_decoder import ReusableRocDecoder
+
+        reusable_rocdecoder = ReusableRocDecoder()
+        self._reusable_rocdecoder = reusable_rocdecoder
+        detector = None
         try:
             self.events.put(ScanStatus("loading_models"))
             detector = self._build_detector()
-        except Exception as exc:
-            self.events.put(ScanFailed(str(exc)))
-            if self._on_stopped is not None:
-                self._on_stopped()
-            return
-        try:
             self._scan(detector)
             if self._on_stopped is not None:
                 self._on_stopped()
@@ -847,14 +901,18 @@ class MosaicScanWorker:
             if self._on_stopped is not None:
                 self._on_stopped()
         finally:
-            if hasattr(detector, "close"):
-                detector.close()
-            import gc
+            self._reusable_rocdecoder = None
+            try:
+                reusable_rocdecoder.close()
+            finally:
+                if detector is not None and hasattr(detector, "close"):
+                    detector.close()
+                import gc
 
-            import torch
+                import torch
 
-            gc.collect()
-            torch.cuda.empty_cache()
+                gc.collect()
+                torch.cuda.empty_cache()
 
     def _build_detector(self):
         from jasna._suppress_noise import install as _install_noise_filters
@@ -946,12 +1004,16 @@ class MosaicScanWorker:
             estimated_rate = max(float(metadata.average_fps), float(metadata.video_fps))
             capacity = math.ceil(scan_span * estimated_rate / frame_stride) + batch_size
 
-        decoders = scan_decoder_count(
+        amd = is_amd_device(device)
+        linux_amd = _is_linux_amd_rocdecode_scan_device(device)
+        decode_backends = scan_decode_backends(
             int(metadata.video_width),
             int(metadata.video_height),
             duration,
-            amd=is_amd_device(device),
+            amd=amd,
+            linux_amd=linux_amd,
         )
+        decoders = len(decode_backends)
         segment_capacity = (
             capacity if decoders == 1 else math.ceil(capacity / decoders) + batch_size
         )
@@ -961,6 +1023,7 @@ class MosaicScanWorker:
         batches: queue.Queue = queue.Queue(maxsize=decoders + 1)
 
         def decode_segment(index: int) -> None:
+            backend = decode_backends[index]
             start_s, end_s = bounds[index], bounds[index + 1]
             is_last = index == decoders - 1
             try:
@@ -970,6 +1033,10 @@ class MosaicScanWorker:
                     device,
                     metadata,
                     frame_stride=frame_stride,
+                    # Keep NVIDIA and unsupported AMD on their established
+                    # default/environment selection.  Linux AMD receives its
+                    # explicit per-reader production strategy only here.
+                    **({"decode_backend": backend} if linux_amd else {}),
                 )
                 with reader:
                     start_pts = reader.start_pts
@@ -1153,11 +1220,16 @@ class MosaicScanWorker:
 
         metadata = self.metadata
         device = torch.device("cuda:0")
+        linux_amd = _is_linux_amd_rocdecode_scan_device(device)
         batch_size = int(self.settings.batch_size)
         expected_samples = plan.sample_count
         if expected_samples <= 0:
             raise RuntimeError("Adaptive coarse scan planned no detection samples")
 
+        # Linux AMD must use rocDecode for this keyframe/GOP route.  A native
+        # decoder error must be visible instead of silently turning into a CPU
+        # scan; other platforms retain their established reader routing.
+        decode_backend = "rocdecode" if linux_amd else None
         collector: _ScanTensorCollector | None = None
         times: list[float] = []
         scores: list[float] = []
@@ -1255,6 +1327,8 @@ class MosaicScanWorker:
                 batch_size,
                 plan,
                 group,
+                decode_backend=decode_backend,
+                reusable_rocdecoder=self._reusable_rocdecoder,
                 stopped=self._stop_scan.is_set,
             )
             try:
