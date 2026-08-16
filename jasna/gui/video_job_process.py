@@ -18,6 +18,7 @@ from jasna.gui.models import (
     JobItem,
     JobProcessingSnapshot,
     JobStatus,
+    SegmentSelectionMode,
 )
 from jasna.segments import SegmentRange
 
@@ -35,14 +36,17 @@ def build_video_job_request(
     output_folder: str,
     output_pattern: str,
     disable_basicvsrpp_tensorrt: bool,
+    preserve_input_structure: bool = False,
 ) -> dict[str, Any]:
     return {
         "schema_version": REQUEST_SCHEMA_VERSION,
         "job": {
             "id": job.id,
             "path": str(job.path),
+            "input_root": str(job.input_root) if job.input_root is not None else None,
             "duration_seconds": job.duration_seconds,
             "segments": [asdict(segment) for segment in snapshot.segments],
+            "segment_selection_mode": snapshot.segment_selection_mode.value,
             "detection_model": snapshot.detection_model,
             "detection_score_threshold": snapshot.detection_score_threshold,
             "vr_projection": snapshot.vr_projection,
@@ -50,6 +54,7 @@ def build_video_job_request(
         "settings": asdict(settings),
         "output_folder": output_folder,
         "output_pattern": output_pattern,
+        "preserve_input_structure": bool(preserve_input_structure),
         "disable_basicvsrpp_tensorrt": bool(disable_basicvsrpp_tensorrt),
     }
 
@@ -111,10 +116,18 @@ def _load_request(path: Path) -> tuple[JobItem, AppSettings, dict[str, Any]]:
     job = JobItem(
         id=int(raw_job["id"]),
         path=Path(raw_job["path"]),
+        input_root=(
+            Path(raw_job["input_root"])
+            if raw_job.get("input_root")
+            else None
+        ),
         duration_seconds=raw_job.get("duration_seconds"),
         segments=tuple(
             SegmentRange(float(segment["start"]), float(segment["end"]))
             for segment in raw_job.get("segments", ())
+        ),
+        segment_selection_mode=SegmentSelectionMode(
+            raw_job.get("segment_selection_mode", SegmentSelectionMode.DEFAULT.value)
         ),
         detection_model=raw_job.get("detection_model"),
         detection_score_threshold=raw_job.get("detection_score_threshold"),
@@ -184,6 +197,9 @@ def run_video_job_file(
         processor._output_pattern = str(
             payload.get("output_pattern", "{original}_restored.mp4")
         )
+        processor._preserve_input_structure = bool(
+            payload.get("preserve_input_structure", False)
+        )
         processor._disable_basicvsrpp_tensorrt_for_run = bool(
             payload.get("disable_basicvsrpp_tensorrt", False)
         )
@@ -218,6 +234,7 @@ def run_video_job_file(
                 "output_path": (
                     str(job.output_path) if job.output_path is not None else None
                 ),
+                "processing_path": processor.completed_processing_path(job.id),
             },
         )
         return 0

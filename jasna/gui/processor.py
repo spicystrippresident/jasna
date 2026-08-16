@@ -633,6 +633,7 @@ class Processor:
                 frames_processed=int(raw.get("frames_processed", 0)),
                 total_frames=int(raw.get("total_frames", 0)),
                 message=str(raw.get("message", "")),
+                phase=str(raw.get("phase", "")),
             )
             job.status = status
             self._progress(update)
@@ -650,6 +651,9 @@ class Processor:
             job.output_path = (
                 Path(str(raw_output_path)) if raw_output_path else None
             )
+            processing_path = event.get("processing_path")
+            if processing_path in {"full", "smart", "copy"}:
+                self._completed_processing_paths[job.id] = str(processing_path)
             return True
         return False
 
@@ -694,6 +698,7 @@ class Processor:
                     disable_basicvsrpp_tensorrt=(
                         self._disable_basicvsrpp_tensorrt_for_run
                     ),
+                    preserve_input_structure=self._preserve_input_structure,
                 )
                 write_video_job_request(request_path, request)
                 environment = os.environ.copy()
