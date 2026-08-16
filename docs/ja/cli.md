@@ -212,17 +212,17 @@ NVIDIA H.264 は復元されたディテールを保つためにより多くの�
 
 | キー | 説明 |
 | --- | ------------ |
-| `cq` | 数値を変更せず AMF の `qvbr_quality_level` として渡す品質目標。低いほど高品質。範囲は 0–51、デフォルトは 24（H.264）、25（HEVC）、32（AV1）。Linux AMD 10 ビット AV1 は上記のソースレート連動ピーク VBR の例外を使います。 |
+| `cq` | 汎用の品質目標。低いほど高品質です。H.264 と通常の AV1 は値を変更せず `qvbr_quality_level` に渡し、Linux AMD 10 ビット AV1 は上記のソースレート連動ピーク VBR の例外を使います。HEVC の全体処理は値をそのまま CQP の I/P QP に使い、Linux AMD の HEVC Smart Render 断片は 0–51 に制限した `CQ + 2` を使います。範囲は 0–51、デフォルトは 24（H.264）、25（HEVC）、32（AV1）。 |
 | `qvbr_quality_level` | AMF ネイティブの別名。`--cq` を省略した場合は CLI の高度な設定で利用できますが、GUI のカスタム引数では利用できません。 |
 | `usage` | エンコーダーの用途プロファイル。デフォルト `high_quality`。 |
 | `quality` | 速度/品質プリセット: `speed`、`balanced`、`quality`（デフォルト）。 |
-| `rc` | レート制御モード。デフォルト `qvbr`。Linux AMD 10 ビット AV1 は `vbr_peak` に固定されます。 |
+| `rc` | レート制御モード。H.264/AV1 はデフォルト `qvbr`、HEVC は `cqp`。Linux AMD 10 ビット AV1 は `vbr_peak` に固定されます。 |
 | `preset` | AMF プリセット。 |
 | `g` | キーフレーム間隔（フレーム数）。デフォルト 250。 |
 | `bf` | 連続 B フレームの最大数。 |
-| `preanalysis` | 事前分析パス。デフォルトで有効ですが、Linux AMD 10 ビット AV1 では無効になります。 |
-| `vbaq` | H.264/HEVC 用の分散ベース適応量子化。AV1 は `aq_mode` を使います。 |
-| `maxrate` / `bufsize` | ビットレート上限と VBV バッファサイズ（bit/秒）。`maxrate` を指定しない限り、ソースのビットレートから自動設定されます。 |
+| `preanalysis` | H.264/AV1 はデフォルトで有効ですが、Linux AMD 10 ビット AV1 では無効です。HEVC のデフォルト CQP と Linux AMD HEVC Smart Render 断片でも無効です。 |
+| `vbaq` | H.264/HEVC 用の分散ベース適応量子化。HEVC CQP では無効です。AV1 は `aq_mode` を使います。 |
+| `maxrate` / `bufsize` | ビットレート上限と VBV バッファサイズ。選択したレート制御が上限を扱える場合はソースのビットレートから設定され、HEVC のデフォルト CQP は VBV 上限を使いません。 |
 | `profile` / `level` | コーデックのプロファイルとレベル。 |
 
 コーデック別の追加キー:
