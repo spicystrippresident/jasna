@@ -12,6 +12,7 @@ from jasna.gui.mosaic_scan import (
     MosaicScanResult,
     MosaicScanWorker,
     ScanCheckpoint,
+    ScanFailed,
     _ScanTensorCollector,
     _decode_adaptive_coarse_group,
     plan_adaptive_coarse_scan,
@@ -157,6 +158,7 @@ def test_adaptive_sparse_group_opens_one_reader_for_all_its_targets(monkeypatch)
             yield torch.zeros((2, 3, 2, 2), dtype=torch.uint8), [1_800, 1_900]
 
     monkeypatch.setattr(video_decoder, "NvidiaVideoReader", FakeReader)
+    reusable = object()
     batches = list(
         _decode_adaptive_coarse_group(
             Path("视频.mp4"),
@@ -166,7 +168,7 @@ def test_adaptive_sparse_group_opens_one_reader_for_all_its_targets(monkeypatch)
             plan,
             group,
             decode_backend="rocdecode",
-            reusable_rocdecoder=object(),
+            reusable_rocdecoder=reusable,
             stopped=lambda: False,
         )
     )
@@ -174,12 +176,13 @@ def test_adaptive_sparse_group_opens_one_reader_for_all_its_targets(monkeypatch)
     assert len(opened) == 1
     assert opened[0][0][1] == 1
     assert opened[0][1]["frame_stride"] == 1
+    assert opened[0][1]["decode_backend"] == "rocdecode"
+    assert opened[0][1]["reusable_rocdecoder"] is reusable
     assert [pts for _batch, pts_list in batches for pts in pts_list] == [1_000, 1_400, 1_800]
 
 
 def test_adaptive_direct_gops_share_detector_batches_and_exact_checkpoint_pts(monkeypatch):
     import torch
-    import jasna.accelerator as accelerator
     import jasna.gui.mosaic_scan as mosaic_scan
 
     batch_size = 3
@@ -224,14 +227,17 @@ def test_adaptive_direct_gops_share_detector_batches_and_exact_checkpoint_pts(mo
         def finish(self):
             return tuple(self.scores), torch.empty((len(self.scores), 1, 1), dtype=torch.uint8)
 
-    def fake_decode(_path, _metadata, _device, _reader_batch_size, active_plan, group, **_kwargs):
+    decode_requests = []
+
+    def fake_decode(_path, _metadata, _device, _reader_batch_size, active_plan, group, **kwargs):
         assert active_plan is plan
+        decode_requests.append(kwargs)
         key = group.target_pts[0]
         yield torch.full((1, 3, 2, 2), key % 255, dtype=torch.uint8), [
             active_plan.start_pts + key
         ]
 
-    monkeypatch.setattr(accelerator, "is_amd_device", lambda _device: False)
+    monkeypatch.setattr(mosaic_scan, "_is_linux_amd_rocdecode_scan_device", lambda _device: True)
     monkeypatch.setattr(mosaic_scan, "_ScanTensorCollector", FakeCollector)
     monkeypatch.setattr(mosaic_scan, "_decode_adaptive_coarse_group", fake_decode)
     worker = MosaicScanWorker(
@@ -242,7 +248,8 @@ def test_adaptive_direct_gops_share_detector_batches_and_exact_checkpoint_pts(mo
         emit_checkpoints=True,
         adaptive_coarse_plan=plan,
     )
-    worker._reusable_rocdecoder = object()
+    reusable = object()
+    worker._reusable_rocdecoder = reusable
 
     worker._scan_adaptive_coarse(FakeDetector(), plan)
 
@@ -262,6 +269,43 @@ def test_adaptive_direct_gops_share_detector_batches_and_exact_checkpoint_pts(mo
             tuple(key * 0.01 for key in sample_keys[batch_size:]),
         ]
     )
+    assert len(decode_requests) == len(groups)
+    assert all(request["decode_backend"] == "rocdecode" for request in decode_requests)
+    assert all(request["reusable_rocdecoder"] is reusable for request in decode_requests)
+
+
+def test_scan_worker_closes_reusable_rocdecoder_after_detector_setup_failure(monkeypatch):
+    import jasna.media.video_decoder as video_decoder
+
+    created = []
+
+    class FakeReusableRocDecoder:
+        def __init__(self):
+            self.closed = False
+            created.append(self)
+
+        def close(self):
+            self.closed = True
+
+    worker = MosaicScanWorker(
+        "video.mp4",
+        SimpleNamespace(),
+        AppSettings(),
+        stride_seconds=1.0,
+    )
+
+    def fail_detector_setup():
+        raise RuntimeError("detector unavailable")
+
+    monkeypatch.setattr(video_decoder, "ReusableRocDecoder", FakeReusableRocDecoder)
+    monkeypatch.setattr(worker, "_build_detector", fail_detector_setup)
+
+    worker._run()
+
+    assert len(created) == 1
+    assert created[0].closed is True
+    assert worker._reusable_rocdecoder is None
+    assert any(isinstance(event, ScanFailed) for event in worker.events.queue)
 
 
 def test_editor_scan_does_not_emit_checkpoint_events_by_default():
@@ -395,14 +439,38 @@ def test_add_many_skips_already_covered_ranges():
     assert state.segments == (SegmentRange(0.0, 10.0), SegmentRange(20.0, 21.0))
 
 
-def test_scan_decoder_count_parallel_only_for_4k_on_nvidia():
-    from jasna.gui.mosaic_scan import scan_decoder_count
+def test_linux_amd_scan_gate_requires_linux_and_amd(monkeypatch):
+    import jasna.accelerator as accelerator
+    import jasna.gui.mosaic_scan as mosaic_scan
+
+    monkeypatch.setattr(accelerator, "is_amd_device", lambda _device: True)
+    monkeypatch.setattr(mosaic_scan.sys, "platform", "win32")
+    assert mosaic_scan._is_linux_amd_rocdecode_scan_device(object()) is False
+
+    monkeypatch.setattr(mosaic_scan.sys, "platform", "linux")
+    assert mosaic_scan._is_linux_amd_rocdecode_scan_device(object()) is True
+
+    monkeypatch.setattr(accelerator, "is_amd_device", lambda _device: False)
+    assert mosaic_scan._is_linux_amd_rocdecode_scan_device(object()) is False
+
+
+def test_scan_decode_backends_keep_nvidia_and_enable_dual_8k_linux_amd():
+    from jasna.gui.mosaic_scan import scan_decode_backends, scan_decoder_count
 
     assert scan_decoder_count(3840, 2160, 120.0, amd=False) == 2
     assert scan_decoder_count(8192, 4096, 15.0, amd=False) == 2
     assert scan_decoder_count(1920, 1080, 120.0, amd=False) == 1
     assert scan_decoder_count(3840, 2160, 5.0, amd=False) == 1
     assert scan_decoder_count(3840, 2160, 120.0, amd=True) == 1
+    assert scan_decode_backends(8192, 4096, 120.0, amd=True) == ("auto",)
+    assert scan_decode_backends(
+        8192,
+        4096,
+        120.0,
+        amd=True,
+        linux_amd=True,
+    ) == ("auto", "auto")
+    assert scan_decoder_count(8192, 4096, 120.0, amd=True, linux_amd=True) == 2
 
 
 def test_segment_sample_indices_ownership():
