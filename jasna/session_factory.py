@@ -193,7 +193,30 @@ def build_pipeline(
     segments: "tuple[SegmentRange, ...] | None" = None,
     splice_plan: "SplicePlan | None" = None,
 ) -> "Pipeline":
+    from jasna import __version__
     from jasna.pipeline import Pipeline
+
+    processing_signature = {
+        "jasna_version": __version__,
+        "device": config.device,
+        "fp16": bool(config.fp16),
+        "batch_size": int(config.batch_size),
+        "detection_model_name": config.detection_model_name,
+        "detection_score_threshold": float(config.detection_score_threshold),
+        "max_detection_gap": int(config.max_detection_gap),
+        "min_detection_duration": int(config.min_detection_duration),
+        "scene_detection": bool(config.scene_detection),
+        "max_clip_size": int(config.max_clip_size),
+        "temporal_overlap": int(config.temporal_overlap),
+        "enable_crossfade": bool(config.enable_crossfade),
+        "denoise_strength": config.denoise_strength,
+        "denoise_step": config.denoise_step,
+        "secondary_restoration": config.secondary_restoration,
+        "vr_mode": config.vr_mode,
+        "vr_projection": config.vr_projection,
+        "sharpen_strength": float(config.sharpen_strength),
+        "retarget_high_fps": bool(config.retarget_high_fps),
+    }
 
     return Pipeline(
         input_video=input_video,
@@ -224,5 +247,6 @@ def build_pipeline(
         segments=segments,
         splice_plan=splice_plan,
         working_dir=config.working_dir,
+        processing_signature=processing_signature,
         detection_session=session,
     )

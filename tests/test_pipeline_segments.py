@@ -64,6 +64,7 @@ def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_pat
         lambda index, suffix: workspace.path / f"{index:04d}{suffix}"
     )
     workspace.reusable_fragment.return_value = None
+    workspace.cleanup.side_effect = OSError("workspace is locked")
 
     with (
         patch(
