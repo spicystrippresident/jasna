@@ -87,6 +87,17 @@ For Nvidia library builds, you also need:
 uv pip install cmake ninja
 ```
 
+Linux AMD source builds use rocDecode for large HEVC/AV1 inputs and for every
+Main10 HEVC input. AMF can open Main10 HEVC on Linux, but its P010 surface
+cannot be transferred through PyAV; when rocDecode is unavailable this case
+uses explicit FFmpeg software decoding instead of the incompatible AMF path.
+Install the development package matching the active ROCm release (for example
+`rocdecode-dev` from the same ROCm 7.2.1 repository). If it is absent or the
+native bridge cannot build, Jasna logs the reason once and permanently falls
+back to its AMF/software reader for that video. A non-root development install
+may instead place `include/rocdecode` and `share/rocdecode/utils/rocvideodecode`
+under `$XDG_DATA_HOME/jasna/rocdecode-sdk`.
+
 Developer setup also requires:
 
 - `ffmpeg` and `ffprobe` on `PATH`; `ffmpeg` major version must be **8**.
@@ -183,13 +194,16 @@ jasna/protection/keytool/validate_amd_ssh.sh user@amd-host
 python jasna/protection/keytool/build_windows_amd.py
 ```
 
-The AMD build uses PyTorch/ROCm for BasicVSR++, YOLO and RF-DETR, and AMF for
-H.264/HEVC/AV1 decode and encode. RF-DETR runs the trained checkpoint through the
+The AMD build uses PyTorch/ROCm for BasicVSR++, YOLO and RF-DETR, rocDecode for
+large HEVC/AV1 decode and every Main10 HEVC input, and AMF for encode and
+compatible decode fallback. RF-DETR runs the trained checkpoint through the
 `rfdetr` torch model (`rfdetr==1.8.3` on `transformers==5.1.0`, bundled as
 `rfdetr-v6.pt`) — no ONNX Runtime/MIGraphX, so no
 per-model engine precompile step. NVIDIA builds keep the ONNX → TensorRT path
-(`rfdetr-v6.onnx`). Decode falls back to FFmpeg software decoding when AMF cannot
-handle the source. Secondary restoration and segment smart rendering remain
+(`rfdetr-v6.onnx`). rocDecode keeps PyAV demux timestamps and copies each internal
+surface device-to-device into Torch-owned NV12/P010 memory before release. Small
+8-bit and AV1 inputs and unsupported codecs remain on PyAV; failures fall back
+to AMF or FFmpeg software decoding. Secondary restoration and segment smart rendering remain
 NVIDIA-only.
 
 `--device cuda:N` selects the PyTorch GPU (ROCm reuses the CUDA device API).

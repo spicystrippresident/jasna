@@ -11,7 +11,7 @@ import torch
 from jasna.blend_buffer import BlendBuffer
 from jasna.crop_buffer import CropBuffer
 from jasna.frame_queue import FrameQueue
-from jasna.media.video_decoder import NvidiaVideoReader
+from jasna.media.video_decoder import NvidiaVideoReader, ReusableRocDecoder
 from jasna.pipeline_debug_logging import PipelineDebugMemoryLogger
 from jasna.pipeline_items import ClipRestoreItem, FrameMeta, PrimaryRestoreResult, SecondaryRestoreResult, _SENTINEL
 from jasna.pipeline_processing import process_frame_batch, finalize_processing
@@ -60,6 +60,7 @@ def decode_detect_loop(
     debug_memory: PipelineDebugMemoryLogger | None = None,
     vr_mode: str = "off",
     vr_projector=None,
+    reusable_rocdecoder: ReusableRocDecoder | None = None,
 ) -> None:
     timer = LoopTimer("decode-detect")
     try:
@@ -80,6 +81,7 @@ def decode_detect_loop(
                 device=device,
                 metadata=metadata,
                 frame_stride=frame_stride,
+                reusable_rocdecoder=reusable_rocdecoder,
             ) as reader,
             torch.inference_mode(),
         ):
@@ -356,6 +358,7 @@ def blend_encode_loop(
     seek_ts: float | None = None,
     frame_stride: int = 1,
     vram_offloader=None,
+    reusable_rocdecoder: ReusableRocDecoder | None = None,
 ) -> None:
     timer = LoopTimer("blend-encode")
     try:
@@ -372,6 +375,7 @@ def blend_encode_loop(
             device=device,
             metadata=metadata,
             frame_stride=frame_stride,
+            reusable_rocdecoder=reusable_rocdecoder,
         ) as reader2:
             frame_gen = _flat_frames(reader2)
             secondary_done = False
