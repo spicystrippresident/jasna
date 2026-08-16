@@ -37,6 +37,7 @@ class ProgressUpdate:
     frames_processed: int = 0
     total_frames: int = 0
     message: str = ""
+    phase: str = ""
 
 
 class ProcessingStopped(Exception):
@@ -324,6 +325,7 @@ class Processor:
             job_id=job.id,
             status=JobStatus.PROCESSING,
             message=f"Starting {job.filename}",
+            phase="preparing",
         ))
         
         input_path = job.path
@@ -407,7 +409,7 @@ class Processor:
                             job_settings,
                             stopped=self._stop_event.is_set,
                             log=self._log,
-                            progress=lambda fraction, fps, eta: self._progress(
+                            progress=lambda stage, fraction, fps, eta: self._progress(
                                 ProgressUpdate(
                                     job_id=job.id,
                                     status=JobStatus.PROCESSING,
@@ -415,6 +417,7 @@ class Processor:
                                     fps=fps,
                                     eta_seconds=eta,
                                     message="Scanning for mosaic ranges",
+                                    phase=f"{stage}_scan",
                                 )
                             ),
                         )
@@ -440,6 +443,12 @@ class Processor:
                         automatic_segments = processing_path == "smart"
 
             if processing_path == "copy":
+                self._progress(ProgressUpdate(
+                    job_id=job.id,
+                    status=JobStatus.PROCESSING,
+                    progress=15.0,
+                    phase="source_copy",
+                ))
                 try:
                     self._copy_source_video(input_path, output_path)
                 except ProcessingStopped:
@@ -454,6 +463,11 @@ class Processor:
                     processing_path = "full"
                     segments = ()
             if processing_path != "copy":
+                self._progress(ProgressUpdate(
+                    job_id=job.id,
+                    status=JobStatus.PROCESSING,
+                    phase="restoring",
+                ))
                 pipeline_options = {}
                 if automatic_segments:
                     pipeline_options["automatic_segments"] = True
@@ -469,6 +483,12 @@ class Processor:
                 )
                 if actual_path in {"full", "smart"}:
                     processing_path = actual_path
+            self._progress(ProgressUpdate(
+                job_id=job.id,
+                status=JobStatus.PROCESSING,
+                progress=99.9,
+                phase="finalizing",
+            ))
             if not is_image:
                 self._run_post_export_video_command(input_path, output_path)
 
@@ -930,6 +950,7 @@ class Processor:
                 eta_seconds=eta_seconds,
                 frames_processed=frames_done,
                 total_frames=total,
+                phase="restoring",
             ))
 
         pipeline = None
@@ -1048,7 +1069,13 @@ class Processor:
         self._pause_event.wait()
         if self._stop_event.is_set():
             raise ProcessingStopped("Processing stopped")
-        self._progress(ProgressUpdate(job_id=job_id, status=JobStatus.PROCESSING, progress=20.0, message="Detecting mosaics"))
+        self._progress(ProgressUpdate(
+            job_id=job_id,
+            status=JobStatus.PROCESSING,
+            progress=20.0,
+            message="Detecting mosaics",
+            phase="restoring",
+        ))
 
         num_variants = max(1, int(settings.image_restore_variants))
         freeu = dict(DEFAULT_FREEU) if bool(settings.image_restore_freeu) else None
@@ -1065,7 +1092,12 @@ class Processor:
         for path, out in zip(variant_output_paths(output_path, num_variants), outputs):
             image_io.write_image_rgb_chw(path, out)
             self._log("INFO", f"Wrote {path.name}")
-        self._progress(ProgressUpdate(job_id=job_id, status=JobStatus.PROCESSING, progress=100.0))
+        self._progress(ProgressUpdate(
+            job_id=job_id,
+            status=JobStatus.PROCESSING,
+            progress=100.0,
+            phase="finalizing",
+        ))
 
     def _close_image_session(self):
         if self._img_session is None:

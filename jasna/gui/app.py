@@ -714,6 +714,7 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
                 update.fps,
                 update.eta_seconds,
                 elapsed_seconds=job_elapsed,
+                phase=update.phase,
             )
         except Exception:
             logger.warning("Failed to update job status in queue panel", exc_info=True)

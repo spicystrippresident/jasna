@@ -12,6 +12,7 @@ from jasna.gui.mosaic_scan import (
     ScanCheckpoint,
     ScanCompleted,
     ScanFailed,
+    ScanProgress,
 )
 from jasna.gui.pre_scan_routing import (
     PRE_SCAN_ALGORITHM_VERSION,
@@ -342,6 +343,7 @@ def test_incomplete_stage_decodes_from_start_and_reuses_exact_pts(tmp_path):
         def __init__(self, *args, **kwargs):
             created.update(kwargs)
             self.events = queue.Queue()
+            self.events.put(ScanProgress(0.5, 12.0, 8.0))
             self.events.put(
                 ScanCompleted(
                     MosaicScanResult(
@@ -372,7 +374,8 @@ def test_incomplete_stage_decodes_from_start_and_reuses_exact_pts(tmp_path):
     coordinator.settings = AppSettings()
     coordinator._stopped = lambda: False
     coordinator._log = lambda *_args: None
-    coordinator._progress = None
+    progress = []
+    coordinator._progress = lambda *values: progress.append(values)
     coordinator._worker_factory = FakeWorker
     coordinator._active_worker = None
     coordinator.checkpoint = checkpoint
@@ -386,6 +389,7 @@ def test_incomplete_stage_decodes_from_start_and_reuses_exact_pts(tmp_path):
     assert created["start_seconds"] == 0.0
     assert created["known_sample_scores"] == {45_046: 0.8, 90_090: 0.4}
     assert created["emit_checkpoints"] is True
+    assert progress == [("fine", 0.5, 12.0, 8.0)]
 
 
 def test_adaptive_coarse_checkpoint_keeps_exact_pts_and_reuses_completed_stage(tmp_path):
