@@ -55,6 +55,14 @@ def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_pat
         segments=pipeline.segments,
     )
     pipeline.splice_plan = plan
+    workspace = MagicMock()
+    workspace.path = tmp_path / "workspace"
+    workspace.path.mkdir()
+    workspace.raw_path.side_effect = lambda index: workspace.path / f"{index:04d}-raw.nut"
+    workspace.fragment_path.side_effect = (
+        lambda index, suffix: workspace.path / f"{index:04d}{suffix}"
+    )
+    workspace.reusable_fragment.return_value = None
 
     with (
         patch(
@@ -62,6 +70,8 @@ def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_pat
             return_value=AcceleratorVendor.NVIDIA,
         ),
         patch("jasna.pipeline.validate_smart_render", return_value="h264"),
+        patch("jasna.pipeline.workspace_signature", return_value={}),
+        patch("jasna.pipeline.SmartRenderWorkspace.open", return_value=workspace),
         patch("jasna.pipeline.probe_keyframes") as probe_keyframes,
         patch("jasna.pipeline.build_splice_plan") as build_splice_plan,
         patch("jasna.pipeline.NvidiaVideoEncoder") as encoder,
@@ -94,6 +104,7 @@ def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_pat
     assert pass_args["effect_ranges"] == ((75, 90),)
     concatenate.assert_called_once()
     mux.assert_called_once()
+    workspace.cleanup.assert_called_once()
 
 
 def test_smart_run_uses_working_dir_for_temp_files(tmp_path) -> None:
@@ -125,9 +136,19 @@ def test_smart_run_uses_working_dir_for_temp_files(tmp_path) -> None:
         spans=(SpliceSpan("copy", 0, 60), SpliceSpan("render", 60, 120, ((75, 90),)), SpliceSpan("copy", 120, 180)),
         segments=pipeline.segments,
     )
+    workspace = MagicMock()
+    workspace.path = pipeline.working_dir / ".output.segments-test"
+    workspace.path.mkdir(parents=True)
+    workspace.raw_path.side_effect = lambda index: workspace.path / f"{index:04d}-raw.nut"
+    workspace.fragment_path.side_effect = (
+        lambda index, suffix: workspace.path / f"{index:04d}{suffix}"
+    )
+    workspace.reusable_fragment.return_value = None
 
     with (
         patch("jasna.pipeline.validate_smart_render", return_value="h264"),
+        patch("jasna.pipeline.workspace_signature", return_value={}),
+        patch("jasna.pipeline.SmartRenderWorkspace.open", return_value=workspace),
         patch("jasna.pipeline.NvidiaVideoEncoder"),
         patch("jasna.pipeline.create_copy_fragment"),
         patch("jasna.pipeline.normalize_fragment"),
@@ -137,7 +158,7 @@ def test_smart_run_uses_working_dir_for_temp_files(tmp_path) -> None:
         pipeline._run_smart(metadata)
 
     assembled = mux.call_args.args[0]
-    assert assembled.parent.parent == pipeline.working_dir
+    assert assembled.parent == workspace.path
     assert pipeline.working_dir.is_dir()
     assert pipeline.output_video.parent.is_dir()
 

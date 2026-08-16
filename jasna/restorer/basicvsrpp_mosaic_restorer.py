@@ -23,6 +23,7 @@ class BasicvsrppMosaicRestorer:
         fp16: bool,
         config: str | dict | None = None,
     ):
+        self.checkpoint_path = str(checkpoint_path)
         self.device = torch.device(device)
         self.max_clip_size = int(max_clip_size)
         self.use_tensorrt = bool(use_tensorrt)
