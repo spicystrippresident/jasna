@@ -33,8 +33,59 @@ class RestorationSession:
     detection_model_path: Path
     restoration_pipeline: "RestorationPipeline"
     secondary_restorer: "SecondaryRestorer | None"
+    detection_model: object | None = None
+    detection_model_key: tuple[str, str, int, str, float, bool] | None = None
+
+    def get_detection_model(
+        self,
+        *,
+        name: str,
+        path: str | Path,
+        batch_size: int,
+        score_threshold: float,
+        fp16: bool,
+    ) -> object:
+        """Return the detector matching this pipeline's construction contract.
+
+        A restoration session can process multiple videos sequentially. Keep the
+        expensive detector alive between those pipelines, but replace it when a
+        setting that affects its construction changes.
+        """
+        model_path = Path(path)
+        key = (
+            str(name),
+            str(model_path.resolve()),
+            int(batch_size),
+            str(self.device),
+            float(score_threshold),
+            bool(fp16),
+        )
+        if self.detection_model_key == key and self.detection_model is not None:
+            return self.detection_model
+
+        if self.detection_model is not None and hasattr(self.detection_model, "close"):
+            self.detection_model.close()
+        self.detection_model = None
+        self.detection_model_key = None
+
+        from jasna.mosaic.detection_registry import build_detection_model
+
+        self.detection_model = build_detection_model(
+            str(name),
+            model_path,
+            batch_size=int(batch_size),
+            device=self.device,
+            score_threshold=float(score_threshold),
+            fp16=bool(fp16),
+        )
+        self.detection_model_key = key
+        return self.detection_model
 
     def close(self) -> None:
+        if self.detection_model is not None and hasattr(self.detection_model, "close"):
+            self.detection_model.close()
+        self.detection_model = None
+        self.detection_model_key = None
         self.restoration_pipeline.restorer.close()
         if self.secondary_restorer is not None and hasattr(self.secondary_restorer, "close"):
             self.secondary_restorer.close()
@@ -173,4 +224,5 @@ def build_pipeline(
         segments=segments,
         splice_plan=splice_plan,
         working_dir=config.working_dir,
+        detection_session=session,
     )

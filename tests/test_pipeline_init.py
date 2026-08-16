@@ -110,6 +110,44 @@ class TestPipelineInit:
         p = _make_pipeline(progress_callback=cb)
         assert p.progress_callback is cb
 
+    def test_close_does_not_close_session_owned_detector(self):
+        detector = MagicMock()
+        detection_session = MagicMock()
+        detection_session.get_detection_model.return_value = detector
+
+        pipeline = _make_pipeline(detection_session=detection_session)
+
+        detection_session.get_detection_model.assert_called_once_with(
+            name="rfdetr-v5",
+            path=Path("model.onnx"),
+            batch_size=4,
+            score_threshold=0.25,
+            fp16=True,
+        )
+        pipeline.close()
+
+        detector.close.assert_not_called()
+        assert pipeline.detection_model is None
+
+    def test_close_does_not_close_explicitly_supplied_detector(self):
+        detector = MagicMock()
+        pipeline = _make_pipeline(detection_model=detector)
+
+        pipeline.close()
+
+        detector.close.assert_not_called()
+        assert pipeline.detection_model is None
+
+    def test_close_closes_standalone_detector_once(self):
+        pipeline = _make_pipeline()
+        detector = pipeline.detection_model
+
+        pipeline.close()
+        pipeline.close()
+
+        detector.close.assert_called_once_with()
+        assert pipeline.detection_model is None
+
     def test_retarget_high_fps_defaults_off_and_can_be_enabled(self):
         assert _make_pipeline().retarget_high_fps is False
         assert _make_pipeline(retarget_high_fps=True).retarget_high_fps is True
