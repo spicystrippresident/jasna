@@ -218,6 +218,7 @@ class KeyframeIndex:
     end_pts: int
     max_b_frames: int = 0
     uses_b_references: bool = False
+    decode_delay_pts: int = 0
 
     def seconds_for_pts(self, pts: int) -> float:
         return float((int(pts) - self.start_pts) * self.time_base)
@@ -412,9 +413,23 @@ def resolve_smart_encoder_settings(
     return resolved
 
 
+def _nominal_frame_duration_pts(metadata: VideoMetadata, time_base: Fraction) -> int:
+    """Return one frame duration in stream timestamp units when packets omit it."""
+
+    try:
+        return max(
+            1,
+            round(1 / (float(metadata.video_fps) * float(time_base))),
+        )
+    except (TypeError, ValueError, ZeroDivisionError, OverflowError):
+        return 1
+
+
 def probe_keyframes(path: str | Path, metadata: VideoMetadata) -> KeyframeIndex:
     keyframes: list[int] = []
     packet_pts: list[int] = []
+    packet_end_pts: int | None = None
+    decode_delay_pts = 0
     with av.open(str(path)) as container:
         stream = container.streams.video[0]
         codec = _canonical_codec(metadata.codec_name)
@@ -428,10 +443,18 @@ def probe_keyframes(path: str | Path, metadata: VideoMetadata) -> KeyframeIndex:
             length_size = (extradata[21] & 0x03) + 1
         time_base = Fraction(stream.time_base)
         start_pts = resolve_video_start_pts(stream.start_time, metadata.start_pts)
+        nominal_frame_duration = _nominal_frame_duration_pts(metadata, time_base)
         for packet in container.demux(stream):
             if packet.pts is not None:
-                packet_pts.append(int(packet.pts))
-            if (
+                pts = int(packet.pts)
+                packet_pts.append(pts)
+                packet_duration = int(packet.duration or 0)
+                packet_end = pts + (
+                    packet_duration if packet_duration > 0 else nominal_frame_duration
+                )
+                if packet_end_pts is None or packet_end > packet_end_pts:
+                    packet_end_pts = packet_end
+            is_safe_keyframe = (
                 packet.pts is not None
                 and packet.is_keyframe
                 and _is_safe_random_access_packet(
@@ -440,8 +463,15 @@ def probe_keyframes(path: str | Path, metadata: VideoMetadata) -> KeyframeIndex:
                     length_size,
                     length_prefixed=length_prefixed,
                 )
-            ):
+            )
+            if is_safe_keyframe:
                 keyframes.append(int(packet.pts))
+                packet_dts = getattr(packet, "dts", None)
+                if packet_dts is not None:
+                    decode_delay_pts = max(
+                        decode_delay_pts,
+                        int(packet.pts) - int(packet_dts),
+                    )
         stream_duration = stream.duration
 
     if not keyframes:
@@ -451,8 +481,10 @@ def probe_keyframes(path: str | Path, metadata: VideoMetadata) -> KeyframeIndex:
         end_pts = start_pts + int(stream_duration)
     else:
         end_pts = start_pts + round(float(metadata.duration) / time_base)
+    if packet_end_pts is not None:
+        end_pts = max(end_pts, packet_end_pts)
     if end_pts <= keyframes[-1]:
-        end_pts = keyframes[-1] + max(1, round(1 / (metadata.video_fps * time_base)))
+        end_pts = keyframes[-1] + nominal_frame_duration
     max_b_frames, uses_b_references = _analyze_packet_reordering(packet_pts)
     return KeyframeIndex(
         tuple(keyframes),
@@ -461,6 +493,7 @@ def probe_keyframes(path: str | Path, metadata: VideoMetadata) -> KeyframeIndex:
         int(end_pts),
         max_b_frames=max_b_frames,
         uses_b_references=uses_b_references,
+        decode_delay_pts=decode_delay_pts,
     )
 
 
@@ -649,14 +682,54 @@ def _codec_name(path: Path) -> str:
         return container.streams.video[0].codec_context.codec.canonical_name
 
 
-def normalize_fragment(source: Path, destination: Path, *, codec: str) -> None:
+def _fragment_pts_are_reordered(path: Path) -> bool:
+    packet_pts: list[int] = []
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0]
+        for packet in container.demux(stream):
+            if packet.pts is not None:
+                packet_pts.append(int(packet.pts))
+    max_b_frames, _ = _analyze_packet_reordering(packet_pts)
+    return max_b_frames > 0
+
+
+def _normalization_parameters(codec: str) -> tuple[str, str, list[str]]:
     bitstream_filter = {
         "h264": "h264_mp4toannexb,dump_extra=freq=keyframe",
         "hevc": "hevc_mp4toannexb,dump_extra=freq=keyframe",
         "av1": "av1_metadata=td=insert,dump_extra=freq=keyframe",
     }[codec]
     muxer = "mpegts" if codec in {"h264", "hevc"} else "matroska"
-    container_args = ["-muxdelay", "0"] if muxer == "mpegts" else ["-avoid_negative_ts", "make_zero"]
+    container_args = (
+        ["-muxdelay", "0"]
+        if muxer == "mpegts"
+        else ["-avoid_negative_ts", "make_zero"]
+    )
+    return bitstream_filter, muxer, container_args
+
+
+def normalize_fragment(
+    source: Path,
+    destination: Path,
+    *,
+    codec: str,
+    decode_delay: Fraction = Fraction(0, 1),
+) -> None:
+    bitstream_filter, muxer, container_args = _normalization_parameters(codec)
+    timestamp_args: list[str] = []
+    if decode_delay > 0 and not _fragment_pts_are_reordered(source):
+        with av.open(str(source)) as container:
+            time_base = Fraction(container.streams.video[0].time_base)
+        delay_ticks = round(Fraction(decode_delay) / time_base)
+        bitstream_filter += f",setts=pts=PTS:dts=PTS-{delay_ticks}"
+        timestamp_args = [
+            "-output_ts_offset", _seconds(float(decode_delay)),
+            "-avoid_negative_ts", "disabled",
+        ]
+        # The ordinary Matroska policy would otherwise override the requested
+        # offset, which is needed to preserve the source decode delay.
+        if muxer == "matroska":
+            container_args = []
     _run_ffmpeg(
         [
             "-i", str(source),
@@ -665,6 +738,7 @@ def normalize_fragment(source: Path, destination: Path, *, codec: str) -> None:
             "-c:v", "copy",
             "-bsf:v", bitstream_filter,
             *container_args,
+            *timestamp_args,
             "-f", muxer,
             str(destination),
         ],

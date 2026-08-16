@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from jasna.smart_render_workspace import (
     SmartRenderWorkspace,
+    WORKSPACE_ALGORITHM_VERSION,
     workspace_signature,
 )
 
@@ -107,6 +108,32 @@ def test_signature_change_uses_a_different_workspace(tmp_path: Path) -> None:
     )
 
     assert first.path != second.path
+
+
+def test_algorithm_version_bump_invalidates_v1_fragments(tmp_path: Path) -> None:
+    current_signature = _signature(tmp_path)
+    legacy_signature = {
+        **current_signature,
+        "algorithm_version": "jasna-smart-render-workspace-v1",
+    }
+    legacy_workspace = SmartRenderWorkspace.open(
+        tmp_path,
+        output=tmp_path / "restored.mp4",
+        signature=legacy_signature,
+    )
+    legacy_fragment = legacy_workspace.fragment_path(1, ".ts")
+    legacy_fragment.write_bytes(b"v1-fragment")
+    legacy_workspace.mark_complete(1, legacy_fragment)
+
+    current_workspace = SmartRenderWorkspace.open(
+        tmp_path,
+        output=tmp_path / "restored.mp4",
+        signature=current_signature,
+    )
+
+    assert WORKSPACE_ALGORITHM_VERSION == "jasna-smart-render-workspace-v2"
+    assert current_workspace.path != legacy_workspace.path
+    assert current_workspace.reusable_fragment(1) is None
 
 
 def test_invalid_manifest_is_preserved_and_replaced(tmp_path: Path) -> None:

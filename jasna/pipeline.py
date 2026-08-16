@@ -744,7 +744,15 @@ class Pipeline:
                     )
                 if self._cancel_event.is_set():
                     return
-                normalize_fragment(raw, normalized, codec=codec)
+                if span.is_render:
+                    normalize_fragment(
+                        raw,
+                        normalized,
+                        codec=codec,
+                        decode_delay=index.decode_delay_pts * index.time_base,
+                    )
+                else:
+                    normalize_fragment(raw, normalized, codec=codec)
                 workspace.mark_complete(span_index, normalized)
                 raw.unlink(missing_ok=True)
                 fragments.append((normalized, duration))

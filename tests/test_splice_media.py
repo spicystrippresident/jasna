@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from fractions import Fraction
 import subprocess
 from pathlib import Path
 
@@ -68,6 +69,39 @@ def test_h264_probe_resolves_source_compatible_smart_settings(tmp_path: Path) ->
         "bf": 3,
         "b_ref_mode": "disabled",
     }
+
+
+def test_normalize_fragment_applies_decode_delay_to_unreordered_h264(
+    tmp_path: Path,
+) -> None:
+    raw = tmp_path / "rendered.nut"
+    normalized = tmp_path / "rendered.ts"
+    _ffmpeg(
+        "-f", "lavfi", "-i", "testsrc2=size=160x96:rate=30:duration=1",
+        "-an",
+        "-c:v", "libx264",
+        "-bf", "0",
+        "-g", "30",
+        "-f", "nut",
+        str(raw),
+    )
+
+    normalize_fragment(
+        raw,
+        normalized,
+        codec="h264",
+        decode_delay=Fraction(1, 30),
+    )
+
+    with av.open(str(normalized)) as container:
+        packets = [
+            packet
+            for packet in container.demux(container.streams.video[0])
+            if packet.pts is not None and packet.dts is not None
+        ]
+
+    assert packets
+    assert any(packet.pts > packet.dts for packet in packets)
 
 
 @pytest.mark.parametrize(

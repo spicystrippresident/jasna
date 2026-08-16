@@ -18,6 +18,8 @@ from jasna.media.splice import (
     _is_safe_random_access_packet,
     build_splice_plan,
     create_copy_fragment,
+    normalize_fragment,
+    probe_keyframes,
     resolve_smart_encoder_settings,
     validate_smart_render,
 )
@@ -50,6 +52,28 @@ def _metadata(codec: str = "h264", **overrides) -> VideoMetadata:
 
 def _index(points=(0, 60, 120), end=180) -> KeyframeIndex:
     return KeyframeIndex(tuple(points), Fraction(1, 30), 0, end)
+
+
+class _Packet:
+    def __init__(
+        self,
+        *,
+        pts: int | None,
+        dts: int | None = None,
+        duration: int | None = None,
+        is_keyframe: bool = False,
+    ) -> None:
+        self.pts = pts
+        self.dts = dts
+        self.duration = duration
+        self.is_keyframe = is_keyframe
+
+    def __bytes__(self) -> bytes:
+        return b"packet"
+
+
+def test_keyframe_index_defaults_to_no_decode_delay() -> None:
+    assert _index().decode_delay_pts == 0
 
 
 def test_plan_expands_to_keyframes_but_keeps_exact_effect_range() -> None:
@@ -92,6 +116,169 @@ def test_plan_rejects_range_shorter_than_timestamp_interval() -> None:
 def test_packet_reordering_detects_flat_and_hierarchical_b_frames() -> None:
     assert _analyze_packet_reordering((0, 4, 1, 2, 3, 8, 5, 6, 7)) == (3, False)
     assert _analyze_packet_reordering((0, 5, 3, 1, 2, 4, 10, 8, 6, 7, 9)) == (4, True)
+
+
+def test_probe_keyframes_uses_packet_tail_and_keyframe_decode_delay() -> None:
+    stream = MagicMock()
+    stream.codec_context.extradata = b""
+    stream.time_base = Fraction(1, 30)
+    stream.start_time = 100
+    stream.duration = 90
+    container = MagicMock()
+    container.__enter__.return_value = container
+    container.streams.video = [stream]
+    container.demux.return_value = [
+        _Packet(pts=100, dts=94, duration=3, is_keyframe=True),
+        # This final packet has no duration, so the probe must use the
+        # nominal duration rather than truncate the final span at 190.
+        _Packet(pts=190, dts=188, duration=0),
+    ]
+
+    with (
+        patch("jasna.media.splice.av.open", return_value=container),
+        patch("jasna.media.splice._is_safe_random_access_packet", return_value=True),
+    ):
+        index = probe_keyframes(Path("input.mp4"), _metadata())
+
+    assert index.pts == (100,)
+    assert index.end_pts == 191
+    assert index.decode_delay_pts == 6
+
+
+@pytest.mark.parametrize(
+    ("codec", "bitstream_filter", "muxer", "container_args"),
+    [
+        ("h264", "h264_mp4toannexb,dump_extra=freq=keyframe", "mpegts", ["-muxdelay", "0"]),
+        ("hevc", "hevc_mp4toannexb,dump_extra=freq=keyframe", "mpegts", ["-muxdelay", "0"]),
+        ("av1", "av1_metadata=td=insert,dump_extra=freq=keyframe", "matroska", ["-avoid_negative_ts", "make_zero"]),
+    ],
+)
+def test_normalize_fragment_preserves_default_codec_timestamps_without_delay(
+    codec: str,
+    bitstream_filter: str,
+    muxer: str,
+    container_args: list[str],
+) -> None:
+    source = Path("raw.nut")
+    destination = Path("normalized.media")
+
+    with (
+        patch("jasna.media.splice._fragment_pts_are_reordered") as reordered,
+        patch("jasna.media.splice._run_ffmpeg") as run_ffmpeg,
+    ):
+        normalize_fragment(source, destination, codec=codec)
+
+    reordered.assert_not_called()
+    assert run_ffmpeg.call_args.args[0] == [
+        "-i", str(source),
+        "-map", "0:v:0",
+        "-an",
+        "-c:v", "copy",
+        "-bsf:v", bitstream_filter,
+        *container_args,
+        "-f", muxer,
+        str(destination),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("codec", "bitstream_filter", "muxer", "container_args"),
+    [
+        ("h264", "h264_mp4toannexb,dump_extra=freq=keyframe", "mpegts", ["-muxdelay", "0"]),
+        ("hevc", "hevc_mp4toannexb,dump_extra=freq=keyframe", "mpegts", ["-muxdelay", "0"]),
+        ("av1", "av1_metadata=td=insert,dump_extra=freq=keyframe", "matroska", []),
+    ],
+)
+def test_normalize_fragment_adds_decode_delay_to_unreordered_render_output(
+    codec: str,
+    bitstream_filter: str,
+    muxer: str,
+    container_args: list[str],
+) -> None:
+    source = Path("raw.nut")
+    destination = Path("normalized.media")
+    stream = MagicMock()
+    stream.time_base = Fraction(1, 90_000)
+    container = MagicMock()
+    container.__enter__.return_value = container
+    container.streams.video = [stream]
+
+    with (
+        patch("jasna.media.splice._fragment_pts_are_reordered", return_value=False) as reordered,
+        patch("jasna.media.splice.av.open", return_value=container),
+        patch("jasna.media.splice._run_ffmpeg") as run_ffmpeg,
+    ):
+        normalize_fragment(
+            source,
+            destination,
+            codec=codec,
+            decode_delay=Fraction(1, 30),
+        )
+
+    reordered.assert_called_once_with(source)
+    assert run_ffmpeg.call_args.args[0] == [
+        "-i", str(source),
+        "-map", "0:v:0",
+        "-an",
+        "-c:v", "copy",
+        "-bsf:v", f"{bitstream_filter},setts=pts=PTS:dts=PTS-3000",
+        *container_args,
+        "-output_ts_offset", "0.033333333",
+        "-avoid_negative_ts", "disabled",
+        "-f", muxer,
+        str(destination),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("codec", "bitstream_filter", "muxer", "container_args"),
+    [
+        ("h264", "h264_mp4toannexb,dump_extra=freq=keyframe", "mpegts", ["-muxdelay", "0"]),
+        ("hevc", "hevc_mp4toannexb,dump_extra=freq=keyframe", "mpegts", ["-muxdelay", "0"]),
+        ("av1", "av1_metadata=td=insert,dump_extra=freq=keyframe", "matroska", ["-avoid_negative_ts", "make_zero"]),
+    ],
+)
+def test_normalize_fragment_skips_delay_for_already_reordered_packets(
+    codec: str,
+    bitstream_filter: str,
+    muxer: str,
+    container_args: list[str],
+) -> None:
+    source = Path("raw.nut")
+    destination = Path("normalized.media")
+    stream = MagicMock()
+    container = MagicMock()
+    container.__enter__.return_value = container
+    container.streams.video = [stream]
+    container.demux.return_value = [
+        _Packet(pts=0),
+        _Packet(pts=4),
+        _Packet(pts=1),
+        _Packet(pts=2),
+        _Packet(pts=3),
+    ]
+
+    with (
+        patch("jasna.media.splice.av.open", return_value=container),
+        patch("jasna.media.splice._run_ffmpeg") as run_ffmpeg,
+    ):
+        normalize_fragment(
+            source,
+            destination,
+            codec=codec,
+            decode_delay=Fraction(1, 30),
+        )
+
+    assert run_ffmpeg.call_args.args[0] == [
+        "-i", str(source),
+        "-map", "0:v:0",
+        "-an",
+        "-c:v", "copy",
+        "-bsf:v", bitstream_filter,
+        *container_args,
+        "-f", muxer,
+        str(destination),
+    ]
 
 
 def test_smart_h264_settings_match_source_structure() -> None:

@@ -44,6 +44,7 @@ def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_pat
         180,
         max_b_frames=3,
         uses_b_references=False,
+        decode_delay_pts=2,
     )
     plan = SplicePlan(
         index=index,
@@ -76,7 +77,7 @@ def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_pat
         patch("jasna.pipeline.build_splice_plan") as build_splice_plan,
         patch("jasna.pipeline.NvidiaVideoEncoder") as encoder,
         patch("jasna.pipeline.create_copy_fragment") as copy_fragment,
-        patch("jasna.pipeline.normalize_fragment"),
+        patch("jasna.pipeline.normalize_fragment") as normalize_fragment,
         patch("jasna.pipeline.concatenate_fragments") as concatenate,
         patch("jasna.pipeline.mux_final_output") as mux,
     ):
@@ -102,6 +103,11 @@ def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_pat
     assert pass_args["seek_ts"] == 2.0
     assert pass_args["end_pts"] == 120
     assert pass_args["effect_ranges"] == ((75, 90),)
+    assert [call.kwargs for call in normalize_fragment.call_args_list] == [
+        {"codec": "h264"},
+        {"codec": "h264", "decode_delay": Fraction(1, 15)},
+        {"codec": "h264"},
+    ]
     concatenate.assert_called_once()
     mux.assert_called_once()
     workspace.cleanup.assert_called_once()
