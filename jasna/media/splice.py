@@ -55,6 +55,9 @@ def _stream_duration_seconds(container, stream) -> float:
     if container.duration is not None:
         duration = float(container.duration / av.time_base)
         start = _stream_start_seconds(container, stream)
+        # Matroska can expose the absolute last timestamp as the container
+        # duration when a stream starts after zero. Normalize that value to the
+        # media span used by FFprobe and by ordinary MP4/TS stream durations.
         if start > 0.0 and duration > start:
             duration -= start
         return duration
@@ -101,7 +104,9 @@ def validate_video_output(
     except OSError as exc:
         raise OutputValidationError(f"Completed output is missing: {output}") from exc
     if not output.is_file() or size <= 0:
-        raise OutputValidationError(f"Completed output is empty or not a file: {output}")
+        raise OutputValidationError(
+            f"Completed output is empty or not a file: {output}"
+        )
 
     if source is not None:
         source_codec, source_duration = _source_video_contract(Path(source))
@@ -179,12 +184,16 @@ def validate_video_output(
 
 
 def _fsync_file(path: Path) -> None:
+    # Microsoft CRT _commit() ultimately needs a writable file handle. FFmpeg
+    # just created this output, so reopen it read/write only for the final flush.
     mode = "r+b" if os.name == "nt" or sys.platform == "win32" else "rb"
     with path.open(mode) as handle:
         os.fsync(handle.fileno())
 
 
 def _fsync_directory(path: Path) -> None:
+    # Windows does not expose directory handles through os.open. The file flush
+    # remains mandatory there; POSIX filesystems also receive a metadata barrier.
     if os.name == "nt" or sys.platform == "win32":
         return
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
@@ -195,6 +204,32 @@ def _fsync_directory(path: Path) -> None:
         os.close(directory_fd)
 
 
+def sync_and_validate_final_output(
+    path: str | Path,
+    *,
+    source: str | Path | None = None,
+    expected_codec: str | None = None,
+    expected_duration: float | None = None,
+) -> None:
+    """Validate an output before and after the filesystem durability barriers."""
+
+    output = Path(path)
+    validate_video_output(
+        output,
+        source=source,
+        expected_codec=expected_codec,
+        expected_duration=expected_duration,
+    )
+    _fsync_file(output)
+    _fsync_directory(output.parent)
+    validate_video_output(
+        output,
+        source=source,
+        expected_codec=expected_codec,
+        expected_duration=expected_duration,
+    )
+
+
 def _commit_smart_output(
     temporary: Path,
     destination: Path,
@@ -202,9 +237,13 @@ def _commit_smart_output(
     source: Path,
     codec: str,
 ) -> None:
+    """Durably commit a structurally valid smart-render temporary output."""
+
     validate_video_output(temporary, source=source, expected_codec=codec)
     _fsync_file(temporary)
     os.replace(temporary, destination)
+    # Reopen the committed name as a post-rename barrier. This is especially
+    # important on Windows, where directory fsync is not available.
     _fsync_file(destination)
     _fsync_directory(destination.parent)
     validate_video_output(destination, source=source, expected_codec=codec)
