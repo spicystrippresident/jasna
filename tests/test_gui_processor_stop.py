@@ -25,7 +25,6 @@ def _processor_with_job(tmp_path, run_pipeline):
     processor._settings = AppSettings(pre_scan_policy="off")
     processor._output_folder = str(tmp_path)
     processor._output_pattern = "{original}_restored.mp4"
-    processor._validate_completed_video_output = lambda *args, **kwargs: None
     return processor, job, updates
 
 
@@ -92,7 +91,10 @@ def test_overwrite_pipeline_cannot_claim_unchanged_preexisting_output(tmp_path):
         tmp_path,
         lambda job_id, input_path, output_path, **kwargs: None,
     )
-    processor._settings = AppSettings(file_conflict="overwrite")
+    processor._settings = AppSettings(
+        file_conflict="overwrite",
+        pre_scan_policy="off",
+    )
 
     processor._run()
 
@@ -109,7 +111,11 @@ def test_changed_video_output_is_synced_before_completion(tmp_path):
         output_path.write_bytes(b"new completed output")
 
     processor, job, updates = _processor_with_job(tmp_path, write_new_output)
-    processor._settings = AppSettings(file_conflict="overwrite", codec="hevc")
+    processor._settings = AppSettings(
+        file_conflict="overwrite",
+        codec="hevc",
+        pre_scan_policy="off",
+    )
 
     with patch("jasna.media.splice.sync_and_validate_final_output") as validate:
         processor._run()
@@ -131,7 +137,10 @@ def test_video_post_export_runs_after_final_output_validation(tmp_path):
         output_path.write_bytes(b"new completed output")
 
     processor, job, _updates = _processor_with_job(tmp_path, write_new_output)
-    processor._settings = AppSettings(post_export_video_command="remux {output}")
+    processor._settings = AppSettings(
+        post_export_video_command="remux {output}",
+        pre_scan_policy="off",
+    )
 
     def validate(*_args, **_kwargs):
         events.append("validate")
@@ -159,7 +168,10 @@ def test_validation_failure_skips_video_post_export_command(tmp_path):
         output_path.write_bytes(b"new completed output")
 
     processor, job, updates = _processor_with_job(tmp_path, write_new_output)
-    processor._settings = AppSettings(post_export_video_command="remux {output}")
+    processor._settings = AppSettings(
+        post_export_video_command="remux {output}",
+        pre_scan_policy="off",
+    )
 
     with (
         patch(

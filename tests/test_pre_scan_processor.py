@@ -16,12 +16,13 @@ from jasna.gui.processor import Processor
 from jasna.segments import SegmentRange
 
 
-def _processor(tmp_path, settings: AppSettings):
+def _processor(tmp_path, settings: AppSettings, *, mock_validation: bool = True):
     processor = Processor()
     processor._settings = settings
     processor._output_folder = str(tmp_path)
     processor._output_pattern = "{original}_restored.mp4"
-    processor._validate_completed_video_output = MagicMock()
+    if mock_validation:
+        processor._validate_completed_video_output = MagicMock()
     return processor
 
 
@@ -170,6 +171,154 @@ def test_zero_hit_copy_does_not_load_restoration_pipeline(tmp_path):
     processor._copy_source_video.assert_called_once()
     processor._run_pipeline.assert_not_called()
     assert processor.completed_processing_path(job.id) == "copy"
+
+
+def test_zero_hit_copy_is_validated_before_post_export_or_completion(tmp_path):
+    source = tmp_path / "video.mp4"
+    source.write_bytes(b"source")
+    job = JobItem(source)
+    processor = _processor(
+        tmp_path,
+        AppSettings(post_export_video_command="after {output}"),
+        mock_validation=False,
+    )
+    events: list[str] = []
+    validations: list[tuple[object, object, object]] = []
+
+    def copy_source(_input_path, output_path):
+        output_path.write_bytes(b"copied")
+        events.append("copy")
+
+    def validate_output(output_path, *, source, expected_codec):
+        events.append("validate")
+        validations.append((output_path, source, expected_codec))
+        assert job.status is JobStatus.PROCESSING
+        assert job.output_path is None
+
+    processor._copy_source_video = copy_source
+    processor._run_pipeline = MagicMock()
+    coordinator = MagicMock()
+    coordinator.run.return_value = PreScanOutcome("copy", reason="no mosaic")
+
+    with (
+        patch(
+            "jasna.gui.pre_scan_routing.PreScanCoordinator",
+            return_value=coordinator,
+        ),
+        patch("jasna.media.get_video_meta_data", return_value=MagicMock()),
+        patch(
+            "jasna.media.splice.sync_and_validate_final_output",
+            side_effect=validate_output,
+        ),
+        patch(
+            "jasna.post_export_action.run_post_export_video_command",
+            side_effect=lambda *_args: events.append("post-export"),
+        ),
+        patch("jasna.gui.processor._cleanup_torch"),
+    ):
+        processor._process_job(job)
+
+    output = tmp_path / "video_restored.mp4"
+    assert job.status is JobStatus.COMPLETED
+    assert job.output_path == output
+    assert processor.completed_processing_path(job.id) == "copy"
+    assert processor._run_pipeline.call_count == 0
+    assert events == ["copy", "validate", "post-export"]
+    assert validations == [(output, source, None)]
+
+
+def test_zero_hit_copy_rejects_unchanged_preexisting_output(tmp_path):
+    source = tmp_path / "video.mp4"
+    source.write_bytes(b"source")
+    output = tmp_path / "video_restored.mp4"
+    output.write_bytes(b"stale output")
+    job = JobItem(source)
+    processor = _processor(tmp_path, AppSettings(), mock_validation=False)
+    processor._copy_source_video = MagicMock()
+    coordinator = MagicMock()
+    coordinator.run.return_value = PreScanOutcome("copy", reason="no mosaic")
+
+    with (
+        patch(
+            "jasna.gui.pre_scan_routing.PreScanCoordinator",
+            return_value=coordinator,
+        ),
+        patch("jasna.media.get_video_meta_data", return_value=MagicMock()),
+        patch("jasna.media.splice.sync_and_validate_final_output") as validate,
+        patch("jasna.gui.processor._cleanup_torch"),
+    ):
+        processor._process_job(job)
+
+    assert job.status is JobStatus.ERROR
+    assert job.output_path is None
+    validate.assert_not_called()
+
+
+def test_zero_hit_copy_invalid_media_skips_post_export_and_completion(tmp_path):
+    source = tmp_path / "video.mp4"
+    source.write_bytes(b"source")
+    job = JobItem(source)
+    processor = _processor(
+        tmp_path,
+        AppSettings(post_export_video_command="after {output}"),
+        mock_validation=False,
+    )
+
+    def copy_invalid(_input_path, output_path):
+        output_path.write_bytes(b"not a valid video")
+
+    processor._copy_source_video = copy_invalid
+    coordinator = MagicMock()
+    coordinator.run.return_value = PreScanOutcome("copy", reason="no mosaic")
+
+    with (
+        patch(
+            "jasna.gui.pre_scan_routing.PreScanCoordinator",
+            return_value=coordinator,
+        ),
+        patch("jasna.media.get_video_meta_data", return_value=MagicMock()),
+        patch(
+            "jasna.media.splice.sync_and_validate_final_output",
+            side_effect=RuntimeError("invalid copied media"),
+        ),
+        patch("jasna.post_export_action.run_post_export_video_command") as command,
+        patch("jasna.gui.processor._cleanup_torch"),
+    ):
+        processor._process_job(job)
+
+    assert job.status is JobStatus.ERROR
+    assert job.output_path is None
+    command.assert_not_called()
+
+
+def test_zero_hit_copy_cancellation_is_not_reported_completed(tmp_path):
+    source = tmp_path / "video.mp4"
+    source.write_bytes(b"source")
+    job = JobItem(source)
+    processor = _processor(tmp_path, AppSettings(), mock_validation=False)
+
+    def copy_then_stop(_input_path, output_path):
+        output_path.write_bytes(b"copied")
+        processor._stop_event.set()
+
+    processor._copy_source_video = copy_then_stop
+    coordinator = MagicMock()
+    coordinator.run.return_value = PreScanOutcome("copy", reason="no mosaic")
+
+    with (
+        patch(
+            "jasna.gui.pre_scan_routing.PreScanCoordinator",
+            return_value=coordinator,
+        ),
+        patch("jasna.media.get_video_meta_data", return_value=MagicMock()),
+        patch("jasna.media.splice.sync_and_validate_final_output") as validate,
+        patch("jasna.gui.processor._cleanup_torch"),
+    ):
+        processor._process_job(job)
+
+    assert job.status is JobStatus.PENDING
+    assert job.output_path is None
+    validate.assert_not_called()
 
 
 def test_automatic_ranges_fall_back_when_smart_render_is_incompatible(tmp_path):

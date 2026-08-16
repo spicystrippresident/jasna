@@ -165,7 +165,7 @@ class Processor:
         input_path: Path,
         output_path: Path,
         *,
-        codec: str,
+        codec: str | None,
         smart_render: bool,
         previous_fingerprint: _OutputFingerprint | None,
     ) -> None:
@@ -401,6 +401,8 @@ class Processor:
                     )
                     processing_path = "full"
                     segments = ()
+                if self._stop_event.is_set():
+                    raise ProcessingStopped("Processing stopped")
             if processing_path != "copy":
                 pipeline_options = {}
                 if automatic_segments:
@@ -417,11 +419,11 @@ class Processor:
                 )
                 if actual_path in {"full", "smart"}:
                     processing_path = actual_path
-            if not is_image and processing_path != "copy":
+            if not is_image:
                 self._validate_completed_video_output(
                     input_path,
                     output_path,
-                    codec=job_settings.codec,
+                    codec=(None if processing_path == "copy" else job_settings.codec),
                     smart_render=bool(segments),
                     previous_fingerprint=previous_output_fingerprint,
                 )
