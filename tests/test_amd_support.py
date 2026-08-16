@@ -37,6 +37,34 @@ def _metadata() -> VideoMetadata:
     )
 
 
+def _make_encoder(
+    monkeypatch,
+    tmp_path,
+    *,
+    platform: str = "linux",
+    vendor: AcceleratorVendor = AcceleratorVendor.AMD,
+    codec: str = "hevc",
+    encoder_settings: dict[str, object] | None = None,
+    smart_fragment: bool = True,
+    match_input_bit_depth: bool = False,
+    **metadata_overrides,
+):
+    import jasna.media.video_encoder as module
+
+    monkeypatch.setattr(module.sys, "platform", platform)
+    monkeypatch.setattr(module, "vendor_for_device", lambda _device: vendor)
+    metadata_values = {"codec_name": codec, **metadata_overrides}
+    return module.NvidiaVideoEncoder(
+        str(tmp_path / "out.mp4"),
+        torch.device("cuda:0"),
+        replace(_metadata(), **metadata_values),
+        codec=codec,
+        encoder_settings=encoder_settings or {},
+        match_input_bit_depth=match_input_bit_depth,
+        smart_fragment=smart_fragment,
+    )
+
+
 def test_rocm_uses_cuda_device_api_but_reports_amd(monkeypatch) -> None:
     monkeypatch.setattr(torch.version, "hip", "7.2.1")
     assert vendor_for_device("cuda:0") is AcceleratorVendor.AMD
@@ -136,6 +164,159 @@ def test_amf_hevc_maps_cq_to_constant_qp(monkeypatch, tmp_path) -> None:
     assert encoder.encoder_options["qp_p"] == "21"
     assert "cq" not in encoder.encoder_options
     assert "qvbr_quality_level" not in encoder.encoder_options
+
+
+def test_linux_amf_hevc_smart_fragment_uses_stable_cqp_and_source_level(
+    monkeypatch, tmp_path
+) -> None:
+    settings = {"cq": 28}
+    encoder = _make_encoder(
+        monkeypatch,
+        tmp_path,
+        encoder_settings=settings,
+        is_10bit=True,
+        hevc_level=183,
+    )
+
+    assert settings == {"cq": 28}
+    assert encoder.spec.frame_format == "p010le"
+    assert encoder.encoder_options["rc"] == "cqp"
+    assert encoder.encoder_options["qp_i"] == "30"
+    assert encoder.encoder_options["qp_p"] == "30"
+    assert encoder.encoder_options["preanalysis"] == "0"
+    assert encoder.encoder_options["level"] == "6.1"
+    assert encoder.encoder_options["forced_idr"] == "1"
+    assert "qvbr_quality_level" not in encoder.encoder_options
+    assert "vbaq" not in encoder.encoder_options
+
+
+@pytest.mark.parametrize(("cq", "expected"), [(-10, "0"), (50, "51")])
+def test_linux_amf_hevc_smart_fragment_clamps_cqp(
+    monkeypatch, tmp_path, cq: int, expected: str
+) -> None:
+    encoder = _make_encoder(
+        monkeypatch,
+        tmp_path,
+        encoder_settings={"cq": cq},
+    )
+
+    assert encoder.encoder_options["qp_i"] == expected
+    assert encoder.encoder_options["qp_p"] == expected
+
+
+def test_linux_amf_hevc_eight_bit_smart_fragment_uses_same_cqp_policy(
+    monkeypatch, tmp_path
+) -> None:
+    encoder = _make_encoder(
+        monkeypatch,
+        tmp_path,
+        encoder_settings={"cq": 28},
+        match_input_bit_depth=True,
+        hevc_level=186,
+    )
+
+    assert encoder.spec.frame_format == "nv12"
+    assert encoder.encoder_options["profile"] == "main"
+    assert encoder.encoder_options["rc"] == "cqp"
+    assert encoder.encoder_options["qp_i"] == "30"
+    assert encoder.encoder_options["qp_p"] == "30"
+    assert encoder.encoder_options["preanalysis"] == "0"
+    assert encoder.encoder_options["level"] == "6.2"
+
+
+def test_linux_amf_hevc_smart_fragment_forces_preanalysis_off_for_qvbr(
+    monkeypatch, tmp_path
+) -> None:
+    encoder = _make_encoder(
+        monkeypatch,
+        tmp_path,
+        encoder_settings={"cq": 21, "rc": "qvbr", "preanalysis": 1},
+        match_input_bit_depth=True,
+    )
+
+    assert encoder.encoder_options["rc"] == "qvbr"
+    assert encoder.encoder_options["qvbr_quality_level"] == "21"
+    assert encoder.encoder_options["preanalysis"] == "0"
+
+
+def test_hevc_fragment_policy_is_linux_amd_smart_render_only(
+    monkeypatch, tmp_path
+) -> None:
+    full_render = _make_encoder(
+        monkeypatch,
+        tmp_path,
+        encoder_settings={"cq": 28},
+        smart_fragment=False,
+        hevc_level=183,
+    )
+    windows_amd = _make_encoder(
+        monkeypatch,
+        tmp_path,
+        platform="win32",
+        encoder_settings={"cq": 28, "preanalysis": 1},
+        hevc_level=183,
+    )
+    nvidia = _make_encoder(
+        monkeypatch,
+        tmp_path,
+        vendor=AcceleratorVendor.NVIDIA,
+        encoder_settings={"cq": 28},
+        hevc_level=183,
+    )
+
+    assert full_render.encoder_options["qp_i"] == "28"
+    assert "level" not in full_render.encoder_options
+    assert "forced_idr" not in full_render.encoder_options
+    assert windows_amd.encoder_options["qp_i"] == "28"
+    assert windows_amd.encoder_options["preanalysis"] == "1"
+    assert "level" not in windows_amd.encoder_options
+    assert nvidia.encoder_name == "hevc_nvenc"
+    assert nvidia.encoder_options["cq"] == "28"
+    assert nvidia.encoder_options["forced-idr"] == "1"
+    assert "forced_idr" not in nvidia.encoder_options
+    assert "level" not in nvidia.encoder_options
+    assert "qp_i" not in nvidia.encoder_options
+
+
+@pytest.mark.parametrize("codec", ["h264", "av1"])
+def test_linux_amf_non_hevc_smart_fragments_ignore_hevc_policy(
+    monkeypatch, tmp_path, codec: str
+) -> None:
+    encoder = _make_encoder(
+        monkeypatch,
+        tmp_path,
+        codec=codec,
+        encoder_settings={"cq": 28},
+        codec_name="hevc",
+        hevc_level=183,
+    )
+
+    assert encoder.encoder_options["qvbr_quality_level"] == "28"
+    assert encoder.encoder_options["preanalysis"] == "1"
+    assert "level" not in encoder.encoder_options
+    assert "qp_i" not in encoder.encoder_options
+
+
+def test_amf_hevc_smart_fragment_preserves_explicit_or_unknown_level(
+    monkeypatch, tmp_path
+) -> None:
+    settings = {"cq": 28, "level": "6.0"}
+    explicit = _make_encoder(
+        monkeypatch,
+        tmp_path,
+        encoder_settings=settings,
+        hevc_level=183,
+    )
+    unknown = _make_encoder(
+        monkeypatch,
+        tmp_path,
+        encoder_settings={"cq": 28},
+        hevc_level=181,
+    )
+
+    assert settings == {"cq": 28, "level": "6.0"}
+    assert explicit.encoder_options["level"] == "6.0"
+    assert "level" not in unknown.encoder_options
 
 
 def test_amf_hevc_cqp_skips_source_bitrate_cap(monkeypatch, tmp_path) -> None:

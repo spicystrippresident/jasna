@@ -9,7 +9,9 @@ from jasna.media import (
     SUPPORTED_ENCODER_SETTINGS,
     SUPPORTED_ENCODER_SETTINGS_BY_CODEC,
     _parse_encoder_setting_scalar,
+    hevc_level_to_amf_option,
     parse_encoder_settings,
+    parse_hevc_level_idc,
     validate_encoder_settings,
     is_stream_10bit,
     get_video_meta_data,
@@ -48,6 +50,41 @@ def test_resolve_video_start_pts(stream_start, metadata_start, expected) -> None
 )
 def test_parse_video_bitrate(stream, fmt, expected) -> None:
     assert parse_video_bitrate(stream, fmt) == expected
+
+
+@pytest.mark.parametrize(
+    ("stream", "expected"),
+    [
+        ({"codec_name": "hevc", "level": 183}, 183),
+        ({"codec_name": "HEVC", "level": "186"}, 186),
+        ({"codec_name": "hevc", "level": 180.0}, 180),
+        ({"codec_name": "hevc", "level": 180.5}, None),
+        ({"codec_name": "hevc", "level": True}, None),
+        ({"codec_name": "hevc", "level": "unknown"}, None),
+        ({"codec_name": "h264", "level": 183}, None),
+        ({"codec_name": "hevc"}, None),
+    ],
+)
+def test_parse_hevc_level_idc(stream, expected) -> None:
+    assert parse_hevc_level_idc(stream) == expected
+
+
+@pytest.mark.parametrize(
+    ("level_idc", "expected"),
+    [
+        (30, "1.0"),
+        (183, "6.1"),
+        ("186", "6.2"),
+        (180.0, "6.0"),
+        (181, None),
+        (180.5, None),
+        (True, None),
+        ("unknown", None),
+        (None, None),
+    ],
+)
+def test_hevc_level_to_amf_option(level_idc, expected) -> None:
+    assert hevc_level_to_amf_option(level_idc) == expected
 
 
 class TestParseEncoderSettingScalar:
@@ -272,7 +309,10 @@ class TestGetVideoMetaData:
     @patch("jasna.media.subprocess.Popen")
     def test_basic_metadata_extraction(self, mock_popen, mock_resolve):
         proc = MagicMock()
-        proc.communicate.return_value = (self._make_ffprobe_output(), b"")
+        proc.communicate.return_value = (
+            self._make_ffprobe_output(level=183),
+            b"",
+        )
         proc.returncode = 0
         mock_popen.return_value = proc
 
@@ -286,6 +326,7 @@ class TestGetVideoMetaData:
         assert meta.is_10bit is False
         assert meta.color_range == AvColorRange.MPEG
         assert meta.color_space == AvColorspace.ITU709
+        assert meta.hevc_level == 183
 
     @patch("jasna.media.resolve_executable", return_value="ffprobe")
     @patch("jasna.media.subprocess.Popen")

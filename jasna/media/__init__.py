@@ -15,6 +15,25 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# FFprobe reports HEVC ``level`` as the ISO/IEC 23008-2 level_idc integer,
+# while hevc_amf accepts dotted level text. Keep an explicit mapping so an
+# unknown or malformed value cannot become an unsupported AMF argument.
+_HEVC_LEVEL_IDC_TO_AMF_OPTION: dict[int, str] = {
+    30: "1.0",
+    60: "2.0",
+    63: "2.1",
+    90: "3.0",
+    93: "3.1",
+    120: "4.0",
+    123: "4.1",
+    150: "5.0",
+    153: "5.1",
+    156: "5.2",
+    180: "6.0",
+    183: "6.1",
+    186: "6.2",
+}
+
 # ffmpeg *_nvenc option names shared by every codec
 _COMMON_ENCODER_SETTINGS: frozenset[str] = frozenset(
     {
@@ -205,6 +224,7 @@ class VideoMetadata:
     stereo_layout: str = ""
     spherical_projection: str = ""
     video_bitrate: int = 0
+    hevc_level: int | None = None
 
 
 def resolve_video_start_pts(
@@ -272,6 +292,45 @@ def parse_video_bitrate(json_video_stream: dict, json_video_format: dict) -> int
         if value > 0:
             return value
     return 0
+
+
+def parse_hevc_level_idc(json_video_stream: dict) -> int | None:
+    """Return FFprobe's integral HEVC level_idc, or ``None`` when unavailable."""
+    if str(json_video_stream.get("codec_name") or "").lower() != "hevc":
+        return None
+    value = json_video_stream.get("level")
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    if isinstance(value, str):
+        try:
+            return int(value.strip(), 10)
+        except ValueError:
+            return None
+    return None
+
+
+def hevc_level_to_amf_option(level_idc: object) -> str | None:
+    """Translate an FFprobe HEVC level_idc to hevc_amf's dotted option text."""
+    if isinstance(level_idc, bool):
+        return None
+    if isinstance(level_idc, int):
+        value = level_idc
+    elif isinstance(level_idc, float):
+        if not level_idc.is_integer():
+            return None
+        value = int(level_idc)
+    elif isinstance(level_idc, str):
+        try:
+            value = int(level_idc.strip(), 10)
+        except ValueError:
+            return None
+    else:
+        return None
+    return _HEVC_LEVEL_IDC_TO_AMF_OPTION.get(value)
 
 
 def parse_spatial_metadata(json_video_stream: dict) -> tuple[str, str]:
@@ -384,5 +443,6 @@ def get_video_meta_data(path: str) -> VideoMetadata:
         stereo_layout=stereo_layout,
         spherical_projection=spherical_projection,
         video_bitrate=parse_video_bitrate(json_video_stream, json_video_format),
+        hevc_level=parse_hevc_level_idc(json_video_stream),
     )
     return metadata

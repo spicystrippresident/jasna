@@ -64,6 +64,20 @@ Jasna 会修复列出的区间并复制其余部分。区间附近最近的安�
 
 不兼容的输入会在处理开始前被拒绝，并给出清晰的错误提示。
 
+### Linux AMD HEVC 片段
+
+在 Linux AMD 系统上，Smart Render 的 HEVC 片段使用专用策略：
+
+- 将通用 CQ 值映射为恒定 QP `CQ + 2`，并限制在 `0–51`；例如 CQ 28
+  会变为 CQP 30。
+- 始终关闭 PreAnalysis；即使高级编码设置尝试开启也不会生效。连续处理
+  高分辨率片段时，开启它可能导致 AMF 原生运行库直接退出。
+- 如果能识别源视频的 HEVC level，且用户没有明确设置 `level`，片段会
+  继承源 level，使直拷和重新编码的区间使用兼容的 level 标记。
+
+该策略只影响 Linux AMD 的 HEVC Smart Render 片段。全片编码、Windows
+AMD 和 NVIDIA 路径继续使用原有设置。
+
 ## 工作目录
 
 组装区间输出时，Jasna 会把临时文件存放在输出视频旁的隐藏文件夹中。
