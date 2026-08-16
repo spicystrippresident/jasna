@@ -192,6 +192,7 @@ class AppSettings:
     pre_scan_full_threshold: float = 0.85
     pre_scan_coarse_interval: float = 4.0
     pre_scan_fine_interval: float = 0.5
+    pre_scan_pad_seconds: str = "auto"  # auto, 0.0, 0.5, 1.0, 2.0, 5.0
     max_detection_gap: int = 2
     min_detection_duration: int = 2
     scene_detection: bool = True

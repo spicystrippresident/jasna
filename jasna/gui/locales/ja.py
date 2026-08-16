@@ -269,6 +269,9 @@ JA = {
         "pre_scan_full_threshold": "全編処理しきい値",
         "pre_scan_coarse_interval": "粗スキャン間隔",
         "pre_scan_fine_interval": "精密スキャン間隔",
+        "pre_scan_pad_seconds": "精密範囲の余白",
+        "pre_scan_pad_auto": "自動（精度に合わせる）",
+        "pre_scan_pad_none": "なし",
         "pre_scan_interval_0_25": "0.25 秒",
         "pre_scan_interval_0_5": "0.5 秒",
         "pre_scan_interval_1_0": "1.0 秒",
@@ -476,6 +479,7 @@ JA = {
         "tip_pre_scan_full_threshold": "自動モードで、検出時間の正規化されたカバー率がこの値以上なら全編処理を選び、それ未満なら精密スキャンを使います。デフォルト：85%（0.85）。",
         "tip_pre_scan_coarse_interval": "自動モードの適応型粗スキャンで使う目標間隔です。近いキーフレームを直接使い、密な GOP は間引き、疎な GOP は目標点を補います。デフォルト：4.0 秒。",
         "tip_pre_scan_fine_interval": "精密な処理前スキャンで使うサンプル間隔です。短いほど正確ですが、時間がかかります。デフォルト：0.5 秒。",
+        "tip_pre_scan_pad_seconds": "保持された精密スキャン範囲の前後に追加で復元する時間です。自動では精密間隔に合わせ、0.5～1.0 秒に制限します。デフォルト：自動。",
 
         # Preset button tooltips
         "tip_preset_reset": "保存済みの値にリセット",

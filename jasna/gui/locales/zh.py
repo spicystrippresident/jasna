@@ -269,6 +269,9 @@ ZH = {
         "pre_scan_full_threshold": "全视频处理阈值",
         "pre_scan_coarse_interval": "粗扫描间隔",
         "pre_scan_fine_interval": "精确扫描间隔",
+        "pre_scan_pad_seconds": "精扫区间扩边",
+        "pre_scan_pad_auto": "自动（跟随精扫精度）",
+        "pre_scan_pad_none": "不扩边",
         "pre_scan_interval_0_25": "0.25 秒",
         "pre_scan_interval_0_5": "0.5 秒",
         "pre_scan_interval_1_0": "1.0 秒",
@@ -476,6 +479,7 @@ ZH = {
         "tip_pre_scan_full_threshold": "在自动模式中，检测到的时间覆盖率达到或超过此归一化数值时选择全视频处理；覆盖率较低时使用精确扫描。默认值：85%（0.85）。",
         "tip_pre_scan_coarse_interval": "自动模式自适应粗扫的目标间隔。相近关键帧直接取样；关键帧过密时跳过多余 GOP，过疏时补充目标点。默认值：4.0 秒。",
         "tip_pre_scan_fine_interval": "精确预扫描的取样间隔。间隔越小越准确，但速度越慢。默认值：0.5 秒。",
+        "tip_pre_scan_pad_seconds": "在每个保留的精扫区间前后额外修复的时长。自动模式跟随精扫间隔，并限制在 0.5～1.0 秒。默认值：自动。",
 
         # Preset button tooltips
         "tip_preset_reset": "重置为保存的值",
