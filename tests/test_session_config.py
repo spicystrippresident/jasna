@@ -71,6 +71,7 @@ def test_cli_defaults_map_to_expected_config() -> None:
     assert config.rtx_denoise == "medium"
     assert config.rtx_deblur == "none"
     assert config.vr_mode == "auto"
+    assert config.vr_projection == "auto"
     assert config.codec == "hevc"
     assert config.encoder_settings == {}
     assert config.lut_path is None
@@ -91,6 +92,7 @@ def test_cli_non_default_args_are_mapped() -> None:
             "--secondary-restoration", "rtx-super-res",
             "--rtx-quality", "ultra",
             "--vr-mode", "sbs",
+            "--vr-projection", "gnomonic",
             "--no-progress",
             "--working-directory", "/fast/scratch",
             "--retarget-high-fps",
@@ -107,6 +109,7 @@ def test_cli_non_default_args_are_mapped() -> None:
     assert config.secondary_restoration == "rtx-super-res"
     assert config.rtx_quality == "ultra"
     assert config.vr_mode == "sbs"
+    assert config.vr_projection == "gnomonic"
     assert config.disable_progress is True
     assert config.working_dir == Path("/fast/scratch")
     assert config.retarget_high_fps is True
