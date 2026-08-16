@@ -721,7 +721,7 @@ class PreScanCoordinator:
         *,
         stopped: Callable[[], bool],
         log: Callable[[str, str], None],
-        progress: Callable[[float, float, float], None] | None = None,
+        progress: Callable[[str, float, float, float], None] | None = None,
         worker_factory=MosaicScanWorker,
     ) -> None:
         self.source = Path(source)
@@ -954,7 +954,7 @@ class PreScanCoordinator:
                 elif isinstance(event, ScanStatus):
                     self._log("INFO", str(event.message))
                 elif isinstance(event, ScanProgress) and self._progress is not None:
-                    self._progress(event.fraction, event.fps, event.eta_seconds)
+                    self._progress(name, event.fraction, event.fps, event.eta_seconds)
                 elif isinstance(event, ScanFailed):
                     raise PreScanFailed(event.message)
                 elif isinstance(event, ScanCompleted):

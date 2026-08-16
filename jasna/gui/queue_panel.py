@@ -24,6 +24,21 @@ from jasna.media.image_io import is_image_path
 from jasna.segments import SegmentRange
 
 
+_PROCESSING_PHASE_KEYS = {
+    "preparing": "job_phase_preparing",
+    "coarse_scan": "job_phase_coarse_scan",
+    "fine_scan": "job_phase_fine_scan",
+    "source_copy": "job_phase_source_copy",
+    "restoring": "job_phase_restoring",
+    "finalizing": "job_phase_finalizing",
+}
+
+
+def processing_phase_text(phase: str) -> str:
+    key = _PROCESSING_PHASE_KEYS.get(str(phase).strip().lower())
+    return t(key) if key is not None else t("job_processing")
+
+
 class QueuePanel(ctk.CTkFrame):
     """Left panel containing the job queue and output settings."""
     
@@ -566,7 +581,16 @@ class QueuePanel(ctk.CTkFrame):
                 return i
         return None
 
-    def update_job_status(self, job_id: int, status: JobStatus, progress: float = 0.0, fps: float = 0.0, eta_seconds: float = 0.0, elapsed_seconds: float | None = None):
+    def update_job_status(
+        self,
+        job_id: int,
+        status: JobStatus,
+        progress: float = 0.0,
+        fps: float = 0.0,
+        eta_seconds: float = 0.0,
+        elapsed_seconds: float | None = None,
+        phase: str = "",
+    ):
         idx = self._find_job_index_by_id(job_id)
         if idx is None:
             return
@@ -584,11 +608,17 @@ class QueuePanel(ctk.CTkFrame):
             JobStatus.SKIPPED: (t("job_skipped"), "⊘", Colors.STATUS_CONFLICT),
         }
         text, icon, color = status_map.get(status, ("", "", Colors.STATUS_PENDING))
+        if status is JobStatus.PROCESSING:
+            text = processing_phase_text(phase)
         widget.set_status(text, icon, color)
         
         if status == JobStatus.PROCESSING:
             widget.set_progress(progress)
-            widget.set_fps_eta(fps=fps, eta_seconds=eta_seconds)
+            widget.set_fps_eta(
+                fps=fps,
+                eta_seconds=eta_seconds,
+                stage_eta=bool(phase),
+            )
         elif status == JobStatus.COMPLETED and elapsed_seconds is not None:
             widget.hide_progress()
             widget.set_completed(elapsed_seconds)
