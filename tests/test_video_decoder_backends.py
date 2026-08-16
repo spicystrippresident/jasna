@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import sys
 from fractions import Fraction
 from pathlib import Path
@@ -146,6 +147,70 @@ def test_unknown_backend_raises(monkeypatch) -> None:
     reader = _reader(monkeypatch, AcceleratorVendor.NVIDIA)
     with pytest.raises(ValueError, match="JASNA_DECODE_BACKEND"):
         reader.__enter__()
+
+
+def test_reader_decode_backend_override_rejects_unknown_value(monkeypatch) -> None:
+    monkeypatch.setattr(module, "vendor_for_device", lambda _device: AcceleratorVendor.NVIDIA)
+    monkeypatch.setattr(module, "current_stream", lambda _device: None)
+    reader = module.NvidiaVideoReader(
+        "input.mp4",
+        4,
+        torch.device("cuda:0"),
+        _metadata(),
+        decode_backend="cpu-only",
+    )
+
+    with pytest.raises(ValueError, match="Unknown decode backend 'cpu-only'"):
+        reader.__enter__()
+
+
+def test_reader_decode_backend_override_takes_precedence_over_environment(monkeypatch) -> None:
+    monkeypatch.setenv(module.DECODE_BACKEND_ENV, "vali")
+    monkeypatch.setattr(module, "vendor_for_device", lambda _device: AcceleratorVendor.NVIDIA)
+    monkeypatch.setattr(module, "current_stream", lambda _device: None)
+    container = _fake_container(False)
+    monkeypatch.setattr(module.av, "open", MagicMock(return_value=container))
+    reader = module.NvidiaVideoReader(
+        "input.mp4",
+        4,
+        torch.device("cuda:0"),
+        _metadata(),
+        decode_backend="pyav-sw",
+    )
+
+    reader.__enter__()
+
+    assert reader._decode_backend == "pyav-sw"
+    assert module.av.open.call_args.kwargs == {}
+    assert container.streams.video[0].codec_context.thread_type == "AUTO"
+
+
+def test_explicit_auto_override_keeps_linux_amd_main10_rocdecode_route(monkeypatch) -> None:
+    metadata = dataclasses.replace(_metadata(), codec_name="hevc", is_10bit=True)
+    source = MagicMock()
+    source.width = 16
+    source.height = 16
+    monkeypatch.setenv(module.DECODE_BACKEND_ENV, "pyav-sw")
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    monkeypatch.setattr(module, "vendor_for_device", lambda _device: AcceleratorVendor.AMD)
+    monkeypatch.setattr(module, "current_stream", lambda _device: None)
+    monkeypatch.setattr(module, "rocdecode_supported_codec", lambda _codec: True)
+    source_factory = MagicMock(return_value=source)
+    monkeypatch.setattr(module, "_RocDecodeFrameSource", source_factory)
+    reader = module.NvidiaVideoReader(
+        "input.mp4",
+        4,
+        torch.device("cuda:0"),
+        metadata,
+        decode_backend="auto",
+    )
+
+    reader.__enter__()
+    reader.__exit__(None, None, None)
+
+    assert reader._decode_backend == "auto"
+    source_factory.assert_called_once()
+    source.close.assert_called_once()
 
 
 class _FakeVali:
