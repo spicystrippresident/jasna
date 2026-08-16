@@ -1,5 +1,6 @@
 from fractions import Fraction
 from pathlib import Path
+import threading
 from unittest.mock import MagicMock, patch, call
 
 from jasna.crop_buffer import RawCrop
@@ -525,6 +526,89 @@ class TestPipelineRun:
         ):
             with pytest.raises(RuntimeError, match="secondary boom"):
                 p.run()
+        assert p.cancel_requested
+
+    def test_run_secondary_failure_releases_bounded_queues_without_hanging(self):
+        """A secondary failure must unblock a primary producer before Pipeline returns."""
+        p = _make_pipeline()
+        p.max_clip_size = 1
+        p.temporal_overlap = 0
+        p.restoration_pipeline.secondary_restorer = None
+        p.restoration_pipeline.secondary_num_workers = 1
+
+        frames_t = torch.zeros((1, 3, 8, 8), dtype=torch.uint8)
+
+        def _reader_for_pipeline_worker(*_args, **_kwargs):
+            reader = MagicMock()
+            reader.__enter__ = MagicMock(return_value=reader)
+            reader.__exit__ = MagicMock(return_value=False)
+            if threading.current_thread().name == "DecodeDetect":
+                reader.frames.return_value = iter([(frames_t, [0])])
+            else:
+                reader.frames.return_value = iter([])
+            return reader
+
+        def _primary_result():
+            result = MagicMock()
+            result.keep_start = 0
+            result.keep_end = 1
+            result.primary_raw = torch.zeros((1, 3, 8, 8))
+            return result
+
+        p.restoration_pipeline.prepare_and_run_primary.side_effect = [
+            _primary_result(),
+            _primary_result(),
+            _primary_result(),
+        ]
+        p.restoration_pipeline._run_secondary.side_effect = RuntimeError("secondary failure")
+
+        from jasna.pipeline_processing import BatchProcessResult
+
+        def _emit_three_clips(**kwargs):
+            for _ in range(3):
+                kwargs["clip_queue"].put(MagicMock(), frame_count=1)
+            return BatchProcessResult(next_frame_idx=1, clips_emitted=3)
+
+        mock_encoder = MagicMock()
+        mock_encoder.__enter__ = MagicMock(return_value=mock_encoder)
+        mock_encoder.__exit__ = MagicMock(return_value=False)
+        errors: list[BaseException] = []
+        finished = threading.Event()
+
+        def _run_pipeline():
+            try:
+                p.run()
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                finished.set()
+
+        with (
+            patch("jasna.pipeline.get_video_meta_data", return_value=_fake_metadata()),
+            patch("jasna.pipeline.NvidiaVideoEncoder", return_value=mock_encoder),
+            patch("jasna.pipeline.VramOffloader"),
+            patch("jasna.pipeline_threads.NvidiaVideoReader", side_effect=_reader_for_pipeline_worker),
+            patch("jasna.pipeline_threads.process_frame_batch", side_effect=_emit_three_clips),
+            patch("jasna.pipeline_threads.finalize_processing"),
+            patch("jasna.pipeline_threads.torch.cuda.set_device"),
+            patch(
+                "jasna.pipeline_threads.torch.inference_mode",
+                return_value=MagicMock(
+                    __enter__=MagicMock(),
+                    __exit__=MagicMock(return_value=False),
+                ),
+            ),
+        ):
+            runner = threading.Thread(target=_run_pipeline, daemon=True)
+            runner.start()
+            assert finished.wait(timeout=3), "Pipeline did not return after the secondary failure"
+            runner.join(timeout=0.2)
+
+        assert not runner.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], RuntimeError)
+        assert str(errors[0]) == "secondary failure"
+        assert p.cancel_requested
 
     def test_run_secondary_loop(self):
         """Cover _run_secondary_loop: push_clip → flush → pop_completed → build_secondary_result."""

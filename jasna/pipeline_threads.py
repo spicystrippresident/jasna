@@ -3,8 +3,9 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Iterable, Sequence
 from queue import Empty, Queue
-from typing import Protocol
+from typing import Any, Protocol
 
 import torch
 
@@ -22,6 +23,49 @@ from jasna.tracking import ClipTracker
 from jasna.tracking.scene_detector import SceneCutDetector
 
 log = logging.getLogger(__name__)
+
+
+def record_worker_error(
+    label: str,
+    error: BaseException,
+    error_holder: list[BaseException],
+    cancel_event: threading.Event | None,
+) -> None:
+    """Record the first worker failure and ask the other workers to stop."""
+    if cancel_event is not None and cancel_event.is_set():
+        return
+    log.exception("[%s] thread crashed", label)
+    error_holder.append(error)
+    if cancel_event is not None:
+        cancel_event.set()
+
+
+def _drain_pipeline_queues(queues: Iterable[Any]) -> None:
+    for pipeline_queue in queues:
+        while True:
+            try:
+                pipeline_queue.get_nowait()
+            except Empty:
+                break
+
+
+def wait_for_worker_threads(
+    threads: Sequence[threading.Thread],
+    queues: Iterable[Any],
+    cancel_event: threading.Event,
+    *,
+    poll_interval: float = 0.02,
+) -> None:
+    """Join workers while releasing blocked producers during cancellation."""
+    pipeline_queues = tuple(queues)
+    while True:
+        alive = [thread for thread in threads if thread.is_alive()]
+        if not alive:
+            return
+        if cancel_event.is_set():
+            _drain_pipeline_queues(pipeline_queues)
+        for thread in alive:
+            thread.join(timeout=poll_interval)
 
 
 class FrameWriter(Protocol):
@@ -217,9 +261,7 @@ def decode_detect_loop(
                 if progress is not None and close_progress:
                     progress.close(ensure_completed_bar=True)
     except BaseException as e:
-        if cancel_event is None or not cancel_event.is_set():
-            log.exception("[decode] thread crashed")
-            error_holder.append(e)
+        record_worker_error("decode", e, error_holder, cancel_event)
     finally:
         log.info(timer.summary())
         log.debug("[decode] thread exiting")
@@ -278,9 +320,7 @@ def primary_restore_loop(
                     f"clip={clip_item.clip.track_id} frames={len(clip_item.raw_crops)}",
                 )
     except BaseException as e:
-        if cancel_event is None or not cancel_event.is_set():
-            log.exception("[primary] thread crashed")
-            error_holder.append(e)
+        record_worker_error("primary", e, error_holder, cancel_event)
     finally:
         log.info(timer.summary())
         log.debug("[primary] thread exiting")
@@ -332,9 +372,7 @@ def secondary_restore_loop(
                     f"clip={pr.track_id} frames={sr.frame_count}",
                 )
     except BaseException as e:
-        if cancel_event is None or not cancel_event.is_set():
-            log.exception("[secondary] thread crashed")
-            error_holder.append(e)
+        record_worker_error("secondary", e, error_holder, cancel_event)
     finally:
         log.info(timer.summary())
         log.debug("[secondary] thread exiting")
@@ -442,9 +480,7 @@ def blend_encode_loop(
                 vram_offloader.pause_stall_check()
 
     except BaseException as e:
-        if cancel_event is None or not cancel_event.is_set():
-            log.exception("[blend-encode] thread crashed")
-            error_holder.append(e)
+        record_worker_error("blend-encode", e, error_holder, cancel_event)
     finally:
         log.info(timer.summary())
 
