@@ -23,6 +23,200 @@ from jasna.tracking.scene_detector import SceneCutDetector
 
 log = logging.getLogger(__name__)
 
+PTS_RESYNC_HARDWARE_RETRIES = 2
+PTS_RESYNC_FORWARD_SCAN_LIMIT = 64
+
+
+class _PtsRecoveryCancelled(RuntimeError):
+    pass
+
+
+class _PtsAlignedFrameReader:
+    """Read exact source PTS, rebuilding the secondary decoder on divergence."""
+
+    def __init__(
+        self,
+        *,
+        input_video: str,
+        batch_size: int,
+        device: torch.device,
+        metadata,
+        frame_stride: int,
+        seek_ts: float | None,
+        cancel_event: threading.Event | None,
+        reusable_rocdecoder: ReusableRocDecoder | None = None,
+    ) -> None:
+        self.input_video = input_video
+        self.batch_size = int(batch_size)
+        self.device = device
+        self.metadata = metadata
+        self.frame_stride = int(frame_stride)
+        self.seek_ts = seek_ts
+        self.cancel_event = cancel_event
+        self.reusable_rocdecoder = reusable_rocdecoder
+        self._reader: NvidiaVideoReader | None = None
+        self._frames = None
+        self._retry_backend: str | None = None
+        self._stream_start_pts = int(getattr(metadata, "start_pts", 0) or 0)
+
+    @staticmethod
+    def _flat_frames(reader: NvidiaVideoReader, seek_ts: float | None):
+        for batch, pts in reader.frames(seek_ts=seek_ts):
+            for index, frame_pts in enumerate(pts):
+                yield batch[index], int(frame_pts)
+
+    def __enter__(self) -> _PtsAlignedFrameReader:
+        self._open(self.seek_ts, decode_backend=None)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
+    def close(self) -> None:
+        reader, self._reader = self._reader, None
+        frames, self._frames = self._frames, None
+        if frames is not None and hasattr(frames, "close"):
+            frames.close()
+        if reader is not None:
+            reader.__exit__(None, None, None)
+
+    def _open(self, seek_ts: float | None, *, decode_backend: str | None) -> None:
+        self.close()
+        reader = NvidiaVideoReader(
+            self.input_video,
+            batch_size=self.batch_size,
+            device=self.device,
+            metadata=self.metadata,
+            frame_stride=self.frame_stride,
+            decode_backend=decode_backend,
+            reusable_rocdecoder=self.reusable_rocdecoder,
+        )
+        try:
+            entered = reader.__enter__()
+        except BaseException:
+            reader.__exit__(None, None, None)
+            raise
+        self._reader = reader
+        self._frames = self._flat_frames(entered, seek_ts)
+        self._stream_start_pts = int(entered.start_pts)
+        self._retry_backend = (
+            "rocdecode"
+            if getattr(entered, "_rocdecode_source", None) is not None
+            else decode_backend
+        )
+
+    def _next(self) -> tuple[torch.Tensor | None, int | None]:
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            raise _PtsRecoveryCancelled("PTS recovery cancelled")
+        if self._frames is None:
+            return None, None
+        try:
+            return next(self._frames)
+        except StopIteration:
+            return None, None
+
+    def _scan_for_pts(
+        self,
+        expected_pts: int,
+        *,
+        first_frame: torch.Tensor | None = None,
+        first_pts: int | None = None,
+    ) -> tuple[torch.Tensor | None, int | None, int]:
+        frame, actual_pts = first_frame, first_pts
+        discarded = 0
+        for _ in range(PTS_RESYNC_FORWARD_SCAN_LIMIT + 1):
+            if actual_pts is None:
+                frame, actual_pts = self._next()
+            if actual_pts is None or actual_pts >= expected_pts:
+                return frame, actual_pts, discarded
+            discarded += 1
+            frame, actual_pts = self._next()
+        return frame, actual_pts, discarded
+
+    def _target_seek_seconds(self, expected_pts: int) -> float:
+        return max(
+            0.0,
+            float(
+                (int(expected_pts) - self._stream_start_pts)
+                * self.metadata.time_base
+            ),
+        )
+
+    def read_exact(self, expected_pts: int) -> torch.Tensor:
+        frame, actual_pts = self._next()
+        if actual_pts == expected_pts and frame is not None:
+            return frame
+
+        first_actual = actual_pts
+        retry_backend = self._retry_backend
+        if actual_pts is not None and actual_pts < expected_pts:
+            frame, actual_pts, discarded = self._scan_for_pts(
+                expected_pts,
+                first_frame=frame,
+                first_pts=actual_pts,
+            )
+            if actual_pts == expected_pts and frame is not None:
+                log.warning(
+                    "[blend-encode] PTS resynchronized by discarding %d stale "
+                    "secondary-reader frame(s): expected=%d first_actual=%d",
+                    discarded,
+                    expected_pts,
+                    first_actual,
+                )
+                return frame
+
+        seek_ts = self._target_seek_seconds(expected_pts)
+        observations: list[str] = []
+        retry_kind = "rocDecode" if retry_backend == "rocdecode" else "decoder"
+        attempts = [
+            (retry_backend, f"{retry_kind} retry {attempt}")
+            for attempt in range(1, PTS_RESYNC_HARDWARE_RETRIES + 1)
+        ]
+        if retry_backend != "pyav-sw":
+            attempts.append(("pyav-sw", "software fallback"))
+
+        for backend, description in attempts:
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                raise _PtsRecoveryCancelled("PTS recovery cancelled")
+            try:
+                self._open(seek_ts, decode_backend=backend)
+                frame, recovered_pts, discarded = self._scan_for_pts(expected_pts)
+            except _PtsRecoveryCancelled:
+                raise
+            except Exception as error:
+                observations.append(f"{description}: {type(error).__name__}: {error}")
+                log.warning(
+                    "[blend-encode] PTS recovery %s failed while reopening at "
+                    "PTS %d: %s",
+                    description,
+                    expected_pts,
+                    error,
+                )
+                continue
+
+            if recovered_pts == expected_pts and frame is not None:
+                log.warning(
+                    "[blend-encode] PTS mismatch recovered by %s at PTS %d "
+                    "(first_actual=%s, discarded=%d)",
+                    description,
+                    expected_pts,
+                    first_actual,
+                    discarded,
+                )
+                return frame
+            observations.append(
+                f"{description}: observed "
+                f"{recovered_pts if recovered_pts is not None else 'EOF'}"
+            )
+
+        self.close()
+        details = "; ".join(observations)
+        raise RuntimeError(
+            "[blend-encode] could not recover secondary-reader PTS mismatch: "
+            f"expected PTS {expected_pts}, initial actual PTS "
+            f"{first_actual if first_actual is not None else 'EOF'}; {details}"
+        )
+
 
 class FrameWriter(Protocol):
     def write(self, frame: torch.Tensor, pts: int, *, apply_lut: bool = True) -> None: ...
@@ -364,20 +558,16 @@ def blend_encode_loop(
     try:
         torch.cuda.set_device(device)
 
-        def _flat_frames(rdr: NvidiaVideoReader):
-            for batch, pts in rdr.frames(seek_ts=seek_ts):
-                for i in range(len(pts)):
-                    yield batch[i]
-
-        with NvidiaVideoReader(
-            input_video,
+        with _PtsAlignedFrameReader(
+            input_video=input_video,
             batch_size=batch_size,
             device=device,
             metadata=metadata,
             frame_stride=frame_stride,
+            seek_ts=seek_ts,
+            cancel_event=cancel_event,
             reusable_rocdecoder=reusable_rocdecoder,
         ) as reader2:
-            frame_gen = _flat_frames(reader2)
             secondary_done = False
             frames_encoded = 0
 
@@ -406,7 +596,7 @@ def blend_encode_loop(
                     break
                 meta: FrameMeta = meta_item
                 with timer.measure("decode"):
-                    original_frame = next(frame_gen)
+                    original_frame = reader2.read_exact(meta.pts)
 
                 with timer.measure("result-wait"):
                     while meta.apply_effect and not blend_buffer.is_frame_ready(meta.frame_idx):

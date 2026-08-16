@@ -20,6 +20,8 @@ from jasna.media import VideoMetadata
 from jasna.pipeline_items import ClipRestoreItem, FrameMeta, PrimaryRestoreResult, SecondaryRestoreResult, _SENTINEL
 from jasna.pipeline_threads import (
     FrameWriter,
+    _PtsAlignedFrameReader,
+    _PtsRecoveryCancelled,
     decode_detect_loop,
     primary_restore_loop,
     secondary_restore_loop,
@@ -60,12 +62,48 @@ def _mock_reader(batches, seek_ts_check=None):
     return r
 
 
+class _ScriptedPtsReader:
+    def __init__(
+        self,
+        batches,
+        *,
+        start_pts: int = 0,
+        uses_rocdecode: bool = False,
+        on_first_batch=None,
+    ) -> None:
+        self.batches = list(batches)
+        self.start_pts = start_pts
+        self._rocdecode_source = object() if uses_rocdecode else None
+        self.on_first_batch = on_first_batch
+        self.seek_calls: list[float | None] = []
+        self.enter_calls = 0
+        self.exit_calls = 0
+
+    def __enter__(self):
+        self.enter_calls += 1
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.exit_calls += 1
+
+    def frames(self, seek_ts=None):
+        self.seek_calls.append(seek_ts)
+        for index, batch in enumerate(self.batches):
+            if index == 0 and self.on_first_batch is not None:
+                self.on_first_batch()
+            yield batch
+
+
+def _pts_batch(*pts: int) -> tuple[torch.Tensor, list[int]]:
+    return torch.tensor([[pts_value] for pts_value in pts]), list(pts)
+
+
 class _RecordingWriter:
     def __init__(self):
         self.written: list[tuple[torch.Tensor, int]] = []
         self.after_write_calls: list[int] = []
 
-    def write(self, frame: torch.Tensor, pts: int) -> None:
+    def write(self, frame: torch.Tensor, pts: int, *, apply_lut: bool = True) -> None:
         self.written.append((frame, pts))
 
     def after_write(self, frames_written: int) -> None:
@@ -84,6 +122,170 @@ class TestEstimateStartFrame:
     def test_zero(self):
         meta = _fake_metadata(fps=24.0)
         assert _estimate_start_frame(meta, 0.0) == 0
+
+
+# ---------------------------------------------------------------------------
+# _PtsAlignedFrameReader — exact secondary-reader PTS recovery
+# ---------------------------------------------------------------------------
+
+class TestPtsAlignedFrameReader:
+    def _reader(
+        self,
+        *,
+        cancel_event=None,
+        reusable_rocdecoder=None,
+        seek_ts=None,
+    ):
+        return _PtsAlignedFrameReader(
+            input_video="fake.mkv",
+            batch_size=4,
+            device=torch.device("cpu"),
+            metadata=_fake_metadata(),
+            frame_stride=1,
+            seek_ts=seek_ts,
+            cancel_event=cancel_event,
+            reusable_rocdecoder=reusable_rocdecoder,
+        )
+
+    def test_exact_pts_fast_path_uses_initial_reader(self):
+        source = _ScriptedPtsReader([_pts_batch(40)])
+
+        with patch("jasna.pipeline_threads.NvidiaVideoReader", return_value=source) as factory:
+            with self._reader() as reader:
+                frame = reader.read_exact(40)
+
+        assert torch.equal(frame, torch.tensor([40]))
+        factory.assert_called_once()
+        assert factory.call_args.kwargs["decode_backend"] is None
+        assert source.seek_calls == [None]
+
+    def test_discards_stale_frames_before_exact_pts(self):
+        source = _ScriptedPtsReader([_pts_batch(38, 39, 40)])
+
+        with patch("jasna.pipeline_threads.NvidiaVideoReader", return_value=source) as factory:
+            with self._reader() as reader:
+                frame = reader.read_exact(40)
+
+        assert torch.equal(frame, torch.tensor([40]))
+        factory.assert_called_once()
+
+    def test_forward_mismatch_reopens_at_expected_pts(self):
+        first = _ScriptedPtsReader([_pts_batch(41)], uses_rocdecode=True)
+        recovered = _ScriptedPtsReader([_pts_batch(40)], uses_rocdecode=True)
+
+        with patch(
+            "jasna.pipeline_threads.NvidiaVideoReader",
+            side_effect=[first, recovered],
+        ) as factory:
+            with self._reader() as reader:
+                frame = reader.read_exact(40)
+
+        assert torch.equal(frame, torch.tensor([40]))
+        assert [call.kwargs["decode_backend"] for call in factory.call_args_list] == [
+            None,
+            "rocdecode",
+        ]
+        assert recovered.seek_calls == [40 / 24]
+
+    def test_eof_mismatch_reopens_at_expected_pts(self):
+        first = _ScriptedPtsReader([], uses_rocdecode=True)
+        recovered = _ScriptedPtsReader([_pts_batch(40)], uses_rocdecode=True)
+
+        with patch(
+            "jasna.pipeline_threads.NvidiaVideoReader",
+            side_effect=[first, recovered],
+        ) as factory:
+            with self._reader() as reader:
+                frame = reader.read_exact(40)
+
+        assert torch.equal(frame, torch.tensor([40]))
+        assert [call.kwargs["decode_backend"] for call in factory.call_args_list] == [
+            None,
+            "rocdecode",
+        ]
+
+    def test_retries_rocdecode_hardware_before_succeeding(self):
+        reusable = object()
+        first = _ScriptedPtsReader([_pts_batch(41)], uses_rocdecode=True)
+        retry_one = _ScriptedPtsReader([_pts_batch(41)], uses_rocdecode=True)
+        retry_two = _ScriptedPtsReader([_pts_batch(40)], uses_rocdecode=True)
+
+        with patch(
+            "jasna.pipeline_threads.NvidiaVideoReader",
+            side_effect=[first, retry_one, retry_two],
+        ) as factory:
+            with self._reader(
+                reusable_rocdecoder=reusable,
+            ) as reader:
+                frame = reader.read_exact(40)
+
+        assert torch.equal(frame, torch.tensor([40]))
+        assert [call.kwargs["decode_backend"] for call in factory.call_args_list] == [
+            None,
+            "rocdecode",
+            "rocdecode",
+        ]
+        assert all(
+            call.kwargs["reusable_rocdecoder"] is reusable
+            for call in factory.call_args_list
+        )
+        assert first.exit_calls == 1
+        assert retry_one.exit_calls == 1
+        assert retry_two.exit_calls == 1
+
+    def test_uses_explicit_software_fallback_after_hardware_retries(self):
+        first = _ScriptedPtsReader([_pts_batch(41)], uses_rocdecode=True)
+        retry_one = _ScriptedPtsReader([_pts_batch(41)], uses_rocdecode=True)
+        retry_two = _ScriptedPtsReader([_pts_batch(41)], uses_rocdecode=True)
+        fallback = _ScriptedPtsReader([_pts_batch(40)])
+
+        with patch(
+            "jasna.pipeline_threads.NvidiaVideoReader",
+            side_effect=[first, retry_one, retry_two, fallback],
+        ) as factory:
+            with self._reader() as reader:
+                frame = reader.read_exact(40)
+
+        assert torch.equal(frame, torch.tensor([40]))
+        assert [call.kwargs["decode_backend"] for call in factory.call_args_list] == [
+            None,
+            "rocdecode",
+            "rocdecode",
+            "pyav-sw",
+        ]
+
+    def test_unrecoverable_mismatch_raises_clear_error(self):
+        first = _ScriptedPtsReader([_pts_batch(41)], uses_rocdecode=True)
+        retry_one = _ScriptedPtsReader([_pts_batch(41)], uses_rocdecode=True)
+        retry_two = _ScriptedPtsReader([_pts_batch(41)], uses_rocdecode=True)
+        fallback = _ScriptedPtsReader([])
+
+        with patch(
+            "jasna.pipeline_threads.NvidiaVideoReader",
+            side_effect=[first, retry_one, retry_two, fallback],
+        ):
+            with self._reader() as reader:
+                with pytest.raises(RuntimeError, match="could not recover secondary-reader PTS mismatch") as error:
+                    reader.read_exact(40)
+
+        assert "expected PTS 40" in str(error.value)
+        assert "software fallback: observed EOF" in str(error.value)
+        assert fallback.exit_calls == 1
+
+    def test_cancellation_aborts_recovery_without_reopening(self):
+        cancel_event = threading.Event()
+        first = _ScriptedPtsReader(
+            [_pts_batch(41)],
+            uses_rocdecode=True,
+            on_first_batch=cancel_event.set,
+        )
+
+        with patch("jasna.pipeline_threads.NvidiaVideoReader", return_value=first) as factory:
+            with self._reader(cancel_event=cancel_event) as reader:
+                with pytest.raises(_PtsRecoveryCancelled, match="cancelled"):
+                    reader.read_exact(40)
+
+        factory.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +734,82 @@ class TestBlendEncodeLoop:
             )
 
         assert received_seek == [5.0]
+
+    def test_requests_original_frame_by_metadata_pts_not_position(self):
+        requested_pts: list[int] = []
+
+        class _ExactReader:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback) -> None:
+                return None
+
+            def read_exact(self, pts: int) -> torch.Tensor:
+                requested_pts.append(pts)
+                return torch.full((3, 8, 8), pts, dtype=torch.int64)
+
+        reader = _ExactReader()
+        metadata_queue = Queue()
+        metadata_queue.put(FrameMeta(frame_idx=0, pts=100, apply_effect=False))
+        metadata_queue.put(FrameMeta(frame_idx=1, pts=300, apply_effect=False))
+        metadata_queue.put(_SENTINEL)
+        writer = _RecordingWriter()
+
+        with (
+            patch("jasna.pipeline_threads._PtsAlignedFrameReader", return_value=reader),
+            patch("jasna.pipeline_threads.torch.cuda.set_device"),
+        ):
+            blend_encode_loop(
+                input_video="fake.mkv",
+                batch_size=2,
+                device=torch.device("cpu"),
+                metadata=_fake_metadata(),
+                blend_buffer=BlendBuffer(device=torch.device("cpu")),
+                encode_queue=FrameQueue(max_frames=8),
+                metadata_queue=metadata_queue,
+                error_holder=[],
+                frame_writer=writer,
+            )
+
+        assert requested_pts == [100, 300]
+        assert [pts for _frame, pts in writer.written] == [100, 300]
+        assert torch.equal(writer.written[0][0], torch.full((3, 8, 8), 100, dtype=torch.int64))
+
+    def test_records_unrecoverable_exact_pts_error(self):
+        first = _ScriptedPtsReader([_pts_batch(41)], uses_rocdecode=True)
+        retry_one = _ScriptedPtsReader([_pts_batch(41)], uses_rocdecode=True)
+        retry_two = _ScriptedPtsReader([_pts_batch(41)], uses_rocdecode=True)
+        fallback = _ScriptedPtsReader([])
+        metadata_queue = Queue()
+        metadata_queue.put(FrameMeta(frame_idx=0, pts=40, apply_effect=False))
+        metadata_queue.put(_SENTINEL)
+        writer = _RecordingWriter()
+        errors: list[BaseException] = []
+
+        with (
+            patch(
+                "jasna.pipeline_threads.NvidiaVideoReader",
+                side_effect=[first, retry_one, retry_two, fallback],
+            ),
+            patch("jasna.pipeline_threads.torch.cuda.set_device"),
+        ):
+            blend_encode_loop(
+                input_video="fake.mkv",
+                batch_size=2,
+                device=torch.device("cpu"),
+                metadata=_fake_metadata(),
+                blend_buffer=BlendBuffer(device=torch.device("cpu")),
+                encode_queue=FrameQueue(max_frames=8),
+                metadata_queue=metadata_queue,
+                error_holder=errors,
+                frame_writer=writer,
+            )
+
+        assert len(errors) == 1
+        assert isinstance(errors[0], RuntimeError)
+        assert "could not recover secondary-reader PTS mismatch" in str(errors[0])
+        assert not writer.written
 
     def test_error_holder_propagates_in_wait_loop(self):
         blend_buffer = BlendBuffer(device=torch.device("cpu"))
