@@ -509,6 +509,85 @@ class Processor:
         except PostExportVideoCommandCancelled as exc:
             raise ProcessingStopped("Processing stopped") from exc
 
+    def _expected_isolated_video_output_path(
+        self,
+        job: JobItem,
+        settings: AppSettings,
+    ) -> Path:
+        if self._output_folder:
+            output_dir = Path(self._output_folder)
+        else:
+            output_dir = job.path.parent
+        output_name = self._output_pattern.replace("{original}", job.path.stem)
+        output_path = output_dir / output_name
+        if (
+            output_path.exists()
+            and settings.file_conflict == "auto_rename"
+        ):
+            return self._get_unique_output_path(output_path)
+        return output_path
+
+    def _complete_isolated_video_job(
+        self,
+        job: JobItem,
+        snapshot,
+        result,
+        *,
+        expected_output_path: Path,
+        previous_output_fingerprint: _OutputFingerprint | None,
+        settings: AppSettings,
+    ) -> None:
+        if self._stop_event.is_set() or result.status is JobStatus.PENDING:
+            self._mark_stopped(job)
+            return
+        if result.status is JobStatus.ERROR:
+            self._fail_isolated_video_job(job, "isolated video job reported failure")
+            return
+        if result.status is JobStatus.SKIPPED:
+            job.output_path = None
+            job.status = JobStatus.SKIPPED
+            self._progress(ProgressUpdate(job_id=job.id, status=JobStatus.SKIPPED))
+            return
+        if (
+            result.output_path is None
+            or result.output_path.resolve(strict=False)
+            != expected_output_path.resolve(strict=False)
+        ):
+            self._fail_isolated_video_job(
+                job,
+                "isolated video job result did not confirm the expected output path",
+            )
+            return
+
+        try:
+            self._validate_completed_video_output(
+                job.path,
+                expected_output_path,
+                codec=settings.codec,
+                smart_render=bool(snapshot.segments),
+                previous_fingerprint=previous_output_fingerprint,
+            )
+            if self._stop_event.is_set():
+                raise ProcessingStopped("Processing stopped")
+            job.output_path = expected_output_path
+            self._run_post_export_video_command(job.path, expected_output_path)
+            if self._stop_event.is_set():
+                raise ProcessingStopped("Processing stopped")
+        except ProcessingStopped:
+            self._mark_stopped(job)
+            return
+        except Exception as error:
+            self._fail_isolated_video_job(job, str(error))
+            return
+
+        job.status = JobStatus.COMPLETED
+        self._progress(ProgressUpdate(
+            job_id=job.id,
+            status=JobStatus.COMPLETED,
+            progress=100.0,
+        ))
+        self._log("INFO", f"Finished processing {job.filename}")
+
     def _fail_isolated_video_job(self, job: JobItem, message: str) -> None:
         job.status = JobStatus.ERROR
         self._progress(ProgressUpdate(
@@ -528,10 +607,13 @@ class Processor:
             return False
         if event_type == "progress":
             raw = event["update"]
-            status = JobStatus(raw["status"])
+            JobStatus(raw["status"])
             update = ProgressUpdate(
                 job_id=job.id,
-                status=status,
+                # Only a validated terminal result can alter the parent's job
+                # state. A worker's optimistic completion progress is not a
+                # completion acknowledgement.
+                status=JobStatus.PROCESSING,
                 progress=float(raw.get("progress", 0.0)),
                 fps=float(raw.get("fps", 0.0)),
                 eta_seconds=float(raw.get("eta_seconds", 0.0)),
@@ -539,7 +621,6 @@ class Processor:
                 total_frames=int(raw.get("total_frames", 0)),
                 message=str(raw.get("message", "")),
             )
-            job.status = status
             self._progress(update)
             return False
         if event_type == "fatal":
@@ -550,13 +631,8 @@ class Processor:
             self._log("ERROR", f"Isolated video job failed: {detail}")
             return False
         if event_type == "result":
-            job.status = JobStatus(event["status"])
-            raw_output_path = event.get("output_path")
-            job.output_path = (
-                Path(str(raw_output_path)) if raw_output_path else None
-            )
             return True
-        return False
+        raise ValueError(f"unknown isolated video job event type: {event_type!r}")
 
     def _process_isolated_video_job(self, job: JobItem) -> None:
         snapshot = job.begin_processing()
@@ -576,6 +652,7 @@ class Processor:
         from jasna.gui.video_job_process import (
             build_video_job_request,
             parse_event_line,
+            parse_video_job_result,
             video_job_command,
             write_video_job_request,
         )
@@ -585,9 +662,15 @@ class Processor:
             self._fail_isolated_video_job(job, "processor settings are unavailable")
             return
 
-        result_received = False
+        result = None
+        protocol_error: str | None = None
+        fatal_event_received = False
         returncode: int | None = None
+        expected_output_path: Path | None = None
+        previous_output_fingerprint: _OutputFingerprint | None = None
         try:
+            expected_output_path = self._expected_isolated_video_output_path(job, settings)
+            previous_output_fingerprint = self._output_fingerprint(expected_output_path)
             with tempfile.TemporaryDirectory(prefix="jasna-video-job-") as temporary:
                 request_path = Path(temporary) / "request.json"
                 request = build_video_job_request(
@@ -635,8 +718,21 @@ class Processor:
                             if line:
                                 self._log("WARNING", f"[video worker] {line}")
                             continue
-                        result_received = self._apply_isolated_event(job, event) or result_received
+                        if event.get("type") == "result":
+                            if result is not None:
+                                raise ValueError(
+                                    "isolated video job emitted more than one final result"
+                                )
+                            result = parse_video_job_result(
+                                event,
+                                expected_output_path=expected_output_path,
+                            )
+                            continue
+                        if event.get("type") == "fatal":
+                            fatal_event_received = True
+                        self._apply_isolated_event(job, event)
                     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                        protocol_error = str(error)
                         self._log(
                             "ERROR",
                             f"Invalid isolated video job event: {error}: {line}",
@@ -664,17 +760,37 @@ class Processor:
                             exc_info=True,
                         )
 
-        if self._stop_event.is_set() and not result_received:
+        if self._stop_event.is_set():
             self._mark_stopped(job)
         elif returncode != 0:
             self._fail_isolated_video_job(
                 job,
                 f"isolated video job exited with code {returncode}",
             )
-        elif not result_received:
+        elif protocol_error is not None:
+            self._fail_isolated_video_job(
+                job,
+                f"isolated video job emitted an invalid result protocol: {protocol_error}",
+            )
+        elif fatal_event_received:
+            self._fail_isolated_video_job(
+                job,
+                "isolated video job emitted a fatal event",
+            )
+        elif result is None:
             self._fail_isolated_video_job(
                 job,
                 "isolated video job exited without a final result",
+            )
+        else:
+            assert expected_output_path is not None
+            self._complete_isolated_video_job(
+                job,
+                snapshot,
+                result,
+                expected_output_path=expected_output_path,
+                previous_output_fingerprint=previous_output_fingerprint,
+                settings=settings,
             )
 
     def _mark_stopped(self, job: JobItem):
