@@ -35,6 +35,7 @@ def test_isolated_request_round_trips_scan_settings_and_segment_provenance(tmp_p
         pre_scan_full_threshold=0.85,
         pre_scan_coarse_interval=2.0,
         pre_scan_fine_interval=0.5,
+        pre_scan_pad_seconds="1.0",
     )
     request = build_video_job_request(
         job,
@@ -55,6 +56,7 @@ def test_isolated_request_round_trips_scan_settings_and_segment_provenance(tmp_p
     assert restored_settings.pre_scan_full_threshold == 0.85
     assert restored_settings.pre_scan_coarse_interval == 2.0
     assert restored_settings.pre_scan_fine_interval == 0.5
+    assert restored_settings.pre_scan_pad_seconds == "1.0"
 
 
 @pytest.mark.parametrize(
@@ -107,3 +109,25 @@ def test_isolated_parent_validates_the_reported_processing_path(
     assert processor.completed_processing_path(job.id) == processing_path
     assert job.output_path == output
     assert validator.call_args.kwargs["codec"] == expected_codec
+
+
+def test_isolated_progress_preserves_processing_phase():
+    updates = []
+    processor = Processor(on_progress=updates.append)
+    job = JobItem(Path("video.mp4"))
+
+    processor._apply_isolated_event(
+        job,
+        {
+            "type": "progress",
+            "update": {
+                "status": JobStatus.PROCESSING.value,
+                "progress": 12.0,
+                "fps": 20.0,
+                "eta_seconds": 30.0,
+                "phase": "coarse_scan",
+            },
+        },
+    )
+
+    assert updates[-1].phase == "coarse_scan"

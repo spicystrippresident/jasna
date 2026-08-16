@@ -29,6 +29,10 @@ Current queue semantics:
 4. `vr_mode` and `vr_projection` remain independent of the execution route.
 5. Automatic pre-scan is a front-end router in the existing processing path,
    not a new one-click workflow.
+6. A processing queue row names its active phase: preparing, coarse scan,
+   precise scan, source copy, restoration, or finalizing. The adjacent
+   countdown is explicitly labeled **Stage ETA** because it estimates only
+   the active phase, not completion of the whole video.
 
 ## AMD diagnosis and change policy
 
@@ -86,8 +90,9 @@ Current queue semantics:
 - Masks remain in source-video coordinates; SBS eye splitting happens inside
   the detector adapter.
 - Task pre-scan finalizes precise ranges directly from the configurable sample
-  grid. It does not run a second per-frame boundary pass: the established
-  5-second padding is much larger than the default 0.5-second grid uncertainty.
+  grid. It does not run a second per-frame boundary pass. Automatic range
+  padding now follows that grid and is clamped to 0.5-1.0 seconds, so another
+  full decode pass would cost more than the boundary precision it could add.
 - Random mask preview and projection comparison retain the worker-level
   `ReusableRocDecoder`, preventing AMD native surface-pool growth.
 
@@ -181,9 +186,17 @@ Routing and defaults:
 - Scan skips the coarse pass and samples every `0.5s`. Auto uses the same
   precise interval after choosing the scan route. The precise interval is
   configurable.
-- Above-threshold precise samples become sample-grid ranges directly.
-  Normalization then reuses the v0.9.1 safety rules: 5 seconds of padding, a
-  30-second minimum restored range, and merging gaps of 30 seconds or less.
+- Precise candidates longer than `10s` retain the configured detector
+  threshold so weak boundary samples are not lost. Candidates no longer than
+  `1s` are ignored. Candidates between those limits are retained only when
+  they contain a continuous `2s` core at score `0.90` or above. This temporal
+  confidence rule runs before padding.
+- Precise range padding is configurable through `pre_scan_pad_seconds`.
+  `auto` is the default and follows the precise sample interval, clamped to
+  `0.5-1.0s`; explicit choices are `0`, `0.5`, `1`, `2`, and `5s`.
+- The old 30-second minimum range and 30-second gap merge are removed. Padded
+  ranges merge only when they overlap or touch; Smart Render still coalesces
+  ranges that expand onto the same keyframe span.
 - No final ranges select source copy; a range covering the complete source
   selects full restoration; partial ranges reuse `segments + Smart Render`.
 - Automatic ranges fall back to full restoration when the source is not smart-
@@ -194,6 +207,18 @@ showed that the old sparse stride still decoded the complete source. The
 adaptive route now skips dense GOPs and seeks regular/sparse GOPs instead of
 decoding every intervening frame. This changes only Auto's initial coverage
 estimate; videos routed to precise scanning still use the `0.5s` pass.
+
+The short-range policy and gap behavior were calibrated by replaying the
+durable precise-scan checkpoint from a real 48-minute, 8192x4096, 59.94 fps
+video. The original threshold produced 167 candidates covering 1117.617s.
+Confidence filtering retained the seven user-verified mosaic ranges covering
+981.981s; automatic 0.5s padding yielded six non-overlapping effect ranges
+covering 988.482s. With the source's actual keyframe index, disabling the
+30-second gap merge produced five render spans covering 1003.135s. Keeping the
+merge produced four spans covering 1023.155s, so one fewer span cost 20.020s
+of additional restoration. The no-gap-merge route was therefore selected.
+This validation replayed existing scan scores and keyframes without decoding
+or occupying the GPU.
 
 Checkpoints are always written; there is intentionally no additional toggle:
 
@@ -256,6 +281,17 @@ Primary implementation paths:
   suites cover three-way routing, direct sample-grid ranges, exact-PTS
   checkpoints, stop/close, isolated protocol results, smart-render fallback,
   and locale contracts. `py_compile` and `git diff --check` also pass.
+- The confidence-filter/configurable-padding update adds a clipped-duration
+  regression for candidates at the end of a video. Its focused scan,
+  coordinator, stop, isolated-job, mosaic-scan, and settings suite passes
+  `76 passed, 1 deselected`; the deselected case is the documented unrelated
+  platform CQ baseline. The complete locale contract passes `158/158`, and
+  `compileall` plus `git diff --check` pass.
+- Queue phase reporting is preserved across scan callbacks and the isolated
+  video-job protocol. Its focused coordinator, processor, isolated-job, and
+  queue-row suite passes `42/42`; the complete locale contract remains
+  `158/158`. The GUI now labels the countdown as a stage ETA whenever a named
+  phase is active.
 - A broader historical suite still contains 18 stale fixture failures that are
   reproducible on the clean port baseline: old ONNX/TensorRT assumptions,
   incomplete fake settings widgets, obsolete splice mocks, output fixtures
@@ -274,17 +310,21 @@ Primary implementation paths:
   reported no error. The selected source range did not contain visible mosaic,
   so this validates timeline/mux behavior rather than restoration quality.
 - Automatic pre-scan was validated on one 8192x4096, 59.94 fps, 10-bit HEVC SBS
-  source through all three routes:
+  source through all three routes before the later short-range normalization
+  update:
   - all-clear clip: `0%` coarse coverage and source copy;
   - strong mosaic clip: `100%` coverage and full restoration;
   - 51.515-second transition clip: `37.8%` coarse coverage, precise scan, then
-    Smart Render. Replaying its 103 recorded precise samples through the current
-    direct-grid policy produced `21.515-51.515s` at `58.24%` normalized coverage.
+    Smart Render. Replaying its 103 recorded precise samples through that
+    direct-grid revision produced `21.515-51.515s` at `58.24%` normalized
+    coverage.
 - The earlier end-to-end transition output used the retired refined boundary
   `21.468-51.468s` (1,888 processing frames). Source and final output both
   contained 3,085 frames at 8192x4096, HEVC Main 10, `yuv420p10le`;
-  source/output durations were `51.515s` and `51.518s`. The current direct-grid
-  replay changes that boundary by only `0.047s`, well inside the 5-second pad.
+  source/output durations were `51.515s` and `51.518s`. The direct-grid replay
+  changed that refined boundary by only `0.047s`, below one precise sample
+  interval. This older output remains mux/timeline evidence; current range
+  normalization is documented in section 9.
 - The adaptive coarse route was then measured on a complete 8192x4096,
   59.94 fps, 10-bit HEVC SBS source: `1610.542s`, 96,536 frames. It planned 327
   keyframe samples and completed in `65.393s` with `51.1788%` time-weighted
@@ -312,13 +352,16 @@ still not worth retaining in the production route:
 - the 0.5-second precise grid completed in `16m54s` with 5,755 samples;
 - 334 boundary windows then scored another 9,710 frames and took `22m47s`;
 - replaying the same precise samples without refinement kept the same seven
-  normalized ranges, changed individual starts/ends by only `0.18-0.43s`, and
-  changed coverage by about `0.0035` percentage points;
+  ranges under the normalization rules used at that time, changed individual
+  starts/ends by only `0.18-0.43s`, and changed coverage by about `0.0035`
+  percentage points;
 - removing the stage reduces that observed scan route from `42m29s` to about
-  `19m42s` (`2.16x` faster) without reducing the 5-second safety padding.
+  `19m42s` (`2.16x` faster), while the 0.5-second grid already bounded the
+  remaining uncertainty.
 
 Automatic pre-scan therefore no longer invokes boundary-window decoding. The
-precise scan remains resumable and range normalization is unchanged. Historical
+precise scan remains resumable. Its later confidence filtering, configurable
+padding, and no-gap-merge behavior are documented in section 9. Historical
 AMDGPU failure evidence remains recorded because it explains why the unused
 per-frame/window route must not be reintroduced without new performance data.
 

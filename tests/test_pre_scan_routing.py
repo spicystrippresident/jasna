@@ -12,6 +12,7 @@ from jasna.gui.mosaic_scan import (
     ScanCheckpoint,
     ScanCompleted,
     ScanFailed,
+    ScanProgress,
 )
 from jasna.gui.pre_scan_routing import (
     PRE_SCAN_ALGORITHM_VERSION,
@@ -23,6 +24,7 @@ from jasna.gui.pre_scan_routing import (
     coarse_route,
     normalize_scan_segments,
     precise_scan_segments,
+    resolve_timeline_pad_seconds,
     sampled_coverage,
     segment_coverage,
 )
@@ -83,30 +85,115 @@ def test_sampled_coverage_duration_weights_irregular_samples():
 
 def test_precise_scan_uses_sample_grid_before_safe_normalization():
     result = MosaicScanResult(
-        times=(49.5, 50.0, 50.5, 51.0, 51.5),
-        scores=(0.0, 0.9, 0.8, 0.0, 0.0),
+        times=(49.5, 50.0, 50.5, 51.0, 51.5, 52.0, 52.5),
+        scores=(0.0, 0.95, 0.95, 0.95, 0.95, 0.0, 0.0),
         masks=(),
         stride=0.5,
         duration=120.0,
-        completed_until=51.5,
+        completed_until=52.5,
     )
 
-    # The hit grid yields 50.0-51.0s. Existing 5s padding and the 30s
-    # minimum-duration rule then provide a much larger safety margin than a
-    # sub-frame boundary refinement could materially change.
+    # The two-second high-confidence core is retained and Auto adds one precise
+    # sample interval (0.5s) on each side. There is no 30-second expansion.
     assert precise_scan_segments(result, threshold=0.35) == (
-        SegmentRange(35.5, 65.5),
+        SegmentRange(49.5, 52.5),
     )
+
+
+def test_short_precise_candidates_need_duration_and_high_confidence_core():
+    one_second = _result(
+        [0.0, 0.99, 0.99, 0.0],
+        stride=0.5,
+        duration=2.0,
+    )
+    weak_five_seconds = _result(
+        [0.0] + [0.89] * 10 + [0.0],
+        stride=0.5,
+        duration=6.0,
+    )
+    strong_five_seconds = _result(
+        [0.0] + [0.91] * 10 + [0.0],
+        stride=0.5,
+        duration=6.0,
+    )
+    interrupted_high_core = _result(
+        [0.0, 0.95, 0.95, 0.95, 0.50, 0.95, 0.95, 0.95, 0.0],
+        stride=0.5,
+        duration=4.5,
+    )
+
+    assert precise_scan_segments(
+        one_second, threshold=0.35, pad_seconds=0.0
+    ) == ()
+    assert precise_scan_segments(
+        weak_five_seconds, threshold=0.35, pad_seconds=0.0
+    ) == ()
+    assert precise_scan_segments(
+        strong_five_seconds, threshold=0.35, pad_seconds=0.0
+    ) == (SegmentRange(0.5, 5.5),)
+    assert precise_scan_segments(
+        interrupted_high_core, threshold=0.35, pad_seconds=0.0
+    ) == ()
+
+
+def test_short_high_confidence_tail_uses_actual_clipped_duration():
+    result = MosaicScanResult(
+        times=(0.0, 0.5, 1.0, 1.5),
+        scores=(0.95, 0.95, 0.95, 0.95),
+        masks=(),
+        stride=0.5,
+        duration=1.7,
+        completed_until=1.5,
+    )
+
+    assert precise_scan_segments(
+        result, threshold=0.35, pad_seconds=0.0
+    ) == ()
+
+
+def test_long_precise_candidate_keeps_normal_detection_threshold():
+    result = _result(
+        [0.0] + [0.40] * 22 + [0.0],
+        stride=0.5,
+        duration=12.0,
+    )
+
+    assert precise_scan_segments(
+        result, threshold=0.35, pad_seconds=0.0
+    ) == (SegmentRange(0.5, 11.5),)
+
+
+def test_candidate_just_over_ten_seconds_uses_normal_detection_threshold():
+    result = MosaicScanResult(
+        times=tuple(index * 0.5 for index in range(21)),
+        scores=(0.40,) * 21,
+        masks=(),
+        stride=0.5,
+        duration=10.003,
+        completed_until=10.0,
+    )
+
+    assert precise_scan_segments(
+        result, threshold=0.35, pad_seconds=0.0
+    ) == (SegmentRange(0.0, 10.003),)
+
+
+def test_auto_precise_padding_tracks_interval_with_half_to_one_second_bounds():
+    assert resolve_timeline_pad_seconds("auto", fine_interval=0.25) == 0.5
+    assert resolve_timeline_pad_seconds("auto", fine_interval=0.5) == 0.5
+    assert resolve_timeline_pad_seconds("auto", fine_interval=1.0) == 1.0
+    assert resolve_timeline_pad_seconds("auto", fine_interval=2.0) == 1.0
+    assert resolve_timeline_pad_seconds("2.0", fine_interval=0.5) == 2.0
 
 
 def test_scan_policy_finishes_from_precise_grid_without_boundary_worker():
     result = MosaicScanResult(
-        times=(49.5, 50.0, 50.5, 51.0, 51.5),
-        scores=(0.0, 0.9, 0.8, 0.0, 0.0),
+        times=(49.5, 50.0, 50.5, 51.0, 51.5, 52.0, 52.5),
+        scores=(0.0, 0.95, 0.95, 0.95, 0.95, 0.0, 0.0),
         masks=(),
         stride=0.5,
         duration=120.0,
-        completed_until=51.5,
+        completed_until=52.5,
     )
 
     class FakeCheckpoint:
@@ -131,23 +218,28 @@ def test_scan_policy_finishes_from_precise_grid_without_boundary_worker():
     outcome = coordinator.run()
 
     assert outcome.processing_path == "smart"
-    assert outcome.segments == (SegmentRange(35.5, 65.5),)
+    assert outcome.segments == (SegmentRange(49.5, 52.5),)
     assert coordinator.checkpoint.outcome == outcome
 
 
-def test_old_timeline_padding_minimum_and_merge_rules_are_preserved():
+def test_precise_padding_does_not_force_minimum_duration_or_merge_30s_gaps():
     one = normalize_scan_segments(
         (SegmentRange(50.0, 51.0),),
         duration=120.0,
+        pad_seconds=0.5,
     )
-    assert one == (SegmentRange(35.5, 65.5),)
+    assert one == (SegmentRange(49.5, 51.5),)
 
-    merged = normalize_scan_segments(
+    separate = normalize_scan_segments(
         (SegmentRange(10.0, 20.0), SegmentRange(50.0, 60.0)),
         duration=120.0,
+        pad_seconds=0.5,
     )
-    assert merged == (SegmentRange(0.0, 70.0),)
-    assert segment_coverage(merged, 120.0) == pytest.approx(70 / 120)
+    assert separate == (
+        SegmentRange(9.5, 20.5),
+        SegmentRange(49.5, 60.5),
+    )
+    assert segment_coverage(separate, 120.0) == pytest.approx(22 / 120)
 
 
 def test_scan_checkpoint_round_trip_uses_timebase_keys_and_completion(tmp_path):
@@ -245,6 +337,7 @@ def test_incomplete_stage_decodes_from_start_and_reuses_exact_pts(tmp_path):
         def __init__(self, *args, **kwargs):
             created.update(kwargs)
             self.events = queue.Queue()
+            self.events.put(ScanProgress(0.5, 12.0, 8.0))
             self.events.put(
                 ScanCompleted(
                     MosaicScanResult(
@@ -275,7 +368,8 @@ def test_incomplete_stage_decodes_from_start_and_reuses_exact_pts(tmp_path):
     coordinator.settings = AppSettings()
     coordinator._stopped = lambda: False
     coordinator._log = lambda *_args: None
-    coordinator._progress = None
+    progress = []
+    coordinator._progress = lambda *values: progress.append(values)
     coordinator._worker_factory = FakeWorker
     coordinator._active_worker = None
     coordinator.checkpoint = checkpoint
@@ -289,6 +383,7 @@ def test_incomplete_stage_decodes_from_start_and_reuses_exact_pts(tmp_path):
     assert created["start_seconds"] == 0.0
     assert created["known_sample_scores"] == {45_046: 0.8, 90_090: 0.4}
     assert created["emit_checkpoints"] is True
+    assert progress == [("fine", 0.5, 12.0, 8.0)]
 
 
 def test_adaptive_coarse_checkpoint_keeps_exact_pts_and_reuses_completed_stage(tmp_path):
@@ -479,6 +574,11 @@ def test_checkpoint_signature_versions_adaptive_coarse_policy(monkeypatch, tmp_p
         "tolerance_ratio": 0.25,
         "coverage_policy": "duration-weighted-midpoints-v1",
     }
+    assert signature["scan"]["pad_seconds"] == {
+        "configured": "auto",
+        "resolved": 0.5,
+    }
+    assert signature["scan"]["merge_gap_seconds"] == 0.0
     assert signature["scan"]["precise_range_policy"] == (
-        "sample-grid-plus-normalization-v1"
+        "confidence-filter-plus-sample-padding-v2"
     )
