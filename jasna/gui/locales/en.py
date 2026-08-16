@@ -269,6 +269,9 @@ EN = {
         "pre_scan_full_threshold": "Full-video threshold",
         "pre_scan_coarse_interval": "Coarse scan interval",
         "pre_scan_fine_interval": "Precise scan interval",
+        "pre_scan_pad_seconds": "Precise range padding",
+        "pre_scan_pad_auto": "Auto (match precision)",
+        "pre_scan_pad_none": "None",
         "pre_scan_interval_0_25": "0.25 s",
         "pre_scan_interval_0_5": "0.5 s",
         "pre_scan_interval_1_0": "1.0 s",
@@ -476,6 +479,7 @@ EN = {
         "tip_pre_scan_full_threshold": "In Auto mode, the normalized detected-time coverage at or above this value selects full-video processing; lower coverage uses the precise scan. Default: 85% (0.85).",
         "tip_pre_scan_coarse_interval": "Target spacing for Auto's adaptive coarse scan. Nearby keyframes are sampled directly; dense GOPs are skipped and sparse GOPs fill target samples. Default: 4.0 seconds.",
         "tip_pre_scan_fine_interval": "Sampling spacing for the precise pre-scan. Smaller intervals are more accurate but slower. Default: 0.5 seconds.",
+        "tip_pre_scan_pad_seconds": "Extra time restored before and after each retained precise-scan range. Auto follows the precise interval, clamped to 0.5-1.0 seconds. Default: Auto.",
 
         # Preset button tooltips
         "tip_preset_reset": "Reset to saved values",

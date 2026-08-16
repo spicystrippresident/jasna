@@ -250,6 +250,9 @@ KO = {
         "pre_scan_full_threshold": "전체 영상 처리 기준",
         "pre_scan_coarse_interval": "대략 스캔 간격",
         "pre_scan_fine_interval": "정밀 스캔 간격",
+        "pre_scan_pad_seconds": "정밀 범위 여백",
+        "pre_scan_pad_auto": "자동 (정밀도에 맞춤)",
+        "pre_scan_pad_none": "없음",
         "pre_scan_interval_0_25": "0.25초",
         "pre_scan_interval_0_5": "0.5초",
         "pre_scan_interval_1_0": "1.0초",
@@ -456,6 +459,7 @@ KO = {
         "tip_pre_scan_full_threshold": "자동 모드에서 감지된 시간 범위의 정규화된 커버리지가 이 값 이상이면 전체 영상 처리를 선택하고, 낮으면 정밀 스캔을 사용합니다. 기본값: 85% (0.85).",
         "tip_pre_scan_coarse_interval": "자동 모드의 적응형 대략 스캔 목표 간격입니다. 가까운 키프레임을 직접 사용하고, 조밀한 GOP는 건너뛰며, 성긴 GOP에는 목표 지점을 보충합니다. 기본값: 4.0초.",
         "tip_pre_scan_fine_interval": "정밀 사전 스캔에서 사용할 샘플 간격입니다. 짧을수록 정확하지만 느려집니다. 기본값: 0.5초.",
+        "tip_pre_scan_pad_seconds": "유지된 정밀 스캔 범위 앞뒤에 추가로 복원할 시간입니다. 자동은 정밀 간격을 따르며 0.5~1.0초로 제한됩니다. 기본값: 자동.",
 
         # Preset button tooltips
         "tip_preset_reset": "저장된 값으로 초기화",
