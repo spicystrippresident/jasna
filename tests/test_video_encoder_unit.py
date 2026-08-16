@@ -28,6 +28,7 @@ from jasna.media.video_encoder import (
     _mov_container_options,
     _normalized_audio_layout,
     NvidiaVideoEncoder,
+    source_bitrate_cap_options,
 )
 
 
@@ -550,6 +551,14 @@ class TestEncoderOptions:
         enc = _make_encoder(tmp_path, video_bitrate=0)
         assert "maxrate" not in enc.encoder_options
         assert "bufsize" not in enc.encoder_options
+
+    def test_source_bitrate_ceiling_skips_values_outside_encoder_range(self):
+        options = source_bitrate_cap_options(
+            _fake_metadata(video_bitrate=2_000_000_000),
+            output_codec="hevc",
+            vendor=AcceleratorVendor.NVIDIA,
+        )
+        assert options == {}
 
     @pytest.mark.parametrize("codec", ["hevc", "h264"])
     def test_explicit_maxrate_replaces_derived_ceiling(self, tmp_path, codec):

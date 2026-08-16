@@ -280,6 +280,7 @@ NVENC_H264_SOURCE_BITRATE_CAP_FACTOR = 2.0
 # Any VBV buffer of roughly a second or more never becomes the binding
 # constraint; only sub-second buffers throttle, which is the #243 unit trap.
 SOURCE_BITRATE_CAP_BUFFER_RATIO = 2
+FFMPEG_ENCODER_RATE_MAX = 2_147_483_647
 
 
 def source_bitrate_cap_options(
@@ -301,9 +302,17 @@ def source_bitrate_cap_options(
             metadata.codec_name.lower(), DEFAULT_SOURCE_BITRATE_CAP_FACTOR
         )
     maxrate = int(metadata.video_bitrate * factor)
+    bufsize = maxrate * SOURCE_BITRATE_CAP_BUFFER_RATIO
+    if maxrate > FFMPEG_ENCODER_RATE_MAX or bufsize > FFMPEG_ENCODER_RATE_MAX:
+        logger.warning(
+            "Source bitrate ceiling for %s exceeds the encoder option range; "
+            "encoding without a source-tied bitrate ceiling",
+            metadata.video_file,
+        )
+        return {}
     return {
         "maxrate": str(maxrate),
-        "bufsize": str(maxrate * SOURCE_BITRATE_CAP_BUFFER_RATIO),
+        "bufsize": str(bufsize),
     }
 
 

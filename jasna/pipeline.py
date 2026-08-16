@@ -695,6 +695,7 @@ class Pipeline:
             lut_path=self.lut_path,
             sharpen_strength=self.sharpen_strength,
             output_fps=frame_rate.output_fps,
+            match_input_bit_depth=True,
             fmp4=self.fmp4,
         )
         try:
