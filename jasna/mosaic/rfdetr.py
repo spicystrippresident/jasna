@@ -77,6 +77,9 @@ class RfDetrMosaicDetectionModel:
         self.device = device
         self.resolution = int(resolution)
         self.dynamic_batch = bool(dynamic_batch)
+        # The ROCm torch runner accepts a larger dynamic batch. TensorRT
+        # engines are compiled with the configured batch as their upper bound.
+        self.supports_sbs_eye_batching = is_amd_device(self.device)
         self.score_threshold = float(score_threshold)
         self.max_select = int(max_select)
         self._normalization_cache: dict[
@@ -147,7 +150,12 @@ class RfDetrMosaicDetectionModel:
         )
         self.masks_out = next(k for k in self.runner.output_names if self.runner.outputs[k].ndim == 4)
         self.logits_out = next(k for k in self.runner.output_names if k not in {self.boxes_out, self.masks_out})
-        logger.info("RF-DETR detection model loaded: %s (batch_size=%d)", self.engine_path, self.batch_size)
+        logger.info(
+            "RF-DETR detection model loaded: %s (batch_size=%d, sbs_eye_batching=%s)",
+            self.engine_path,
+            self.batch_size,
+            self.supports_sbs_eye_batching,
+        )
 
     def close(self) -> None:
         if self.runner is not None:
@@ -196,6 +204,21 @@ class RfDetrMosaicDetectionModel:
             for name, parts in output_parts.items()
         }
 
+    def _preprocess_sbs_eyes(
+        self,
+        left_frames: torch.Tensor,
+        right_frames: torch.Tensor,
+    ) -> tuple[torch.Tensor, int]:
+        if left_frames.shape != right_frames.shape:
+            raise ValueError(
+                "SBS eye batches must have identical shapes, got "
+                f"{tuple(left_frames.shape)} and {tuple(right_frames.shape)}"
+            )
+        batch_size = int(left_frames.shape[0])
+        left = self._preprocess(left_frames)
+        right = self._preprocess(right_frames)
+        return torch.cat((left, right), dim=0), batch_size
+
     @staticmethod
     def _postprocess(
         *,
@@ -235,6 +258,23 @@ class RfDetrMosaicDetectionModel:
         
         return boxes_list, masks_list
 
+    @staticmethod
+    def _scan_from_outputs(
+        outs: dict[str, torch.Tensor],
+        *,
+        logits_out: str,
+        masks_out: str,
+        score_threshold: float,
+        mask_hw: tuple[int, int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        per_query = outs[logits_out].sigmoid().amax(dim=-1)  # (B, Q)
+        scores = per_query.amax(dim=-1).float()  # (B,)
+        pred_masks = outs[masks_out]  # (B, Q, Hm, Wm)
+        active = (pred_masks > 0.0) & (per_query > score_threshold)[:, :, None, None]
+        merged = active.any(dim=1, keepdim=True).float()
+        merged = F.interpolate(merged, size=mask_hw, mode="area") > 0.0
+        return scores, merged[:, 0]
+
     def scan_scores_masks(
         self, frames_uint8_bchw: torch.Tensor, *, mask_hw: tuple[int, int]
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -244,13 +284,36 @@ class RfDetrMosaicDetectionModel:
 
         x = self._preprocess(frames_uint8_bchw)
         outs = self._infer(x)
-        per_query = outs[self.logits_out].sigmoid().amax(dim=-1)  # (B, Q)
-        scores = per_query.amax(dim=-1).float()  # (B,)
-        pred_masks = outs[self.masks_out]  # (B, Q, Hm, Wm)
-        active = (pred_masks > 0.0) & (per_query > self.score_threshold)[:, :, None, None]
-        merged = active.any(dim=1, keepdim=True).float()
-        merged = F.interpolate(merged, size=mask_hw, mode="area") > 0.0
-        return scores, merged[:, 0]
+        return self._scan_from_outputs(
+            outs,
+            logits_out=self.logits_out,
+            masks_out=self.masks_out,
+            score_threshold=self.score_threshold,
+            mask_hw=mask_hw,
+        )
+
+    def scan_sbs_eyes(
+        self,
+        left_frames: torch.Tensor,
+        right_frames: torch.Tensor,
+        *,
+        mask_hw: tuple[int, int],
+    ) -> tuple[
+        tuple[torch.Tensor, torch.Tensor],
+        tuple[torch.Tensor, torch.Tensor],
+    ]:
+        x, batch_size = self._preprocess_sbs_eyes(left_frames, right_frames)
+        scores, masks = self._scan_from_outputs(
+            self._infer(x),
+            logits_out=self.logits_out,
+            masks_out=self.masks_out,
+            score_threshold=self.score_threshold,
+            mask_hw=mask_hw,
+        )
+        return (
+            (scores[:batch_size], masks[:batch_size]),
+            (scores[batch_size:], masks[batch_size:]),
+        )
 
     def __call__(self, frames_uint8_bchw: torch.Tensor, *, target_hw: tuple[int, int]) -> Detections:
         x = self._preprocess(frames_uint8_bchw)
@@ -266,4 +329,26 @@ class RfDetrMosaicDetectionModel:
         return Detections(
             boxes_xyxy=boxes_list,
             masks=masks_list,
+        )
+
+    def detect_sbs_eyes(
+        self,
+        left_frames: torch.Tensor,
+        right_frames: torch.Tensor,
+        *,
+        target_hw: tuple[int, int],
+    ) -> tuple[Detections, Detections]:
+        x, batch_size = self._preprocess_sbs_eyes(left_frames, right_frames)
+        outs = self._infer(x)
+        boxes, masks = self._postprocess(
+            pred_boxes=outs[self.boxes_out],
+            pred_logits=outs[self.logits_out],
+            pred_masks=outs[self.masks_out],
+            target_hw=target_hw,
+            score_threshold=self.score_threshold,
+            max_select=self.max_select,
+        )
+        return (
+            Detections(boxes_xyxy=boxes[:batch_size], masks=masks[:batch_size]),
+            Detections(boxes_xyxy=boxes[batch_size:], masks=masks[batch_size:]),
         )
