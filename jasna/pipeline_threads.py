@@ -241,6 +241,11 @@ def primary_restore_loop(
     debug_memory: PipelineDebugMemoryLogger | None = None,
 ) -> None:
     timer = LoopTimer("primary")
+    restored_track_ids: set[int] = set()
+    restoration_clips = 0
+    batched_invocations = 0
+    pending_item: ClipRestoreItem | object | None = None
+    reached_sentinel = False
     try:
         torch.cuda.set_device(device)
         log.debug("[primary] thread starting")
@@ -248,7 +253,10 @@ def primary_restore_loop(
             if cancel_event is not None and cancel_event.is_set():
                 break
             primary_idle_event.set()
-            if cancel_event is not None:
+            if pending_item is not None:
+                item = pending_item
+                pending_item = None
+            elif cancel_event is not None:
                 try:
                     with timer.measure("queue-wait"):
                         item = clip_queue.get(timeout=0.1)
@@ -260,31 +268,101 @@ def primary_restore_loop(
             primary_idle_event.clear()
             if item is _SENTINEL:
                 break
-            clip_item: ClipRestoreItem = item
+
+            clip_items: list[ClipRestoreItem] = [item]
+            batch_limit = getattr(
+                restoration_pipeline, "independent_clip_batch_size", 1
+            )
+            batch_limit = batch_limit if isinstance(batch_limit, int) else 1
+            batch_min_frames = getattr(
+                restoration_pipeline, "independent_clip_batch_min_frames", 0
+            )
+            batch_min_frames = (
+                batch_min_frames if isinstance(batch_min_frames, int) else 0
+            )
+            while (
+                len(clip_items[0].raw_crops) >= max(0, batch_min_frames)
+                and len(clip_items) < max(1, batch_limit)
+            ):
+                try:
+                    candidate = clip_queue.get_nowait()
+                except Empty:
+                    break
+                if candidate is _SENTINEL:
+                    reached_sentinel = True
+                    break
+                if len(candidate.raw_crops) != len(clip_items[0].raw_crops):
+                    pending_item = candidate
+                    break
+                clip_items.append(candidate)
+
+            for clip_item in clip_items:
+                restored_track_ids.add(int(clip_item.clip.track_id))
+            restoration_clips += len(clip_items)
             with timer.measure("restore"):
-                result = restoration_pipeline.prepare_and_run_primary(
-                    clip_item.clip,
-                    clip_item.raw_crops,
-                    clip_item.frame_shape,
-                    clip_item.keep_start,
-                    clip_item.keep_end,
-                    clip_item.crossfade_weights,
-                )
+                if len(clip_items) > 1:
+                    try:
+                        results = restoration_pipeline.prepare_and_run_primary_batch(
+                            clip_items
+                        )
+                        batched_invocations += 1
+                    except torch.cuda.OutOfMemoryError:
+                        log.warning(
+                            "Primary clip batch of %d exceeded VRAM; retrying individually",
+                            len(clip_items),
+                        )
+                        torch.cuda.empty_cache()
+                        results = [
+                            restoration_pipeline.prepare_and_run_primary(
+                                clip_item.clip,
+                                clip_item.raw_crops,
+                                clip_item.frame_shape,
+                                clip_item.keep_start,
+                                clip_item.keep_end,
+                                clip_item.crossfade_weights,
+                            )
+                            for clip_item in clip_items
+                        ]
+                else:
+                    clip_item = clip_items[0]
+                    results = [
+                        restoration_pipeline.prepare_and_run_primary(
+                            clip_item.clip,
+                            clip_item.raw_crops,
+                            clip_item.frame_shape,
+                            clip_item.keep_start,
+                            clip_item.keep_end,
+                            clip_item.crossfade_weights,
+                        )
+                    ]
                 if restoration_pipeline.secondary_prefers_cpu_input:
-                    result.primary_raw = result.primary_raw.cpu()
+                    for result in results:
+                        result.primary_raw = result.primary_raw.cpu()
             with timer.measure("queue-put"):
-                secondary_queue.put(result, frame_count=result.keep_end - result.keep_start)
+                for result in results:
+                    secondary_queue.put(
+                        result, frame_count=result.keep_end - result.keep_start
+                    )
             if debug_memory is not None:
-                debug_memory.snapshot(
-                    "primary",
-                    f"clip={clip_item.clip.track_id} frames={len(clip_item.raw_crops)}",
-                )
+                for clip_item in clip_items:
+                    debug_memory.snapshot(
+                        "primary",
+                        f"clip={clip_item.clip.track_id} frames={len(clip_item.raw_crops)}",
+                    )
+            if reached_sentinel:
+                break
     except BaseException as e:
         if cancel_event is None or not cancel_event.is_set():
             log.exception("[primary] thread crashed")
             error_holder.append(e)
     finally:
         log.info(timer.summary())
+        log.info(
+            "[activity] restoration_clips=%d unique_tracks=%d batched_invocations=%d",
+            restoration_clips,
+            len(restored_track_ids),
+            batched_invocations,
+        )
         log.debug("[primary] thread exiting")
         secondary_queue.put(_SENTINEL)
 

@@ -5,10 +5,12 @@ import torch
 logger = logging.getLogger(__name__)
 from torch import Tensor
 
-from jasna.accelerator import is_nvidia_device
+from jasna.accelerator import is_amd_device, is_nvidia_device
 from jasna.models.basicvsrpp.inference import load_model
 
 INFERENCE_SIZE = 256
+AMD_INDEPENDENT_CLIP_BATCH_SIZE = 2
+AMD_INDEPENDENT_CLIP_BATCH_MIN_FRAMES = 60
 
 
 class BasicvsrppMosaicRestorer:
@@ -50,6 +52,18 @@ class BasicvsrppMosaicRestorer:
             self.model = load_model(config, checkpoint_path, self.device, fp16)
             logger.info("BasicVSR++ loaded from checkpoint: %s (fp16=%s)", checkpoint_path, fp16)
 
+        # Independent long clips can share the model batch dimension on ROCm.
+        # Short one-off shapes are slower because of MIOpen setup overhead. The
+        # TensorRT split path has batch-1 loop-body engines and stays unchanged.
+        if is_amd_device(self.device):
+            self.independent_clip_batch_size = AMD_INDEPENDENT_CLIP_BATCH_SIZE
+            self.independent_clip_batch_min_frames = (
+                AMD_INDEPENDENT_CLIP_BATCH_MIN_FRAMES
+            )
+        else:
+            self.independent_clip_batch_size = 1
+            self.independent_clip_batch_min_frames = 0
+
     def close(self) -> None:
         if self._split_forward is not None:
             self._split_forward.close()
@@ -71,6 +85,27 @@ class BasicvsrppMosaicRestorer:
             else:
                 result = self.model(inputs=stacked.unsqueeze(0))
             return result.squeeze(0)
+
+    def raw_process_batch(self, videos: list[list[Tensor]]) -> list[torch.Tensor]:
+        """Restore equal-length, independent clips in one model invocation."""
+        if not videos:
+            return []
+        frame_count = len(videos[0])
+        if frame_count <= 0 or any(len(video) != frame_count for video in videos):
+            raise ValueError("batched restoration requires equal non-empty clip lengths")
+        if len(videos) == 1 or self._split_forward is not None:
+            return [self.raw_process(video) for video in videos]
+
+        with torch.inference_mode():
+            stacked = torch.stack(
+                [torch.stack(video) for video in videos]
+            ).to(
+                device=self.device,
+                dtype=self.input_dtype,
+                memory_format=torch.contiguous_format,
+            ).div_(255.0)
+            result = self.model(inputs=stacked)
+            return list(result.unbind(0))
 
     def restore(self, video: list[Tensor]) -> list[Tensor]:
         """
