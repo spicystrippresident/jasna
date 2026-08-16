@@ -12,11 +12,14 @@ from jasna.media import VideoMetadata
 from jasna.media.splice import (
     HevcParameterSet,
     KeyframeIndex,
+    OutputValidationError,
     SpliceSpan,
     SmartRenderCompatibilityError,
     _analyze_packet_reordering,
     _commit_smart_output,
     _decoded_frame_hashes,
+    _fsync_directory,
+    _fsync_file,
     _hevc_copy_windows_match,
     _is_safe_random_access_packet,
     build_splice_plan,
@@ -24,7 +27,9 @@ from jasna.media.splice import (
     normalize_fragment,
     probe_keyframes,
     resolve_smart_encoder_settings,
+    sync_and_validate_final_output,
     validate_hevc_fragment_parameter_sets,
+    validate_video_output,
     validate_smart_render,
 )
 from jasna.segments import SegmentRange
@@ -593,3 +598,89 @@ def test_copy_fragment_seeks_before_demux(tmp_path: Path) -> None:
     ]
     assert packet.pts == 5
     assert packet.dts == 3
+
+
+def test_validate_video_output_rejects_missing_output(tmp_path: Path) -> None:
+    with pytest.raises(OutputValidationError, match="missing"):
+        validate_video_output(tmp_path / "missing.mp4")
+
+
+def test_sync_and_validate_final_output_validates_before_and_after_sync(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import jasna.media.splice as module
+
+    output = tmp_path / "output.mp4"
+    source = tmp_path / "source.mp4"
+    events = []
+
+    monkeypatch.setattr(
+        module,
+        "validate_video_output",
+        lambda path, **kwargs: events.append(("validate", Path(path), kwargs)),
+    )
+    monkeypatch.setattr(
+        module,
+        "_fsync_file",
+        lambda path: events.append(("fsync-file", Path(path))),
+    )
+    monkeypatch.setattr(
+        module,
+        "_fsync_directory",
+        lambda path: events.append(("fsync-directory", Path(path))),
+    )
+
+    sync_and_validate_final_output(
+        output,
+        source=source,
+        expected_codec="hevc",
+    )
+
+    assert [event[0] for event in events] == [
+        "validate",
+        "fsync-file",
+        "fsync-directory",
+        "validate",
+    ]
+    assert events[0] == events[-1]
+    assert events[0][1] == output
+    assert events[0][2] == {
+        "source": source,
+        "expected_codec": "hevc",
+        "expected_duration": None,
+    }
+
+
+def test_directory_sync_is_safe_noop_on_windows(monkeypatch, tmp_path: Path) -> None:
+    import jasna.media.splice as module
+
+    open_directory = MagicMock()
+    monkeypatch.setattr(module.sys, "platform", "win32")
+    monkeypatch.setattr(module.os, "open", open_directory)
+
+    _fsync_directory(tmp_path)
+
+    open_directory.assert_not_called()
+
+
+def test_windows_file_sync_reopens_output_with_write_access(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import jasna.media.splice as module
+
+    output = tmp_path / "output.mp4"
+    output.write_bytes(b"completed output")
+    opened_modes = []
+    original_open = Path.open
+
+    def record_open(path, mode="r", *args, **kwargs):
+        opened_modes.append(mode)
+        return original_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(module.sys, "platform", "win32")
+    monkeypatch.setattr(Path, "open", record_open)
+    monkeypatch.setattr(module.os, "fsync", lambda _fd: None)
+
+    _fsync_file(output)
+
+    assert opened_modes == ["r+b"]
