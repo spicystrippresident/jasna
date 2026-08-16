@@ -336,7 +336,7 @@ class Processor:
         input_path: Path,
         output_path: Path,
         *,
-        codec: str,
+        codec: str | None,
         smart_render: bool,
         previous_fingerprint: _OutputFingerprint | None,
     ) -> None:
@@ -570,6 +570,8 @@ class Processor:
                     )
                     processing_path = "full"
                     segments = ()
+                if self._stop_event.is_set():
+                    raise ProcessingStopped("Processing stopped")
             if processing_path != "copy":
                 self._progress(ProgressUpdate(
                     job_id=job.id,
@@ -601,8 +603,8 @@ class Processor:
                 self._validate_completed_video_output(
                     input_path,
                     output_path,
-                    codec=job_settings.codec,
-                    smart_render=processing_path != "full",
+                    codec=(None if processing_path == "copy" else job_settings.codec),
+                    smart_render=(processing_path == "smart"),
                     previous_fingerprint=previous_output_fingerprint,
                 )
 
