@@ -80,15 +80,16 @@ Current queue semantics:
 - Large AMD inputs retain parallel native rocDecode scanning; small or short
   inputs retain a single reader.
 - Scan workers share one global sample grid and merge results without duplicate
-  or missing boundary samples.
+  or missing samples at decoder partition boundaries.
 - Native/Torch mixed writes are synchronized before a decoded batch crosses
   thread ownership.
 - Masks remain in source-video coordinates; SBS eye splitting happens inside
   the detector adapter.
-- Boundary refinement continuously decodes and batch-scores each short window.
-  It no longer creates a new 8K reader for every individual frame.
-- Random mask preview, projection comparison, and boundary requests share a
-  worker-level `ReusableRocDecoder`, preventing AMD native surface-pool growth.
+- Task pre-scan finalizes precise ranges directly from the configurable sample
+  grid. It does not run a second per-frame boundary pass: the established
+  5-second padding is much larger than the default 0.5-second grid uncertainty.
+- Random mask preview and projection comparison retain the worker-level
+  `ReusableRocDecoder`, preventing AMD native surface-pool growth.
 
 ### 4. AMD smart rendering and encoder stability
 
@@ -180,10 +181,9 @@ Routing and defaults:
 - Scan skips the coarse pass and samples every `0.5s`. Auto uses the same
   precise interval after choosing the scan route. The precise interval is
   configurable.
-- Each precise hit group receives continuous per-frame boundary refinement
-  with two-frame confirmation.
-- Normalization reuses the v0.9.1 rules: 5 seconds of padding, a 30-second
-  minimum restored range, and merging gaps of 30 seconds or less.
+- Above-threshold precise samples become sample-grid ranges directly.
+  Normalization then reuses the v0.9.1 safety rules: 5 seconds of padding, a
+  30-second minimum restored range, and merging gaps of 30 seconds or less.
 - No final ranges select source copy; a range covering the complete source
   selects full restoration; partial ranges reuse `segments + Smart Render`.
 - Automatic ranges fall back to full restoration when the source is not smart-
@@ -193,8 +193,7 @@ The coarse default was increased from `2.0s` to `4.0s` after a full-length run
 showed that the old sparse stride still decoded the complete source. The
 adaptive route now skips dense GOPs and seeks regular/sparse GOPs instead of
 decoding every intervening frame. This changes only Auto's initial coverage
-estimate; videos routed to precise scanning still use the `0.5s` pass and
-continuous boundary checks.
+estimate; videos routed to precise scanning still use the `0.5s` pass.
 
 Checkpoints are always written; there is intentionally no additional toggle:
 
@@ -203,10 +202,9 @@ Checkpoints are always written; there is intentionally no additional toggle:
 - Detector batches persist exact source PTS and scores, allowing stop, failure,
   or system-restart resume without shifting the sample grid.
 - The signature includes the adaptive GOP policy, tolerance ratio, and
-  duration-weighted coverage policy, invalidating incompatible old coarse
-  checkpoints.
-- Boundary request-frame keys are persisted so an interrupted refinement does
-  not decode the same window again.
+  duration-weighted coverage policy. It also versions the direct sample-grid
+  range policy, invalidating outcomes from the retired boundary-refinement
+  route while preserving deterministic resume within the new route.
 - The isolated result includes the actual output path and the final
   `copy|full|smart` route, which the parent validates again.
 
@@ -251,11 +249,13 @@ Primary implementation paths:
   `77 passed, 5 skipped`.
 - AMF/software-reference routing and both final-mux routes:
   `62 passed, 1 skipped`.
-- Automatic pre-scan focused suite: `214 passed`, plus `py_compile` and
-  `git diff --check`.
-- The focused pre-scan suite covers three-way routing, settings, exact-PTS
+- Latest automatic pre-scan/settings/localization acceptance:
+  `251 passed, 7 deselected`; the 7 exclusions are the already documented
+  output-fixture/default-CQ baseline cases and are unrelated to scan routing.
+- The scan core and coordinator subset passes all `46` tests. Together these
+  suites cover three-way routing, direct sample-grid ranges, exact-PTS
   checkpoints, stop/close, isolated protocol results, smart-render fallback,
-  and locale contracts.
+  and locale contracts. `py_compile` and `git diff --check` also pass.
 - A broader historical suite still contains 18 stale fixture failures that are
   reproducible on the clean port baseline: old ONNX/TensorRT assumptions,
   incomplete fake settings widgets, obsolete splice mocks, output fixtures
@@ -277,11 +277,14 @@ Primary implementation paths:
   source through all three routes:
   - all-clear clip: `0%` coarse coverage and source copy;
   - strong mosaic clip: `100%` coverage and full restoration;
-  - 51.515-second transition clip: `37.8%` coarse coverage, precise scan,
-    boundary refinement, then Smart Render at `58.3%` normalized coverage.
-- The transition route restored `21.468-51.468s` (1,888 processing frames).
-  Source and final output both contained 3,085 frames at 8192x4096, HEVC Main
-  10, `yuv420p10le`. Source/output durations were `51.515s` and `51.518s`.
+  - 51.515-second transition clip: `37.8%` coarse coverage, precise scan, then
+    Smart Render. Replaying its 103 recorded precise samples through the current
+    direct-grid policy produced `21.515-51.515s` at `58.24%` normalized coverage.
+- The earlier end-to-end transition output used the retired refined boundary
+  `21.468-51.468s` (1,888 processing frames). Source and final output both
+  contained 3,085 frames at 8192x4096, HEVC Main 10, `yuv420p10le`;
+  source/output durations were `51.515s` and `51.518s`. The current direct-grid
+  replay changes that boundary by only `0.047s`, well inside the 5-second pad.
 - The adaptive coarse route was then measured on a complete 8192x4096,
   59.94 fps, 10-bit HEVC SBS source: `1610.542s`, 96,536 frames. It planned 327
   keyframe samples and completed in `65.393s` with `51.1788%` time-weighted
@@ -292,7 +295,7 @@ Primary implementation paths:
   coarse scanning; detector/model settings were unchanged. It generated no
   media output and reported no rocDecode, OOM, or detector error.
 
-### AMD boundary-refinement failure and fix
+### AMD boundary-refinement retirement
 
 The first real 8K boundary implementation reopened rocDecode for every source
 frame. The desktop became unresponsive and the previous-boot kernel log
@@ -302,14 +305,22 @@ repeated:
 amdgpu_cs_ioctl: Not enough memory for command submission
 ```
 
-The implementation was replaced with continuous window decoding and a shared
-reusable decoder. After the fix:
+Continuous window decoding and a shared reusable decoder fixed the command-
+submission memory growth, but a later full-video run showed that the stage was
+still not worth retaining in the production route:
 
-- boundary refinement completed in seconds;
-- the complete isolated Smart Render succeeded;
-- no new AMDGPU memory/reset error appeared;
-- system-observed VRAM peaked near `17.5 GB / 25.8 GB` and returned to about
-  `1.64 GB` after process exit.
+- the 0.5-second precise grid completed in `16m54s` with 5,755 samples;
+- 334 boundary windows then scored another 9,710 frames and took `22m47s`;
+- replaying the same precise samples without refinement kept the same seven
+  normalized ranges, changed individual starts/ends by only `0.18-0.43s`, and
+  changed coverage by about `0.0035` percentage points;
+- removing the stage reduces that observed scan route from `42m29s` to about
+  `19m42s` (`2.16x` faster) without reducing the 5-second safety padding.
+
+Automatic pre-scan therefore no longer invokes boundary-window decoding. The
+precise scan remains resumable and range normalization is unchanged. Historical
+AMDGPU failure evidence remains recorded because it explains why the unused
+per-frame/window route must not be reintroduced without new performance data.
 
 Generated media, scan checkpoints, local runtime caches, and personal media
 paths are not committed.

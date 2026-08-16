@@ -12,7 +12,6 @@ from jasna.gui.mosaic_scan import (
     ScanCheckpoint,
     ScanCompleted,
     ScanFailed,
-    ScanScoresReady,
 )
 from jasna.gui.pre_scan_routing import (
     PRE_SCAN_ALGORITHM_VERSION,
@@ -22,8 +21,8 @@ from jasna.gui.pre_scan_routing import (
     _ScanCheckpointStore,
     _checkpoint_signature,
     coarse_route,
-    hit_sample_groups,
     normalize_scan_segments,
+    precise_scan_segments,
     sampled_coverage,
     segment_coverage,
 )
@@ -82,9 +81,58 @@ def test_sampled_coverage_duration_weights_irregular_samples():
     assert sampled_coverage(result, threshold=0.35) == pytest.approx(1.5 / 20.0)
 
 
-def test_fine_hit_groups_split_at_non_hits():
-    result = _result([0.0, 0.9, 0.8, 0.0, 0.7, 0.0], stride=0.5, duration=3.0)
-    assert hit_sample_groups(result, threshold=0.35) == ((1, 2), (4, 4))
+def test_precise_scan_uses_sample_grid_before_safe_normalization():
+    result = MosaicScanResult(
+        times=(49.5, 50.0, 50.5, 51.0, 51.5),
+        scores=(0.0, 0.9, 0.8, 0.0, 0.0),
+        masks=(),
+        stride=0.5,
+        duration=120.0,
+        completed_until=51.5,
+    )
+
+    # The hit grid yields 50.0-51.0s. Existing 5s padding and the 30s
+    # minimum-duration rule then provide a much larger safety margin than a
+    # sub-frame boundary refinement could materially change.
+    assert precise_scan_segments(result, threshold=0.35) == (
+        SegmentRange(35.5, 65.5),
+    )
+
+
+def test_scan_policy_finishes_from_precise_grid_without_boundary_worker():
+    result = MosaicScanResult(
+        times=(49.5, 50.0, 50.5, 51.0, 51.5),
+        scores=(0.0, 0.9, 0.8, 0.0, 0.0),
+        masks=(),
+        stride=0.5,
+        duration=120.0,
+        completed_until=51.5,
+    )
+
+    class FakeCheckpoint:
+        outcome = None
+
+        def completed_outcome(self):
+            return None
+
+        def samples(self, *_args):
+            return {}
+
+        def set_outcome(self, outcome):
+            self.outcome = outcome
+
+    coordinator = PreScanCoordinator.__new__(PreScanCoordinator)
+    coordinator.metadata = SimpleNamespace(duration=120.0)
+    coordinator.settings = AppSettings(pre_scan_policy="scan")
+    coordinator.checkpoint = FakeCheckpoint()
+    coordinator._log = lambda *_args: None
+    coordinator._run_stage = lambda *_args, **_kwargs: (result, None)
+
+    outcome = coordinator.run()
+
+    assert outcome.processing_path == "smart"
+    assert outcome.segments == (SegmentRange(35.5, 65.5),)
+    assert coordinator.checkpoint.outcome == outcome
 
 
 def test_old_timeline_padding_minimum_and_merge_rules_are_preserved():
@@ -148,66 +196,6 @@ def test_scan_checkpoint_prefers_exact_pts_keys(tmp_path):
     )
 
     assert store.samples("fine", 0.5) == {45_046: (0.5005, 0.8)}
-
-
-def test_boundary_checkpoint_reuses_requested_frame_index(tmp_path):
-    path = tmp_path / "scan" / "manifest.json"
-    signature = {"source": "demo"}
-    store = _ScanCheckpointStore(
-        path,
-        signature,
-        fps=30.0,
-        time_base=1 / 90_000,
-    )
-    store.add_boundary_sample(15, 0.5005, 0.8)
-    store.flush()
-
-    resumed = _ScanCheckpointStore(
-        path,
-        signature,
-        fps=30.0,
-        time_base=1 / 90_000,
-    )
-
-    assert resumed.boundary_samples() == {15: (0.5005, 0.8)}
-
-
-def test_boundary_refinement_batches_each_half_second_window(tmp_path):
-    checkpoint = _ScanCheckpointStore(
-        tmp_path / "scan" / "manifest.json",
-        {"source": "demo"},
-        fps=10.0,
-        time_base=0.001,
-    )
-    requested = []
-
-    class FakeWorker:
-        def __init__(self):
-            self.events = queue.Queue()
-            self.generation = 0
-
-        def request_scores(self, start_seconds, end_seconds):
-            self.generation += 1
-            requested.append((start_seconds, end_seconds))
-            first = round(start_seconds * 10)
-            last = round(end_seconds * 10)
-            times = tuple(index / 10 for index in range(first, last + 1))
-            scores = tuple(0.9 if 0.4 <= seconds < 1.3 else 0.0 for seconds in times)
-            self.events.put(ScanScoresReady(times, scores, self.generation))
-            return self.generation
-
-    coordinator = PreScanCoordinator.__new__(PreScanCoordinator)
-    coordinator.metadata = SimpleNamespace(video_fps=10.0, duration=2.0, time_base=0.001)
-    coordinator._stopped = lambda: False
-    coordinator._log = lambda *_args: None
-    coordinator.checkpoint = checkpoint
-    result = _result([0.0, 0.9, 0.9, 0.0], stride=0.5, duration=2.0)
-
-    refined = coordinator._refine_boundaries(result, FakeWorker(), threshold=0.35)
-
-    assert refined == (SegmentRange(0.4, 1.3),)
-    assert requested == pytest.approx([(0.1, 0.5), (1.1, 1.5)])
-    assert len(checkpoint.boundary_samples()) == 8
 
 
 def test_corrupt_checkpoint_is_reset_instead_of_marked_complete(tmp_path):
@@ -491,3 +479,6 @@ def test_checkpoint_signature_versions_adaptive_coarse_policy(monkeypatch, tmp_p
         "tolerance_ratio": 0.25,
         "coverage_policy": "duration-weighted-midpoints-v1",
     }
+    assert signature["scan"]["precise_range_policy"] == (
+        "sample-grid-plus-normalization-v1"
+    )

@@ -30,8 +30,6 @@ from jasna.gui.mosaic_scan import (
     ScanCompleted,
     ScanFailed,
     ScanProgress,
-    ScanScoresFailed,
-    ScanScoresReady,
     ScanStatus,
     plan_adaptive_coarse_scan,
     scan_sample_stride,
@@ -42,13 +40,12 @@ from jasna.smart_render_workspace import _write_json_atomic, source_identity
 
 
 PRE_SCAN_SCHEMA_VERSION = 1
-PRE_SCAN_ALGORITHM_VERSION = "jasna-pre-scan-v2-adaptive-coarse"
+PRE_SCAN_ALGORITHM_VERSION = "jasna-pre-scan-v3-sample-grid-ranges"
 CHECKPOINT_SAMPLE_BATCH = 256
 CHECKPOINT_MAX_SECONDS = 30.0
 TIMELINE_HEAD_TAIL_PAD_SECONDS = 5.0
 TIMELINE_MERGE_GAP_SECONDS = 30.0
 TIMELINE_MIN_SEGMENT_SECONDS = 30.0
-BOUNDARY_CONFIRM_FRAMES = 2
 
 PreScanPath = Literal["full", "smart", "copy"]
 
@@ -185,34 +182,6 @@ def normalize_scan_segments(
     return normalize_segments(tuple(merged), duration=duration)
 
 
-def hit_sample_groups(
-    result: MosaicScanResult,
-    *,
-    threshold: float,
-) -> tuple[tuple[int, int], ...]:
-    groups: list[tuple[int, int]] = []
-    start: int | None = None
-    previous = -1
-    for index, score in enumerate(result.scores):
-        hit = float(score) >= float(threshold)
-        continuous = (
-            previous < 0
-            or result.times[index] - result.times[previous] <= result.stride * 1.5
-        )
-        if hit and (start is None or continuous):
-            start = index if start is None else start
-        elif hit:
-            groups.append((start, previous))
-            start = index
-        elif start is not None:
-            groups.append((start, previous))
-            start = None
-        previous = index
-    if start is not None:
-        groups.append((start, len(result.scores) - 1))
-    return tuple(groups)
-
-
 def coarse_route(
     result: MosaicScanResult,
     *,
@@ -225,6 +194,30 @@ def coarse_route(
     if coverage >= full_threshold:
         return "full"
     return "fine"
+
+
+def precise_scan_segments(
+    result: MosaicScanResult,
+    *,
+    threshold: float,
+) -> tuple[SegmentRange, ...]:
+    """Build safe restoration ranges directly from the precise sample grid.
+
+    A precise scan already limits boundary uncertainty to one configured sample
+    interval.  The established five-second padding, minimum-duration, and merge
+    rules dominate that uncertainty, so per-frame boundary re-scanning adds
+    substantial decode cost without a meaningful change to the restored range.
+    """
+
+    sampled = segments_from_scores(
+        result.times,
+        result.scores,
+        threshold=threshold,
+        stride=result.stride,
+        duration=result.duration,
+        pad=0.0,
+    )
+    return normalize_scan_segments(sampled, duration=result.duration)
 
 
 class _ScanCheckpointStore:
@@ -262,7 +255,6 @@ class _ScanCheckpointStore:
             "schema_version": PRE_SCAN_SCHEMA_VERSION,
             "signature": signature,
             "stages": {},
-            "boundary_samples": [],
             "outcome": None,
         }
         _write_json_atomic(self.path, value)
@@ -284,8 +276,6 @@ class _ScanCheckpointStore:
                 return False
             if not cls._valid_encoded_samples(stage.get("samples")):
                 return False
-        if not cls._valid_encoded_samples(value.get("boundary_samples")):
-            return False
         outcome = value.get("outcome")
         if outcome is None:
             return True
@@ -351,9 +341,6 @@ class _ScanCheckpointStore:
         stage = self._stage(name, stride)
         return self._decode_samples(stage.get("samples", ()))
 
-    def boundary_samples(self) -> dict[int, tuple[float, float]]:
-        return self._decode_samples(self.data.get("boundary_samples", ()))
-
     def _decode_samples(self, values) -> dict[int, tuple[float, float]]:
         decoded: dict[int, tuple[float, float]] = {}
         for item in values or ():
@@ -383,18 +370,6 @@ class _ScanCheckpointStore:
         values = self.samples(name, stride)
         self._add(values, times, scores, sample_keys=sample_keys)
         self._stage(name, stride)["samples"] = self._encode_samples(values)
-        self._maybe_flush()
-
-    def add_boundary_sample(
-        self,
-        frame_index: int,
-        seconds: float,
-        score: float,
-    ) -> None:
-        values = self.boundary_samples()
-        values[max(0, int(frame_index))] = (float(seconds), float(score))
-        self._dirty_samples += 1
-        self.data["boundary_samples"] = self._encode_samples(values)
         self._maybe_flush()
 
     def _add(
@@ -521,7 +496,7 @@ def _checkpoint_signature(
             "pad_seconds": TIMELINE_HEAD_TAIL_PAD_SECONDS,
             "merge_gap_seconds": TIMELINE_MERGE_GAP_SECONDS,
             "min_segment_seconds": TIMELINE_MIN_SEGMENT_SECONDS,
-            "boundary_confirm_frames": BOUNDARY_CONFIRM_FRAMES,
+            "precise_range_policy": "sample-grid-plus-normalization-v1",
         },
     }
 
@@ -656,17 +631,12 @@ class PreScanCoordinator:
         coarse_known = self.checkpoint.samples(
             "coarse", float(self.settings.pre_scan_coarse_interval)
         )
-        fine, worker = self._run_stage(
+        fine, _worker = self._run_stage(
             "fine",
             fine_interval,
             seed_samples=coarse_known,
-            keep_worker=True,
         )
-        try:
-            raw = self._refine_boundaries(fine, worker, threshold=threshold)
-        finally:
-            self._close_active_worker()
-        normalized = normalize_scan_segments(raw, duration=float(self.metadata.duration))
+        normalized = precise_scan_segments(fine, threshold=threshold)
         coverage = segment_coverage(normalized, float(self.metadata.duration))
         self._log("INFO", f"最终有码覆盖率：{coverage:.1%}")
         if not normalized:
@@ -729,7 +699,6 @@ class PreScanCoordinator:
         requested_stride: float,
         *,
         seed_samples: dict[int, tuple[float, float]] | None = None,
-        keep_worker: bool = False,
         adaptive_coarse: bool = False,
     ) -> tuple[MosaicScanResult, object | None]:
         fps = float(self.metadata.video_fps)
@@ -742,8 +711,7 @@ class PreScanCoordinator:
         if self.checkpoint.stage_complete(name, stage_stride):
             result = _result_from_samples(saved, stride=stage_stride, duration=duration)
             self._log("INFO", f"扫描断点：复用 {name} 的 {len(saved)} 个采样点")
-            worker = self._start_service_worker(actual_stride, saved, seed_samples) if keep_worker else None
-            return result, worker
+            return result, None
 
         known = dict(seed_samples or {})
         known.update(saved)
@@ -772,7 +740,6 @@ class PreScanCoordinator:
         self._active_worker = worker
         worker.start()
         stopped_requested = False
-        retained_worker = False
         received_checkpoint = False
         try:
             while True:
@@ -818,50 +785,10 @@ class PreScanCoordinator:
                     result = _result_from_samples(
                         saved, stride=stage_stride, duration=duration
                     )
-                    if keep_worker:
-                        retained_worker = True
-                        return result, worker
                     return result, None
         finally:
             self.checkpoint.flush()
-            if not retained_worker:
-                self._close_active_worker()
-
-    def _start_service_worker(
-        self,
-        actual_stride: float,
-        saved: dict[int, tuple[float, float]],
-        seed_samples: dict[int, tuple[float, float]] | None,
-    ):
-        known = dict(seed_samples or {})
-        known.update(saved)
-        worker = self._worker_factory(
-            self.source,
-            self.metadata,
-            self.settings,
-            stride_seconds=actual_stride,
-            start_seconds=0.0,
-            known_sample_scores={key: value[1] for key, value in known.items()},
-            emit_checkpoints=False,
-            serve_only=True,
-        )
-        self._active_worker = worker
-        worker.start()
-        while True:
-            if self._stopped():
-                worker.stop()
-            try:
-                event = worker.events.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            if isinstance(event, ScanFailed):
-                self._close_active_worker()
-                raise PreScanFailed(event.message)
-            if isinstance(event, ScanCompleted):
-                if event.stopped or self._stopped():
-                    self._close_active_worker()
-                    raise PreScanStopped("pre-scan stopped")
-                return worker
+            self._close_active_worker()
 
     def _close_active_worker(self) -> None:
         worker = self._active_worker
@@ -869,137 +796,3 @@ class PreScanCoordinator:
         if worker is not None:
             worker.close()
             worker.join()
-
-    def _refine_boundaries(
-        self,
-        result: MosaicScanResult,
-        worker,
-        *,
-        threshold: float,
-    ) -> tuple[SegmentRange, ...]:
-        groups = hit_sample_groups(result, threshold=threshold)
-        if not groups:
-            return ()
-        self._log("INFO", f"边界补扫：{len(groups) * 2} 个窗口")
-        fps = max(1.0, float(self.metadata.video_fps))
-        frame_period = 1.0 / fps
-        duration = float(self.metadata.duration)
-        fine_scores = {
-            round(seconds * fps): (seconds, score)
-            for seconds, score in zip(result.times, result.scores)
-        }
-        boundary_scores = self.checkpoint.boundary_samples()
-
-        def score_at(frame_index: int) -> tuple[float, float]:
-            if frame_index in boundary_scores:
-                return boundary_scores[frame_index]
-            if frame_index in fine_scores:
-                return fine_scores[frame_index]
-            raise PreScanFailed(f"边界补扫缺少第 {frame_index} 帧的检测结果")
-
-        def scan_window(frame_indices: range) -> None:
-            missing = [
-                frame_index
-                for frame_index in frame_indices
-                if frame_index not in boundary_scores and frame_index not in fine_scores
-            ]
-            if not missing:
-                return
-            if self._stopped():
-                raise PreScanStopped("pre-scan stopped")
-            start_seconds = min(duration, max(0.0, missing[0] / fps))
-            # Include the following nominal frame so a VFR timestamp just
-            # after the requested grid point still supplies a score.
-            end_seconds = min(
-                duration,
-                max(start_seconds, (missing[-1] + 1) / fps),
-            )
-            generation = worker.request_scores(start_seconds, end_seconds)
-            while True:
-                if self._stopped():
-                    raise PreScanStopped("pre-scan stopped")
-                try:
-                    event = worker.events.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-                if isinstance(event, ScanScoresFailed) and event.generation == generation:
-                    raise PreScanFailed(event.message)
-                if isinstance(event, ScanScoresReady) and event.generation == generation:
-                    samples = sorted(
-                        (float(seconds), float(score))
-                        for seconds, score in zip(event.times, event.scores)
-                    )
-                    if not samples:
-                        raise PreScanFailed("边界补扫没有返回检测结果")
-                    cursor = 0
-                    epsilon = max(abs(float(self.metadata.time_base)), 1e-9)
-                    for frame_index in missing:
-                        requested = frame_index / fps
-                        while (
-                            cursor + 1 < len(samples)
-                            and samples[cursor][0] + epsilon < requested
-                        ):
-                            cursor += 1
-                        value = samples[cursor]
-                        boundary_scores[frame_index] = value
-                        # Persist deterministic request-frame keys so an
-                        # interrupted refinement resumes without decoding the
-                        # same boundary window again.
-                        self.checkpoint.add_boundary_sample(frame_index, *value)
-                    return
-
-        refined: list[SegmentRange] = []
-        for first, last in groups:
-            first_time = float(result.times[first])
-            last_time = float(result.times[last])
-            left_limit = float(result.times[first - 1]) if first else 0.0
-            right_limit = (
-                float(result.times[last + 1])
-                if last + 1 < len(result.times)
-                else duration
-            )
-            left_frames = range(
-                max(0, math.floor(left_limit * fps)),
-                max(0, math.ceil(first_time * fps)) + 1,
-            )
-            scan_window(left_frames)
-            start = first_time
-            run = 0
-            candidate = first_time
-            for frame_index in left_frames:
-                seconds, score = score_at(frame_index)
-                if score >= threshold:
-                    if run == 0:
-                        candidate = seconds
-                    run += 1
-                    if run >= BOUNDARY_CONFIRM_FRAMES:
-                        start = candidate
-                        break
-                else:
-                    run = 0
-
-            right_frames = range(
-                max(0, math.floor(last_time * fps)),
-                max(0, math.ceil(right_limit * fps)) + 1,
-            )
-            scan_window(right_frames)
-            end = min(duration, last_time + result.stride)
-            miss_run = 0
-            first_miss = end
-            for frame_index in right_frames:
-                seconds, score = score_at(frame_index)
-                if score < threshold:
-                    if miss_run == 0:
-                        first_miss = seconds
-                    miss_run += 1
-                    if miss_run >= BOUNDARY_CONFIRM_FRAMES:
-                        end = first_miss
-                        break
-                else:
-                    miss_run = 0
-            if end <= start:
-                end = min(duration, start + max(frame_period, result.stride))
-            if end > start:
-                refined.append(SegmentRange(start, end))
-        self.checkpoint.flush()
-        return normalize_segments(tuple(refined), duration=duration)
