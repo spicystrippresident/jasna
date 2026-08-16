@@ -402,6 +402,16 @@ def _normalized_audio_layout(layout: av.AudioLayout) -> av.AudioLayout:
     return layout
 
 
+@dataclass(order=True, frozen=True)
+class _BufferedEncodeItem:
+    """One encoder input kept together while the bounded PTS window reorders it."""
+
+    pts: int
+    sequence: int
+    frame: torch.Tensor = field(compare=False)
+    apply_lut: bool = field(compare=False)
+
+
 class NvidiaVideoEncoder:
     def __init__(
         self,
@@ -524,7 +534,8 @@ class NvidiaVideoEncoder:
             self.encoder_options.update(spec.smart_fragment_options)
 
         self.BUFFER_MAX_SIZE = 8
-        self._lut_flags: deque[bool] = deque()
+        self.frame_buffer: list[_BufferedEncodeItem] = []
+        self._next_buffer_sequence = 0
         # Set on AMD in __enter__, where the frame size is known; NVIDIA leaves
         # them None and allocates per frame (NVENC outlives encode()).
         self._packed: torch.Tensor | None = None
@@ -631,9 +642,8 @@ class NvidiaVideoEncoder:
                 dtype=dtype,
                 pin_memory=True,
             )
-        self.pts_heap: list[int] = []
-        self.frame_buffer: deque = deque()
-        self._lut_flags.clear()
+        self.frame_buffer = []
+        self._next_buffer_sequence = 0
         self.pts_set: set[int] = set()
         self._last_emitted_pts: int | None = None
         self._video_started = False
@@ -948,15 +958,14 @@ class NvidiaVideoEncoder:
 
     def _process_buffer(self, flush_all=False):
         if len(self.frame_buffer) > (self.BUFFER_MAX_SIZE // 2) or (flush_all and self.frame_buffer):
-            frame_to_encode = self.frame_buffer.popleft()
-            pts_to_assign = heapq.heappop(self.pts_heap)
-            self.pts_set.remove(pts_to_assign)
-            pts_to_assign = self._clamp_pts_monotonic(pts_to_assign)
-            apply_lut = self._lut_flags.popleft() if self._lut_flags else True
-            if apply_lut:
-                item = self._build_encode_item(frame_to_encode, pts_to_assign)
-            else:
-                item = self._build_encode_item(frame_to_encode, pts_to_assign, False)
+            buffered = heapq.heappop(self.frame_buffer)
+            self.pts_set.remove(buffered.pts)
+            pts_to_assign = self._clamp_pts_monotonic(buffered.pts)
+            item = self._build_encode_item(
+                buffered.frame,
+                pts_to_assign,
+                buffered.apply_lut,
+            )
             self._encode_queue.put(item)
 
     def _encoder_open_error(self, exc: Exception) -> RuntimeError:
@@ -1063,8 +1072,23 @@ class NvidiaVideoEncoder:
         pts = int(pts) - self.pts_origin
         while pts in self.pts_set:
             pts += 1
-        heapq.heappush(self.pts_heap, pts)
-        self.frame_buffer.append(frame)
-        self._lut_flags.append(bool(apply_lut))
+        # AMD rocDecode batch views can be reused by subsequent decode batches.
+        # Keep an independent tensor only on that path; NVIDIA retains its
+        # existing no-copy producer/worker storage contract.
+        owned_frame = (
+            frame.clone()
+            if self.vendor is AcceleratorVendor.AMD and isinstance(frame, torch.Tensor)
+            else frame
+        )
+        heapq.heappush(
+            self.frame_buffer,
+            _BufferedEncodeItem(
+                pts=pts,
+                sequence=self._next_buffer_sequence,
+                frame=owned_frame,
+                apply_lut=bool(apply_lut),
+            ),
+        )
+        self._next_buffer_sequence += 1
         self.pts_set.add(pts)
         self._process_buffer()
