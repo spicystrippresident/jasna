@@ -71,6 +71,21 @@ What works with segment processing:
 
 Incompatible input is rejected with a clear error before processing starts.
 
+### Linux AMD HEVC fragments
+
+On Linux AMD systems, Smart Render uses a fragment-specific HEVC policy:
+
+- The portable CQ value is encoded as constant QP `CQ + 2`, clamped to
+  `0–51` (for example, CQ 28 becomes CQP 30).
+- PreAnalysis is always disabled, including when an advanced encoder setting
+  tries to enable it. Repeated high-resolution fragment sessions can otherwise
+  abort inside the native AMF runtime.
+- A recognized source HEVC level is inherited unless `level` is set explicitly,
+  so copied and re-encoded spans use compatible level signalling.
+
+This policy applies only to Linux AMD HEVC Smart Render fragments. Full-video
+encoding, Windows AMD, and NVIDIA paths keep their existing settings.
+
 ## Working directory
 
 While assembling segment output, Jasna keeps temporary files in a hidden
