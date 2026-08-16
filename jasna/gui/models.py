@@ -25,6 +25,19 @@ class JobStatus(Enum):
     SKIPPED = "skipped"
 
 
+class SegmentSelectionMode(Enum):
+    """Where a queued video's restoration ranges came from.
+
+    ``DEFAULT`` leaves routing to the global pre-scan policy. ``MANUAL`` keeps
+    non-empty ranges strict, while ``FULL`` records that the user deliberately
+    saved an empty range list in the segment editor.
+    """
+
+    DEFAULT = "default"
+    MANUAL = "manual"
+    FULL = "full"
+
+
 _job_id_counter = itertools.count(1)
 
 
@@ -34,6 +47,7 @@ class JobProcessingSnapshot:
     detection_model: str | None
     detection_score_threshold: float | None
     vr_projection: str | None
+    segment_selection_mode: SegmentSelectionMode = SegmentSelectionMode.DEFAULT
 
 
 @dataclass
@@ -47,6 +61,7 @@ class JobItem:
     error_message: str = ""
     has_conflict: bool = False  # True if output file already exists
     segments: tuple[SegmentRange, ...] = ()
+    segment_selection_mode: SegmentSelectionMode = SegmentSelectionMode.DEFAULT
     detection_model: str | None = None
     detection_score_threshold: float | None = None
     vr_projection: str | None = None
@@ -76,6 +91,21 @@ class JobItem:
             if self.status is not JobStatus.PENDING:
                 return False
             self.segments = tuple(segments)
+            self.segment_selection_mode = (
+                SegmentSelectionMode.MANUAL
+                if self.segments
+                else SegmentSelectionMode.FULL
+            )
+            return True
+
+    def try_reset_segments(self) -> bool:
+        """Return a pending job to global automatic range selection."""
+
+        with self._state_lock:
+            if self.status is not JobStatus.PENDING:
+                return False
+            self.segments = ()
+            self.segment_selection_mode = SegmentSelectionMode.DEFAULT
             return True
 
     def try_set_video_options(
@@ -90,6 +120,11 @@ class JobItem:
             if self.status is not JobStatus.PENDING:
                 return False
             self.segments = tuple(segments)
+            self.segment_selection_mode = (
+                SegmentSelectionMode.MANUAL
+                if self.segments
+                else SegmentSelectionMode.FULL
+            )
             self.detection_model = str(detection_model)
             self.detection_score_threshold = float(detection_score_threshold)
             self.vr_projection = str(vr_projection)
@@ -102,6 +137,7 @@ class JobItem:
             self.status = JobStatus.PROCESSING
             return JobProcessingSnapshot(
                 segments=self.segments,
+                segment_selection_mode=self.segment_selection_mode,
                 detection_model=self.detection_model,
                 detection_score_threshold=self.detection_score_threshold,
                 vr_projection=self.vr_projection,
@@ -152,6 +188,10 @@ class AppSettings:
     # Detection
     detection_model: str = "rfdetr-v6"  # RF-DETR, Lada YOLO, or ZeLeFans VR YOLO registry name
     detection_score_threshold: float = 0.35
+    pre_scan_policy: str = "auto"  # auto, scan, off
+    pre_scan_full_threshold: float = 0.85
+    pre_scan_coarse_interval: float = 4.0
+    pre_scan_fine_interval: float = 0.5
     max_detection_gap: int = 2
     min_detection_duration: int = 2
     scene_detection: bool = True

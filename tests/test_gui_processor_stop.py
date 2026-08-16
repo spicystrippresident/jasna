@@ -1,4 +1,5 @@
 import threading
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -21,9 +22,10 @@ def _processor_with_job(tmp_path, run_pipeline):
     processor = Processor(on_progress=updates.append)
     processor._run_pipeline = run_pipeline
     processor._jobs = [job]
-    processor._settings = AppSettings()
+    processor._settings = AppSettings(pre_scan_policy="off")
     processor._output_folder = str(tmp_path)
     processor._output_pattern = "{original}_restored.mp4"
+    processor._validate_completed_video_output = lambda *args, **kwargs: None
     return processor, job, updates
 
 
@@ -41,14 +43,15 @@ def test_stopped_job_leaves_processing_state(tmp_path):
 
     processor, job, updates = _processor_with_job(tmp_path, fake_run_pipeline)
 
-    worker = threading.Thread(target=processor._run, daemon=True)
-    worker.start()
-    assert started.wait(5)
-    assert job.status is JobStatus.PROCESSING
+    with patch("jasna.gui.processor._cleanup_torch"):
+        worker = threading.Thread(target=processor._run, daemon=True)
+        worker.start()
+        assert started.wait(5)
+        assert job.status is JobStatus.PROCESSING
 
-    processor.stop()
-    release.set()
-    worker.join(5)
+        processor.stop()
+        release.set()
+        worker.join(5)
 
     assert not worker.is_alive()
     assert job.status is JobStatus.PENDING
@@ -98,6 +101,58 @@ def test_interrupted_pipeline_marks_job_pending(tmp_path):
 
     assert job.status is JobStatus.PENDING
     assert updates[-1].status is JobStatus.PENDING
+
+
+def test_stop_during_pre_scan_leaves_current_and_later_jobs_pending(tmp_path):
+    from jasna.gui.pre_scan_routing import PreScanStopped
+
+    first = JobItem(path=tmp_path / "first.mp4")
+    second = JobItem(path=tmp_path / "second.mp4")
+    first.path.touch()
+    second.path.touch()
+    updates: list[ProgressUpdate] = []
+    processor = Processor(on_progress=updates.append)
+    processor._jobs = [first, second]
+    processor._settings = AppSettings(pre_scan_policy="auto")
+    processor._output_folder = str(tmp_path)
+    processor._output_pattern = "{original}_restored.mp4"
+    processor._run_pipeline = MagicMock()
+    started = threading.Event()
+    stopped = threading.Event()
+
+    class BlockingCoordinator:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self):
+            started.set()
+            assert stopped.wait(5)
+            raise PreScanStopped("stopped")
+
+        def stop(self):
+            stopped.set()
+
+        def close(self):
+            pass
+
+    with (
+        patch(
+            "jasna.gui.pre_scan_routing.PreScanCoordinator",
+            BlockingCoordinator,
+        ),
+        patch("jasna.media.get_video_meta_data", return_value=object()),
+        patch("jasna.gui.processor._cleanup_torch"),
+    ):
+        worker = threading.Thread(target=processor._run, daemon=True)
+        worker.start()
+        assert started.wait(5)
+        processor.stop()
+        worker.join(5)
+
+    assert not worker.is_alive()
+    assert first.status is JobStatus.PENDING
+    assert second.status is JobStatus.PENDING
+    processor._run_pipeline.assert_not_called()
 
 
 def test_failing_job_still_marked_error(tmp_path):
