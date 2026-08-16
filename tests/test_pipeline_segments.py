@@ -77,8 +77,7 @@ def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_pat
         patch("jasna.pipeline.NvidiaVideoEncoder") as encoder,
         patch("jasna.pipeline.create_copy_fragment") as copy_fragment,
         patch("jasna.pipeline.normalize_fragment"),
-        patch("jasna.pipeline.concatenate_fragments") as concatenate,
-        patch("jasna.pipeline.mux_final_output") as mux,
+        patch("jasna.pipeline.mux_fragments_final_output") as mux,
     ):
         pipeline._run_smart(metadata)
 
@@ -102,8 +101,9 @@ def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_pat
     assert pass_args["seek_ts"] == 2.0
     assert pass_args["end_pts"] == 120
     assert pass_args["effect_ranges"] == ((75, 90),)
-    concatenate.assert_called_once()
     mux.assert_called_once()
+    assert mux.call_args.args[0][0][0].parent == workspace.path
+    assert mux.call_args.kwargs["manifest"].parent == workspace.path
     workspace.cleanup.assert_called_once()
 
 
@@ -152,13 +152,13 @@ def test_smart_run_uses_working_dir_for_temp_files(tmp_path) -> None:
         patch("jasna.pipeline.NvidiaVideoEncoder"),
         patch("jasna.pipeline.create_copy_fragment"),
         patch("jasna.pipeline.normalize_fragment"),
-        patch("jasna.pipeline.concatenate_fragments"),
-        patch("jasna.pipeline.mux_final_output") as mux,
+        patch("jasna.pipeline.mux_fragments_final_output") as mux,
     ):
         pipeline._run_smart(metadata)
 
-    assembled = mux.call_args.args[0]
-    assert assembled.parent == workspace.path
+    fragments = mux.call_args.args[0]
+    assert all(fragment.parent == workspace.path for fragment, _ in fragments)
+    assert mux.call_args.kwargs["manifest"].parent == workspace.path
     assert pipeline.working_dir.is_dir()
     assert pipeline.output_video.parent.is_dir()
 

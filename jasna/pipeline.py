@@ -24,9 +24,8 @@ from jasna.media.frame_rate import resolve_frame_rate_retarget
 from jasna.media.splice import (
     SplicePlan,
     build_splice_plan,
-    concatenate_fragments,
     create_copy_fragment,
-    mux_final_output,
+    mux_fragments_final_output,
     normalize_fragment,
     probe_keyframes,
     resolve_smart_encoder_settings,
@@ -782,18 +781,11 @@ class Pipeline:
 
             if self._cancel_event.is_set():
                 return
-            assembled = workspace.path / f"assembled{fragment_suffix}"
-            assembled.unlink(missing_ok=True)
-            concatenate_fragments(
+            mux_fragments_final_output(
                 fragments,
-                manifest=workspace.path / "fragments.ffconcat",
-                destination=assembled,
-                codec=codec,
-            )
-            mux_final_output(
-                assembled,
                 self.input_video,
                 self.output_video,
+                manifest=workspace.path / "fragments.ffconcat",
                 codec=codec,
             )
             workspace.cleanup()

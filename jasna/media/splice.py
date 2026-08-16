@@ -252,7 +252,7 @@ def _canonical_codec(name: str) -> str:
         return "hevc"
     if value in {"avc", "h.264"}:
         return "h264"
-    if value == "av01":
+    if value in {"av01", "libdav1d"}:
         return "av1"
     return value
 
@@ -691,6 +691,17 @@ def _quote_concat_path(path: Path) -> str:
     return str(path.resolve()).replace("'", "'\\''")
 
 
+def _write_concat_manifest(
+    fragments: list[tuple[Path, float]],
+    manifest: Path,
+) -> None:
+    lines = ["ffconcat version 1.0"]
+    for path, duration in fragments:
+        lines.append(f"file '{_quote_concat_path(path)}'")
+        lines.append(f"duration {_seconds(duration)}")
+    manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def concatenate_fragments(
     fragments: list[tuple[Path, float]],
     *,
@@ -698,11 +709,7 @@ def concatenate_fragments(
     destination: Path,
     codec: str,
 ) -> None:
-    lines = ["ffconcat version 1.0"]
-    for path, duration in fragments:
-        lines.append(f"file '{_quote_concat_path(path)}'")
-        lines.append(f"duration {_seconds(duration)}")
-    manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _write_concat_manifest(fragments, manifest)
     muxer = "mpegts" if codec in {"h264", "hevc"} else "matroska"
     muxer_args = ["-muxdelay", "0"] if muxer == "mpegts" else []
     _run_ffmpeg(
@@ -729,6 +736,77 @@ def mux_final_output(
     codec: str,
 ) -> None:
     temporary = destination.with_name(f".{destination.stem}.smart-render{destination.suffix}")
+    args = _final_mux_args(
+        ["-i", str(video), "-i", str(source)],
+        source,
+        destination,
+        codec=codec,
+        source_input_index=1,
+    )
+    args.append(str(temporary))
+    try:
+        _run_ffmpeg(args, purpose=f"mux smart-render output {destination.name}")
+        _commit_smart_output(
+            temporary,
+            destination,
+            source=source,
+            codec=codec,
+        )
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            log.warning("Could not remove temporary output %s", temporary)
+
+
+def mux_fragments_final_output(
+    fragments: list[tuple[Path, float]],
+    source: Path,
+    destination: Path,
+    *,
+    manifest: Path,
+    codec: str,
+) -> None:
+    """Concatenate video fragments while preserving compatible source streams."""
+    _write_concat_manifest(fragments, manifest)
+    temporary = destination.with_name(f".{destination.stem}.smart-render{destination.suffix}")
+    args = _final_mux_args(
+        [
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(manifest),
+            "-i", str(source),
+        ],
+        source,
+        destination,
+        codec=codec,
+        source_input_index=1,
+    )
+    args.append(str(temporary))
+    try:
+        _run_ffmpeg(args, purpose=f"assemble smart-render output {destination.name}")
+        _commit_smart_output(
+            temporary,
+            destination,
+            source=source,
+            codec=codec,
+        )
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            log.warning("Could not remove temporary output %s", temporary)
+
+
+def _final_mux_args(
+    video_input_args: list[str],
+    source: Path,
+    destination: Path,
+    *,
+    codec: str,
+    source_input_index: int,
+) -> list[str]:
+    """Build final Smart Render mux arguments without losing side streams."""
     output_format = {
         ".mkv": "matroska",
         ".mov": "mov",
@@ -737,15 +815,11 @@ def mux_final_output(
     with av.open(BytesIO(), "w", format=output_format) as probe:
         supported_codecs = probe.supported_codecs
 
-    args = [
-        "-i", str(video),
-        "-i", str(source),
-        "-map", "0:v:0",
-    ]
+    args = [*video_input_args, "-map", "0:v:0"]
     with av.open(str(source)) as container:
         primary_video_index = container.streams.video[0].index
         copied_streams = []
-        transcoded_subtitles = {}
+        transcoded_subtitles: dict[int, str] = {}
         source_formats = set(container.format.name.split(","))
         source_chapters = container.chapters()
         for stream in container.streams:
@@ -805,18 +879,18 @@ def mux_final_output(
             )
 
         for stream in copied_streams:
-            args += ["-map", f"1:{stream.index}"]
+            args += ["-map", f"{source_input_index}:{stream.index}"]
 
         args += [
-            "-map_metadata", "1",
-            "-map_metadata:s:v:0", "1:s:v:0",
-            "-map_chapters", "1",
+            "-map_metadata", str(source_input_index),
+            "-map_metadata:s:v:0", f"{source_input_index}:s:v:0",
+            "-map_chapters", str(source_input_index),
             "-c", "copy",
         ]
         for output_index, stream in enumerate(copied_streams, start=1):
             args += [
                 f"-map_metadata:s:{output_index}",
-                f"1:s:{stream.index}",
+                f"{source_input_index}:s:{stream.index}",
             ]
         audio_streams = [
             stream for stream in copied_streams if stream.type == "audio"
@@ -837,17 +911,4 @@ def mux_final_output(
     if destination.suffix.lower() in {".mp4", ".mov"}:
         tag = {"h264": "avc3", "hevc": "hev1", "av1": "av01"}[codec]
         args += ["-tag:v:0", tag, "-movflags", "+faststart"]
-    args.append(str(temporary))
-    try:
-        _run_ffmpeg(args, purpose=f"mux smart-render output {destination.name}")
-        _commit_smart_output(
-            temporary,
-            destination,
-            source=source,
-            codec=codec,
-        )
-    finally:
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            log.warning("Could not remove temporary output %s", temporary)
+    return args
