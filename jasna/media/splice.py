@@ -180,13 +180,15 @@ def _source_gop_size(index: KeyframeIndex, video_fps: Fraction) -> int | None:
 def _nvenc_h264_settings(
     profile: str,
     index: KeyframeIndex,
+    max_b_frames: int | None = None,
 ) -> dict[str, object]:
+    max_b_frames = index.max_b_frames if max_b_frames is None else max_b_frames
     return {
         "profile": H264_SMART_PROFILES[profile],
-        "bf": index.max_b_frames,
+        "bf": max_b_frames,
         "b_ref_mode": (
             "middle"
-            if index.uses_b_references and index.max_b_frames >= 2
+            if index.uses_b_references and max_b_frames >= 2
             else "disabled"
         ),
     }
@@ -195,16 +197,18 @@ def _nvenc_h264_settings(
 def _amf_h264_settings(
     profile: str,
     index: KeyframeIndex,
+    max_b_frames: int | None = None,
 ) -> dict[str, object]:
-    if index.max_b_frames > 3:
+    max_b_frames = index.max_b_frames if max_b_frames is None else max_b_frames
+    if max_b_frames > 3:
         raise SmartRenderCompatibilityError(
             "AMF H.264 smart rendering supports at most 3 consecutive B-frames; "
-            f"source uses {index.max_b_frames}"
+            f"source uses {max_b_frames}"
         )
     return {
         "profile": _AMF_H264_SMART_PROFILES[profile],
-        "bf": index.max_b_frames,
-        "bf_ref": int(index.uses_b_references and index.max_b_frames >= 2),
+        "bf": max_b_frames,
+        "bf_ref": int(index.uses_b_references and max_b_frames >= 2),
         "pa_adaptive_mini_gop": 0,
     }
 
@@ -222,6 +226,7 @@ def resolve_smart_encoder_settings(
     settings: dict[str, object],
     *,
     vendor: AcceleratorVendor,
+    h264_max_b_frames: int | None = None,
 ) -> dict[str, object]:
     resolved = dict(settings)
     source_gop_size = _source_gop_size(index, metadata.video_fps_exact)
@@ -236,8 +241,18 @@ def resolve_smart_encoder_settings(
         raise SmartRenderCompatibilityError(
             f"Smart rendering cannot match H.264 profile {metadata.profile!r}"
         )
+    max_b_frames = index.max_b_frames
+    if h264_max_b_frames is not None:
+        h264_max_b_frames = int(h264_max_b_frames)
+        if h264_max_b_frames < 0:
+            raise ValueError("h264_max_b_frames must be non-negative")
+        max_b_frames = min(max_b_frames, h264_max_b_frames)
     try:
-        h264_settings = _H264_SETTINGS_BY_VENDOR[vendor](profile, index)
+        h264_settings = _H264_SETTINGS_BY_VENDOR[vendor](
+            profile,
+            index,
+            max_b_frames,
+        )
     except KeyError as exc:
         raise SmartRenderCompatibilityError(
             f"Smart rendering is not supported on {vendor.value} encoders"
