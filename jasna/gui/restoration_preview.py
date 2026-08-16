@@ -383,7 +383,7 @@ class RestorationPreviewWorker:
         session: RestorationSession,
         detection_model,
     ) -> RestorationFrame | RestorationClip | None:
-        from queue import Empty, Queue
+        from queue import Queue
 
         from jasna.blend_buffer import BlendBuffer
         from jasna.crop_buffer import CropBuffer
@@ -393,6 +393,7 @@ class RestorationPreviewWorker:
             decode_detect_loop,
             primary_restore_loop,
             secondary_restore_loop,
+            wait_for_worker_threads,
         )
         from jasna.vram_offloader import VramOffloader
 
@@ -558,20 +559,11 @@ class RestorationPreviewWorker:
                 break
             time.sleep(0.05)
 
-        all_queues = [clip_queue, secondary_queue, encode_queue, metadata_queue]
-
-        def _drain_all_queues():
-            for q in all_queues:
-                try:
-                    while True:
-                        q.get_nowait()
-                except Empty:
-                    pass
-
-        for t in threads:
-            while t.is_alive():
-                _drain_all_queues()
-                t.join(timeout=0.02)
+        wait_for_worker_threads(
+            threads,
+            (clip_queue, secondary_queue, encode_queue, metadata_queue),
+            cancel_event,
+        )
         vram_offloader.stop()
 
         with self._cancel_lock:
