@@ -277,6 +277,49 @@ def test_preview_pass_forwards_scene_detection(monkeypatch) -> None:
     worker.close()
 
 
+def test_preview_pass_forwards_fisheye_mask_geometry(monkeypatch) -> None:
+    from jasna import blend_buffer, pipeline_threads, vr_projection, vram_offloader
+
+    class ImmediateThread:
+        def __init__(self, *, target, **_kwargs):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+        def is_alive(self):
+            return False
+
+        def join(self, timeout=None):
+            pass
+
+    decode_detect = MagicMock()
+    blend_buffer_factory = MagicMock()
+    monkeypatch.setattr(pipeline_threads, "decode_detect_loop", decode_detect)
+    monkeypatch.setattr(pipeline_threads, "primary_restore_loop", MagicMock())
+    monkeypatch.setattr(pipeline_threads, "secondary_restore_loop", MagicMock())
+    monkeypatch.setattr(pipeline_threads, "blend_encode_loop", MagicMock())
+    monkeypatch.setattr(restoration_preview.threading, "Thread", ImmediateThread)
+    monkeypatch.setattr(vram_offloader, "VramOffloader", MagicMock())
+    monkeypatch.setattr(blend_buffer, "BlendBuffer", blend_buffer_factory)
+    monkeypatch.setattr(vr_projection, "build_vr_projector", MagicMock())
+    monkeypatch.setattr(torch.cuda, "empty_cache", MagicMock())
+    worker = RestorationPreviewWorker("video.mp4", _metadata())
+    settings = AppSettings(vr_mode="sbs-fisheye")
+    worker.request(2.0, settings, projection="fisheye")
+    command = worker._commands.get_nowait()
+    session = SimpleNamespace(
+        device=torch.device("cpu"),
+        restoration_pipeline=SimpleNamespace(secondary_num_workers=1),
+    )
+
+    worker._run_preview_pass(command, session, MagicMock())
+
+    assert blend_buffer_factory.call_args.kwargs["fisheye_eye_width"] == 960
+    assert decode_detect.call_args.kwargs["fisheye_mask_geometry"] is True
+    worker.close()
+
+
 def test_restoration_worker_cancels_before_queueing_replacement() -> None:
     worker = RestorationPreviewWorker("unused.mp4", _metadata())
     order = []

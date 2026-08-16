@@ -441,7 +441,15 @@ class RestorationPreviewWorker:
         metadata_queue: Queue = Queue(maxsize=settings.max_clip_size * 5)
 
         error_holder: list[BaseException] = []
-        blend_buffer = BlendBuffer(device=session.device, vr_projector=vr_projector)
+        blend_buffer = BlendBuffer(
+            device=session.device,
+            vr_projector=vr_projector,
+            fisheye_eye_width=(
+                int(self.metadata.video_width) // 2
+                if vr_resolution.fisheye_mask_geometry
+                else None
+            ),
+        )
         crop_buffers: dict[int, CropBuffer] = {}
         crop_lock = threading.Lock()
         primary_idle_event = threading.Event()
@@ -504,6 +512,7 @@ class RestorationPreviewWorker:
                     end_pts=window.end_pts,
                     vr_mode=vr_resolution.resolved,
                     vr_projector=vr_projector,
+                    fisheye_mask_geometry=vr_resolution.fisheye_mask_geometry,
                 ),
                 name="PreviewDecodeDetect", daemon=True,
             ),
