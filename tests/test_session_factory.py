@@ -222,6 +222,12 @@ def test_build_pipeline_passes_through_config_and_session() -> None:
     assert kwargs["segments"] == segments
     assert kwargs["splice_plan"] is splice_plan
     assert kwargs["working_dir"] == Path("/scratch")
+    signature = kwargs["processing_signature"]
+    assert signature["device"] == "cuda:0"
+    assert signature["denoise_strength"] == "none"
+    assert signature["denoise_step"] == "after_primary"
+    assert signature["secondary_restoration"] == "none"
+    assert signature["vr_projection"] == "gnomonic"
 
 
 def test_build_pipeline_defaults_optional_runtime_inputs() -> None:
