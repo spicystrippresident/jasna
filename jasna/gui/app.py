@@ -573,6 +573,10 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
             self._video_player_dialog.request_close()
             return
         try:
+            self._settings_panel.persist_working_directory()
+        except Exception:
+            logger.debug("Could not persist working directory during shutdown", exc_info=True)
+        try:
             if self._processor:
                 self._processor.stop()
                 self._processor.join(timeout=5.0)
@@ -734,6 +738,7 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
         output_pattern = self._queue_panel.get_output_pattern()
         preserve_input_structure = self._queue_panel.get_preserve_input_structure()
         settings = self._settings_panel.get_settings()
+        self._settings_panel.persist_working_directory(settings.working_directory)
 
         run_log_path = self._start_run_log(
             settings,
