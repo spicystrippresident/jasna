@@ -582,7 +582,7 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
             self.destroy()
         
     def _refresh_license_chip(self):
-        from jasna.protection import license_store
+        from jasna.license_api import license_store
         licensed = license_store.is_licensed()
         self._license_chip.configure(
             text=t("license_chip_active") if licensed else t("license_chip_inactive"),
