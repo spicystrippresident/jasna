@@ -82,6 +82,36 @@ def test_auto_scan_failure_falls_back_to_full_processing(tmp_path):
     assert processor.completed_processing_path(job.id) == "full"
 
 
+def test_auto_smart_render_fallback_is_validated_as_full_processing(tmp_path):
+    source = tmp_path / "video.mp4"
+    source.touch()
+    job = JobItem(source)
+    processor = _processor(tmp_path, AppSettings())
+    processor._run_pipeline = MagicMock(return_value="full")
+    coordinator = MagicMock()
+    coordinator.run.return_value = PreScanOutcome(
+        "smart",
+        segments=(SegmentRange(10, 40),),
+        coverage=0.25,
+    )
+
+    with (
+        patch(
+            "jasna.gui.pre_scan_routing.PreScanCoordinator",
+            return_value=coordinator,
+        ),
+        patch("jasna.media.get_video_meta_data", return_value=MagicMock()),
+        patch("jasna.gui.processor._cleanup_torch"),
+    ):
+        processor._process_job(job)
+
+    assert job.status is JobStatus.COMPLETED
+    assert processor.completed_processing_path(job.id) == "full"
+    assert processor._validate_completed_video_output.call_args.kwargs[
+        "smart_render"
+    ] is False
+
+
 def test_forced_scan_failure_is_not_silently_changed_to_full(tmp_path):
     source = tmp_path / "video.mp4"
     source.touch()

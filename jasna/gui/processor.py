@@ -424,7 +424,7 @@ class Processor:
                     input_path,
                     output_path,
                     codec=(None if processing_path == "copy" else job_settings.codec),
-                    smart_render=bool(segments),
+                    smart_render=(processing_path == "smart"),
                     previous_fingerprint=previous_output_fingerprint,
                 )
 
