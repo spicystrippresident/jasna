@@ -4,6 +4,7 @@ import bisect
 import logging
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from fractions import Fraction
 from io import BytesIO
@@ -42,6 +43,208 @@ class SmartRenderCompatibilityError(ValueError):
     def __init__(self, message: str, *, reason: str = "generic") -> None:
         super().__init__(message)
         self.reason = reason
+
+
+class OutputValidationError(RuntimeError):
+    """Raised when a completed media file is absent, truncated, or inconsistent."""
+
+
+def _stream_duration_seconds(container, stream) -> float:
+    if stream.duration is not None and stream.time_base is not None:
+        return float(stream.duration * stream.time_base)
+    if container.duration is not None:
+        duration = float(container.duration / av.time_base)
+        start = _stream_start_seconds(container, stream)
+        # Matroska can expose the absolute last timestamp as the container
+        # duration when a stream starts after zero. Normalize that value to the
+        # media span used by FFprobe and by ordinary MP4/TS stream durations.
+        if start > 0.0 and duration > start:
+            duration -= start
+        return duration
+    return 0.0
+
+
+def _stream_start_seconds(container, stream) -> float:
+    if stream.start_time is not None and stream.time_base is not None:
+        return float(stream.start_time * stream.time_base)
+    if container.start_time is not None:
+        return float(container.start_time / av.time_base)
+    return 0.0
+
+
+def _source_video_contract(source: Path) -> tuple[str, float]:
+    try:
+        with av.open(str(source)) as container:
+            if not container.streams.video:
+                raise OutputValidationError(f"Source has no video stream: {source}")
+            stream = container.streams.video[0]
+            duration = _stream_duration_seconds(container, stream)
+            return _canonical_codec(stream.codec_context.name), duration
+    except OutputValidationError:
+        raise
+    except Exception as exc:
+        raise OutputValidationError(
+            f"Could not inspect source video {source}: {exc}"
+        ) from exc
+
+
+def validate_video_output(
+    path: str | Path,
+    *,
+    source: str | Path | None = None,
+    expected_codec: str | None = None,
+    expected_duration: float | None = None,
+) -> None:
+    """Perform a bounded structural and tail-read check of a completed video."""
+
+    output = Path(path)
+    try:
+        size = output.stat().st_size
+    except OSError as exc:
+        raise OutputValidationError(f"Completed output is missing: {output}") from exc
+    if not output.is_file() or size <= 0:
+        raise OutputValidationError(
+            f"Completed output is empty or not a file: {output}"
+        )
+
+    if source is not None:
+        source_codec, source_duration = _source_video_contract(Path(source))
+        if expected_codec is None:
+            expected_codec = source_codec
+        if expected_duration is None:
+            expected_duration = source_duration
+
+    try:
+        with av.open(str(output)) as container:
+            if not container.streams.video:
+                raise OutputValidationError(
+                    f"Completed output has no video stream: {output}"
+                )
+            stream = container.streams.video[0]
+            actual_codec = _canonical_codec(stream.codec_context.name)
+            if expected_codec is not None and actual_codec != _canonical_codec(
+                expected_codec
+            ):
+                raise OutputValidationError(
+                    f"Completed output codec is {actual_codec}, expected "
+                    f"{_canonical_codec(expected_codec)}: {output}"
+                )
+
+            actual_duration = _stream_duration_seconds(container, stream)
+            if actual_duration <= 0:
+                raise OutputValidationError(
+                    f"Completed output has no usable video duration: {output}"
+                )
+            if expected_duration is not None and float(expected_duration) > 0:
+                tolerance = max(0.5, min(2.0, float(expected_duration) * 0.001))
+                if abs(actual_duration - float(expected_duration)) > tolerance:
+                    raise OutputValidationError(
+                        f"Completed output duration is {actual_duration:.6f}s, expected "
+                        f"{float(expected_duration):.6f}s (+/- {tolerance:.3f}s): {output}"
+                    )
+
+            stream_start_seconds = _stream_start_seconds(container, stream)
+            seek_seconds = stream_start_seconds + max(0.0, actual_duration - 2.0)
+            container.seek(
+                int(seek_seconds * av.time_base),
+                backward=True,
+                any_frame=False,
+            )
+            tail_seconds: float | None = None
+            inspected = 0
+            for packet in container.demux(stream):
+                if packet.size <= 0:
+                    continue
+                timestamp = packet.pts if packet.pts is not None else packet.dts
+                if timestamp is None or packet.time_base is None:
+                    continue
+                packet_seconds = (
+                    float(timestamp * packet.time_base) - stream_start_seconds
+                )
+                duration_seconds = float((packet.duration or 0) * packet.time_base)
+                tail_seconds = max(
+                    tail_seconds or packet_seconds,
+                    packet_seconds + duration_seconds,
+                )
+                inspected += 1
+                if inspected >= 4096:
+                    break
+            if tail_seconds is None or tail_seconds < actual_duration - 1.0:
+                raise OutputValidationError(
+                    f"Completed output tail is missing or unreadable: {output}"
+                )
+    except OutputValidationError:
+        raise
+    except Exception as exc:
+        raise OutputValidationError(
+            f"Completed output is unreadable: {output}: {exc}"
+        ) from exc
+
+
+def _fsync_file(path: Path) -> None:
+    # Microsoft CRT _commit() ultimately needs a writable file handle. FFmpeg
+    # just created this output, so reopen it read/write only for the final flush.
+    mode = "r+b" if os.name == "nt" or sys.platform == "win32" else "rb"
+    with path.open(mode) as handle:
+        os.fsync(handle.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    # Windows does not expose directory handles through os.open. The file flush
+    # remains mandatory there; POSIX filesystems also receive a metadata barrier.
+    if os.name == "nt" or sys.platform == "win32":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(path, flags)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def sync_and_validate_final_output(
+    path: str | Path,
+    *,
+    source: str | Path | None = None,
+    expected_codec: str | None = None,
+    expected_duration: float | None = None,
+) -> None:
+    """Validate an output before and after the filesystem durability barriers."""
+
+    output = Path(path)
+    validate_video_output(
+        output,
+        source=source,
+        expected_codec=expected_codec,
+        expected_duration=expected_duration,
+    )
+    _fsync_file(output)
+    _fsync_directory(output.parent)
+    validate_video_output(
+        output,
+        source=source,
+        expected_codec=expected_codec,
+        expected_duration=expected_duration,
+    )
+
+
+def _commit_smart_output(
+    temporary: Path,
+    destination: Path,
+    *,
+    source: Path,
+    codec: str,
+) -> None:
+    """Durably commit a structurally valid smart-render temporary output."""
+
+    validate_video_output(temporary, source=source, expected_codec=codec)
+    _fsync_file(temporary)
+    os.replace(temporary, destination)
+    # Reopen the committed name as a post-rename barrier. This is especially
+    # important on Windows, where directory fsync is not available.
+    _fsync_file(destination)
+    _fsync_directory(destination.parent)
+    validate_video_output(destination, source=source, expected_codec=codec)
 
 
 @dataclass(frozen=True)
@@ -86,7 +289,7 @@ def _canonical_codec(name: str) -> str:
         return "hevc"
     if value in {"avc", "h.264"}:
         return "h264"
-    if value == "av01":
+    if value in {"av01", "libdav1d"}:
         return "av1"
     return value
 
@@ -657,11 +860,10 @@ def mux_final_output(
         tag = {"h264": "avc3", "hevc": "hev1", "av1": "av01"}[codec]
         args += ["-tag:v:0", tag, "-movflags", "+faststart"]
     args.append(str(temporary))
-    try:
-        _run_ffmpeg(args, purpose=f"mux smart-render output {destination.name}")
-        os.replace(temporary, destination)
-    finally:
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            log.warning("Could not remove temporary output %s", temporary)
+    _run_ffmpeg(args, purpose=f"mux smart-render output {destination.name}")
+    _commit_smart_output(
+        temporary,
+        destination,
+        source=source,
+        codec=codec,
+    )

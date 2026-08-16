@@ -19,6 +19,8 @@ from jasna.session_factory import RestorationSession, build_pipeline
 
 logger = logging.getLogger(__name__)
 
+_OutputFingerprint = tuple[int, int, int, int, int, int]
+
 
 @dataclass
 class ProgressUpdate:
@@ -158,6 +160,64 @@ class Processor:
                 return job
         return None
 
+    def _validate_completed_video_output(
+        self,
+        input_path: Path,
+        output_path: Path,
+        *,
+        codec: str,
+        smart_render: bool,
+        previous_fingerprint: _OutputFingerprint | None,
+    ) -> None:
+        from jasna.media.splice import (
+            sync_and_validate_final_output,
+            validate_video_output,
+        )
+
+        self._require_completed_output_changed(output_path, previous_fingerprint)
+        if smart_render:
+            # Smart-render muxing commits through _commit_smart_output, which
+            # already validates and syncs the final output before returning.
+            validate_video_output(output_path, source=input_path)
+        else:
+            sync_and_validate_final_output(
+                output_path,
+                source=input_path,
+                expected_codec=codec,
+            )
+
+    @staticmethod
+    def _output_fingerprint(path: Path) -> _OutputFingerprint | None:
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            return None
+        return (
+            int(info.st_mode),
+            int(info.st_dev),
+            int(info.st_ino),
+            int(info.st_size),
+            int(info.st_mtime_ns),
+            int(info.st_ctime_ns),
+        )
+
+    @classmethod
+    def _require_completed_output_changed(
+        cls,
+        output_path: Path,
+        previous_fingerprint: _OutputFingerprint | None,
+    ) -> None:
+        current_fingerprint = cls._output_fingerprint(output_path)
+        if current_fingerprint is None:
+            raise ValueError(f"completed output is missing: {output_path}")
+        if (
+            previous_fingerprint is not None
+            and current_fingerprint == previous_fingerprint
+        ):
+            raise ValueError(
+                f"completed output was not created or changed by this job: {output_path}"
+            )
+
     def _run(self):
         self._log("INFO", "Processing started")
 
@@ -257,9 +317,11 @@ class Processor:
                 self._log("INFO", f"Renamed output to {output_path.name} to avoid overwrite")
             # "overwrite" - just proceed and let the file be replaced
         
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
         try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            previous_output_fingerprint = (
+                self._output_fingerprint(output_path) if not is_image else None
+            )
             processing_path = "smart" if segments else "full"
             automatic_segments = False
             if is_image:
@@ -355,11 +417,19 @@ class Processor:
                 )
                 if actual_path in {"full", "smart"}:
                     processing_path = actual_path
-            if not is_image:
-                self._run_post_export_video_command(input_path, output_path)
+            if not is_image and processing_path != "copy":
+                self._validate_completed_video_output(
+                    input_path,
+                    output_path,
+                    codec=job_settings.codec,
+                    smart_render=bool(segments),
+                    previous_fingerprint=previous_output_fingerprint,
+                )
 
             self._completed_processing_paths[job.id] = processing_path
             job.output_path = output_path
+            if not is_image:
+                self._run_post_export_video_command(input_path, output_path)
             job.status = JobStatus.COMPLETED
             self._progress(ProgressUpdate(
                 job_id=job.id,
