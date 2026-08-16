@@ -13,6 +13,7 @@ from jasna.media.splice import (
     KeyframeIndex,
     SpliceSpan,
     SmartRenderCompatibilityError,
+    _commit_smart_output,
     _analyze_packet_reordering,
     _is_safe_random_access_packet,
     build_splice_plan,
@@ -332,3 +333,54 @@ def test_copy_fragment_seeks_before_demux(tmp_path: Path) -> None:
     ]
     assert packet.pts == 5
     assert packet.dts == 3
+
+
+def test_smart_output_is_validated_and_synced_around_atomic_replace(
+    tmp_path: Path,
+) -> None:
+    temporary = tmp_path / ".output.smart-render.mp4"
+    destination = tmp_path / "output.mp4"
+    source = tmp_path / "source.mp4"
+    temporary.write_bytes(b"new")
+    destination.write_bytes(b"old")
+    source.write_bytes(b"source")
+    events = []
+
+    def replace(old, new):
+        events.append(("replace", Path(old), Path(new)))
+        Path(new).write_bytes(Path(old).read_bytes())
+        Path(old).unlink()
+
+    with (
+        patch(
+            "jasna.media.splice.validate_video_output",
+            side_effect=lambda path, **_kwargs: events.append(
+                ("validate", Path(path))
+            ),
+        ),
+        patch(
+            "jasna.media.splice._fsync_file",
+            side_effect=lambda path: events.append(("fsync", Path(path))),
+        ),
+        patch(
+            "jasna.media.splice._fsync_directory",
+            side_effect=lambda path: events.append(("fsync-dir", Path(path))),
+        ),
+        patch("jasna.media.splice.os.replace", side_effect=replace),
+    ):
+        _commit_smart_output(
+            temporary,
+            destination,
+            source=source,
+            codec="h264",
+        )
+
+    assert events == [
+        ("validate", temporary),
+        ("fsync", temporary),
+        ("replace", temporary, destination),
+        ("fsync", destination),
+        ("fsync-dir", tmp_path),
+        ("validate", destination),
+    ]
+    assert destination.read_bytes() == b"new"

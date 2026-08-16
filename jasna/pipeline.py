@@ -7,7 +7,6 @@ import threading
 import time
 from pathlib import Path
 from queue import Empty, Queue
-from tempfile import TemporaryDirectory
 
 from jasna.blend_buffer import BlendBuffer
 from jasna.crop_buffer import CropBuffer
@@ -39,6 +38,7 @@ from jasna.progressbar import Progressbar
 from jasna.restorer import RestorationPipeline
 from jasna.restorer.secondary_restorer import AsyncSecondaryRestorer
 from jasna.segments import SegmentRange
+from jasna.smart_render_workspace import SmartRenderWorkspace, workspace_signature
 from jasna.vram_offloader import VramOffloader
 from jasna.vr180 import (
     SbsDetectionAdapter,
@@ -119,6 +119,22 @@ class Pipeline:
         self.scene_detection = bool(scene_detection)
         self.vr_mode = str(vr_mode)
         self.vr_projection = str(vr_projection)
+        self.detection_model_path = Path(detection_model_path)
+        self.processing_signature = {
+            "detection_model": str(detection_model_name),
+            "detection_score_threshold": float(detection_score_threshold),
+            "batch_size": int(batch_size),
+            "max_clip_size": int(max_clip_size),
+            "temporal_overlap": int(temporal_overlap),
+            "max_detection_gap": int(max_detection_gap),
+            "min_detection_duration": int(min_detection_duration),
+            "enable_crossfade": bool(enable_crossfade),
+            "scene_detection": bool(scene_detection),
+            "vr_mode": str(vr_mode),
+            "vr_projection": str(vr_projection),
+            "fp16": bool(fp16),
+            "sharpen_strength": float(sharpen_strength),
+        }
 
         self.detection_model = build_detection_model(
             detection_model_name,
@@ -639,64 +655,117 @@ class Pipeline:
         work_root = self.working_dir or self.output_video.parent
         work_root.mkdir(parents=True, exist_ok=True)
 
-        try:
-            with TemporaryDirectory(
-                dir=work_root,
-                prefix=f".{self.output_video.stem}.segments-",
-            ) as temp_dir_name:
-                temp_dir = Path(temp_dir_name)
-                fragments: list[tuple[Path, float]] = []
-                fragment_suffix = ".ts" if codec in {"h264", "hevc"} else ".mkv"
-                for span_index, span in enumerate(plan.spans):
-                    if self._cancel_event.is_set():
-                        return
-                    raw = temp_dir / f"{span_index:04d}-raw.nut"
-                    normalized = temp_dir / f"{span_index:04d}{fragment_suffix}"
-                    duration = float((span.end_pts - span.start_pts) * index.time_base)
-                    if span.is_render:
-                        encoder_ctx = NvidiaVideoEncoder(
-                            str(raw),
-                            device=self.device,
-                            metadata=metadata,
-                            codec=codec,
-                            encoder_settings=smart_encoder_settings,
-                            lut_path=self.lut_path,
-                            sharpen_strength=self.sharpen_strength,
-                            output_fps=metadata.video_fps_exact,
-                            mux_audio=False,
-                            pts_origin=span.start_pts,
-                            match_input_bit_depth=True,
-                            smart_fragment=True,
-                        )
-                        self._run_pass(
-                            metadata=metadata,
-                            encoder_ctx=encoder_ctx,
-                            progress=progress,
-                            seek_ts=index.seconds_for_pts(span.start_pts),
-                            end_pts=span.end_pts,
-                            effect_ranges=span.effect_ranges,
-                            output_frame_count=max(1, round(duration * metadata.video_fps)),
-                        )
-                    else:
-                        create_copy_fragment(self.input_video, span, index, raw, codec=codec)
-                    normalize_fragment(raw, normalized, codec=codec)
-                    fragments.append((normalized, duration))
+        vr_resolution = getattr(self, "_vr_resolution", None)
+        resolved_projection = (
+            vr_resolution.projection
+            if vr_resolution is not None
+            else getattr(self, "vr_projection", "auto")
+        )
+        signature = workspace_signature(
+            source=self.input_video,
+            output=self.output_video,
+            plan=plan,
+            processing=getattr(self, "processing_signature", {}),
+            model_files={
+                "detection": getattr(self, "detection_model_path", None),
+                "restoration": getattr(
+                    getattr(
+                        getattr(self, "restoration_pipeline", None),
+                        "restorer",
+                        None,
+                    ),
+                    "checkpoint_path",
+                    None,
+                ),
+                "lut": self.lut_path,
+            },
+            codec=codec,
+            encoder_settings=smart_encoder_settings,
+            resolved_projection=resolved_projection,
+        )
+        workspace = SmartRenderWorkspace.open(
+            work_root,
+            output=self.output_video,
+            signature=signature,
+        )
 
+        try:
+            fragments: list[tuple[Path, float]] = []
+            fragment_suffix = ".ts" if codec in {"h264", "hevc"} else ".mkv"
+            for span_index, span in enumerate(plan.spans):
                 if self._cancel_event.is_set():
                     return
-                assembled = temp_dir / f"assembled{fragment_suffix}"
-                concatenate_fragments(
-                    fragments,
-                    manifest=temp_dir / "fragments.ffconcat",
-                    destination=assembled,
-                    codec=codec,
-                )
-                mux_final_output(
-                    assembled,
-                    self.input_video,
-                    self.output_video,
-                    codec=codec,
-                )
+                duration = float((span.end_pts - span.start_pts) * index.time_base)
+                expected_frames = max(1, round(duration * metadata.video_fps))
+                reusable = workspace.reusable_fragment(span_index)
+                if reusable is not None:
+                    log.info("Reusing smart-render span %s from %s", span_index, reusable)
+                    fragments.append((reusable, duration))
+                    if span.is_render:
+                        progress.mark_completed(expected_frames)
+                    continue
+
+                workspace.mark_running(span_index)
+                raw = workspace.raw_path(span_index)
+                normalized = workspace.fragment_path(span_index, fragment_suffix)
+                raw.unlink(missing_ok=True)
+                normalized.unlink(missing_ok=True)
+                if span.is_render:
+                    encoder_ctx = NvidiaVideoEncoder(
+                        str(raw),
+                        device=self.device,
+                        metadata=metadata,
+                        codec=codec,
+                        encoder_settings=smart_encoder_settings,
+                        lut_path=self.lut_path,
+                        sharpen_strength=self.sharpen_strength,
+                        output_fps=metadata.video_fps_exact,
+                        mux_audio=False,
+                        pts_origin=span.start_pts,
+                        match_input_bit_depth=True,
+                        smart_fragment=True,
+                    )
+                    self._run_pass(
+                        metadata=metadata,
+                        encoder_ctx=encoder_ctx,
+                        progress=progress,
+                        seek_ts=index.seconds_for_pts(span.start_pts),
+                        end_pts=span.end_pts,
+                        effect_ranges=span.effect_ranges,
+                        output_frame_count=expected_frames,
+                    )
+                else:
+                    create_copy_fragment(
+                        self.input_video,
+                        span,
+                        index,
+                        raw,
+                        codec=codec,
+                    )
+                if self._cancel_event.is_set():
+                    return
+                normalize_fragment(raw, normalized, codec=codec)
+                workspace.mark_complete(span_index, normalized)
+                raw.unlink(missing_ok=True)
+                fragments.append((normalized, duration))
+
+            if self._cancel_event.is_set():
+                return
+            assembled = workspace.path / f"assembled{fragment_suffix}"
+            assembled.unlink(missing_ok=True)
+            concatenate_fragments(
+                fragments,
+                manifest=workspace.path / "fragments.ffconcat",
+                destination=assembled,
+                codec=codec,
+            )
+            mux_final_output(
+                assembled,
+                self.input_video,
+                self.output_video,
+                codec=codec,
+            )
+            workspace.cleanup()
         finally:
             progress.close(ensure_completed_bar=True)
 
