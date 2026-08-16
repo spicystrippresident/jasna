@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import logging
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -16,7 +17,7 @@ from jasna.frame_queue import FrameQueue
 import psutil
 import torch
 
-from jasna.accelerator import vendor_for_device
+from jasna.accelerator import AcceleratorVendor, vendor_for_device
 from jasna.media import UnsupportedColorspaceError, get_video_meta_data
 from jasna.media.video_encoder import NvidiaVideoEncoder
 from jasna.media.frame_rate import resolve_frame_rate_retarget
@@ -621,6 +622,17 @@ class Pipeline:
             index,
             self.encoder_settings,
             vendor=vendor_for_device(self.device),
+            # AMF 1.4.37 rejects the source's four-B-frame configuration on
+            # large Linux inputs. Closed GOP + forced IDR allow the short
+            # rendered transition spans to use P-frames and remain safe to
+            # splice with the untouched copied spans.
+            h264_max_b_frames=(
+                0
+                if codec == "h264"
+                and sys.platform == "linux"
+                and vendor_for_device(self.device) is AcceleratorVendor.AMD
+                else None
+            ),
         )
         total_frames = max(
             1,

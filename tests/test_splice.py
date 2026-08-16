@@ -187,6 +187,68 @@ def test_smart_h264_amf_rejects_more_than_three_b_frames() -> None:
         )
 
 
+def test_smart_h264_amf_can_limit_rendered_spans_to_p_frames() -> None:
+    index = KeyframeIndex(
+        (0, 60, 120),
+        Fraction(1, 30),
+        0,
+        180,
+        max_b_frames=4,
+        uses_b_references=True,
+    )
+
+    settings = resolve_smart_encoder_settings(
+        "h264",
+        _metadata("h264", profile="High"),
+        index,
+        {"cq": 22},
+        vendor=AcceleratorVendor.AMD,
+        h264_max_b_frames=0,
+    )
+
+    assert settings == {
+        "cq": 22,
+        "profile": "high",
+        "g": 60,
+        "bf": 0,
+        "bf_ref": 0,
+        "pa_adaptive_mini_gop": 0,
+    }
+
+
+def test_smart_h264_b_frame_limit_does_not_raise_source_setting() -> None:
+    index = KeyframeIndex(
+        (0, 60, 120),
+        Fraction(1, 30),
+        0,
+        180,
+        max_b_frames=3,
+        uses_b_references=False,
+    )
+    settings = resolve_smart_encoder_settings(
+        "h264",
+        _metadata("h264"),
+        index,
+        {},
+        vendor=AcceleratorVendor.NVIDIA,
+        h264_max_b_frames=4,
+    )
+
+    assert settings["bf"] == 3
+
+
+def test_smart_h264_rejects_negative_b_frame_limit() -> None:
+    with pytest.raises(ValueError, match="must be non-negative"):
+        resolve_smart_encoder_settings(
+            "h264",
+            _metadata("h264"),
+            _index(),
+            {},
+            vendor=AcceleratorVendor.AMD,
+            h264_max_b_frames=-1,
+        )
+
+
 @pytest.mark.parametrize("codec", ["hevc", "av1"])
 @pytest.mark.parametrize(
     "vendor",

@@ -64,7 +64,9 @@ What works with segment processing:
 - NVIDIA and AMD GPUs.
 - One video at a time (no folders, images, or streaming).
 - H.264, HEVC, or AV1 input with constant frame rate; MP4, MOV, or MKV output.
-- On AMD, H.264 sources with more than three consecutive B-frames are not supported.
+- On Linux AMD, rendered H.264 transition spans use P-frames for compatibility
+  with current AMF runtimes; copied spans keep the source stream unchanged.
+  Other platforms retain the existing source-matched B-frame policy.
 - The output codec always matches the input codec.
 - Cannot be combined with `--retarget-high-fps`.
 - Cannot be combined with `--fmp4`; the output is assembled after processing finishes.
