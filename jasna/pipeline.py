@@ -102,6 +102,7 @@ class Pipeline:
         segments: tuple[SegmentRange, ...] | None = None,
         splice_plan: SplicePlan | None = None,
         working_dir: Path | None = None,
+        processing_signature: dict[str, object] | None = None,
     ) -> None:
         self.input_video = input_video
         self.output_video = output_video
@@ -119,7 +120,7 @@ class Pipeline:
         self.vr_mode = str(vr_mode)
         self.vr_projection = str(vr_projection)
         self.detection_model_path = Path(detection_model_path)
-        self.processing_signature = {
+        self.processing_signature = dict(processing_signature or {
             "detection_model": str(detection_model_name),
             "detection_score_threshold": float(detection_score_threshold),
             "batch_size": int(batch_size),
@@ -133,7 +134,7 @@ class Pipeline:
             "vr_projection": str(vr_projection),
             "fp16": bool(fp16),
             "sharpen_strength": float(sharpen_strength),
-        }
+        })
 
         self.detection_model = build_detection_model(
             detection_model_name,
@@ -745,7 +746,10 @@ class Pipeline:
                     return
                 normalize_fragment(raw, normalized, codec=codec)
                 workspace.mark_complete(span_index, normalized)
-                raw.unlink(missing_ok=True)
+                try:
+                    raw.unlink(missing_ok=True)
+                except OSError:
+                    log.warning("Could not clean raw smart-render span %s", raw)
                 fragments.append((normalized, duration))
 
             if self._cancel_event.is_set():
@@ -757,7 +761,13 @@ class Pipeline:
                 manifest=workspace.path / "fragments.ffconcat",
                 codec=codec,
             )
-            workspace.cleanup()
+            try:
+                workspace.cleanup()
+            except OSError:
+                log.warning(
+                    "Could not clean completed smart-render workspace %s",
+                    workspace.path,
+                )
         finally:
             progress.close(ensure_completed_bar=True)
 
