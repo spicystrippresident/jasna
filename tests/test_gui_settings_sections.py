@@ -74,6 +74,7 @@ def _fake_section_widgets() -> dict:
         "min_detection_duration": _FakeWidget(2),
         "scene_detection": _FakeWidget(0),
         "enable_crossfade": _FakeWidget(0),
+        "save_run_log": _FakeWidget(0),
         "vr_mode": _FakeValueMenu({"auto": "自動", "off": "オフ"}, "off"),
         "denoise_strength": _FakeValueMenu({"none": "なし", "high": "高"}, "high"),
         "denoise_step": _FakeValueMenu({"after_primary": "一", "after_secondary": "二"}, "after_secondary"),
@@ -358,7 +359,7 @@ def test_settings_panel_get_settings_is_locale_independent(monkeypatch, tmp_path
         from jasna.gui.settings_panel import SettingsPanel
 
         panel = SettingsPanel(root)
-        assert panel.get_settings() == replace(AppSettings(), encoder_cq=28)
+        assert panel.get_settings() == replace(AppSettings(), encoder_cq=25)
         assert panel._saved_preset_settings == panel.get_settings()
     finally:
         root.destroy()
