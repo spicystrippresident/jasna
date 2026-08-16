@@ -193,6 +193,34 @@ class TestPipelineRun:
 
         assert encoder_cls.call_args.kwargs["fmp4"] is True
 
+    def test_full_render_matches_input_bit_depth(self):
+        p = _make_pipeline()
+
+        reader_cls, _, _ = _make_two_readers([])
+        mock_encoder = MagicMock()
+        mock_encoder.__enter__ = MagicMock(return_value=mock_encoder)
+        mock_encoder.__exit__ = MagicMock(return_value=False)
+
+        with (
+            patch("jasna.pipeline.get_video_meta_data", return_value=_fake_metadata()),
+            patch("jasna.pipeline_threads.NvidiaVideoReader", reader_cls),
+            patch(
+                "jasna.pipeline.NvidiaVideoEncoder",
+                return_value=mock_encoder,
+            ) as encoder_cls,
+            patch("jasna.pipeline_threads.torch.cuda.set_device"),
+            patch(
+                "jasna.pipeline_threads.torch.inference_mode",
+                return_value=MagicMock(
+                    __enter__=MagicMock(),
+                    __exit__=MagicMock(return_value=False),
+                ),
+            ),
+        ):
+            p.run()
+
+        assert encoder_cls.call_args.kwargs["match_input_bit_depth"] is True
+
     def test_fmp4_is_dropped_for_segment_processing(self):
         p = _make_pipeline()
         p.fmp4 = True
