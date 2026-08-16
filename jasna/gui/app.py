@@ -415,7 +415,7 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
             while not self._system_stats_stop.is_set():
                 stats = read_system_stats()
                 try:
-                    self.after(0, lambda s=stats: self._control_bar.set_system_stats(s))
+                    self.after(0, lambda s=stats: self._apply_system_stats(s))
                 except Exception:
                     logger.debug("System stats poller stopping (widget gone)", exc_info=True)
                     return
@@ -423,6 +423,13 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
         self._system_stats_thread = threading.Thread(target=_loop, daemon=True)
         self._system_stats_thread.start()
+
+    def _apply_system_stats(self, stats) -> None:
+        self._control_bar.set_system_stats(stats)
+        # Total VRAM is immutable while Jasna is running. Keep the last known
+        # value if a later telemetry sample times out.
+        if stats.total_vram_bytes is not None:
+            self._settings_panel.set_total_vram_bytes(stats.total_vram_bytes)
 
     def _stop_system_stats_poller(self):
         self._system_stats_stop.set()

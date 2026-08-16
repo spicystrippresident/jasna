@@ -15,6 +15,7 @@ from jasna.gui.components import (
     Tooltip,
 )
 from jasna.gui.icons import NativeIconButton
+from jasna.gui.hardware_policy import recommended_detection_batch_size
 from jasna.gui.locales import t
 from jasna.gui.settings_sections.advanced import (
     TEMPORAL_FILTER_SLIDER_MAX,
@@ -47,6 +48,7 @@ class SettingsPanel(ctk.CTkFrame):
         self._applying_preset = False  # Flag to prevent modification tracking during apply
         self._widgets: dict = {}
         self._on_interactive_image_restore: callable | None = None
+        self._total_vram_bytes: int | None = None
 
         self._build_preset_bar()
         self._build_scrollable()
@@ -204,7 +206,12 @@ class SettingsPanel(ctk.CTkFrame):
         """Update dropdown text to show modified status."""
         current_settings = self.get_settings()
         if self._saved_preset_settings:
-            self._is_modified = asdict(current_settings) != asdict(self._saved_preset_settings)
+            current_values = asdict(current_settings)
+            saved_values = asdict(self._saved_preset_settings)
+            # The hidden hardware-derived batch is not a user preset value.
+            current_values.pop("batch_size", None)
+            saved_values.pop("batch_size", None)
+            self._is_modified = current_values != saved_values
         else:
             self._is_modified = False
 
@@ -364,9 +371,19 @@ class SettingsPanel(ctk.CTkFrame):
         values: dict = {}
         for section in self._sections:
             values.update(section.collect())
+        batch_size = recommended_detection_batch_size(
+            values.get("detection_model", AppSettings.detection_model),
+            self._total_vram_bytes,
+        )
         return AppSettings(
-            batch_size=4,  # Fixed default value
+            batch_size=batch_size,
             **values,
+        )
+
+    def set_total_vram_bytes(self, total_vram_bytes: int | None) -> None:
+        """Update telemetry used by the hidden hardware-derived default."""
+        self._total_vram_bytes = (
+            int(total_vram_bytes) if total_vram_bytes is not None else None
         )
 
     def set_enabled(self, enabled: bool):
