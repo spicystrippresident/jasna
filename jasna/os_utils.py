@@ -54,6 +54,13 @@ def _find_bundled_executable(name: str) -> Path | None:
     return None
 
 
+def _find_source_executable(name: str) -> Path | None:
+    if is_frozen() or name not in {"ffmpeg", "ffprobe"}:
+        return None
+    candidate = Path(__file__).resolve().parent.parent / "tools" / _bundled_exe_filename(name)
+    return candidate if candidate.is_file() else None
+
+
 _COMMON_EXECUTABLE_LOCATIONS: dict[str, tuple[str, ...]] = {
     "nvidia-smi": (
         # Windows
@@ -79,6 +86,9 @@ def find_executable(name: str) -> str | None:
     bundled = _find_bundled_executable(name)
     if bundled is not None:
         return str(bundled)
+    source_tool = _find_source_executable(name)
+    if source_tool is not None:
+        return str(source_tool)
     found = shutil.which(name)
     if found is not None:
         return found
