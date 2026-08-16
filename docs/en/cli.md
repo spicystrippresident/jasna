@@ -209,17 +209,17 @@ Per-codec extras:
 
 | Key | What it does |
 | --- | ------------ |
-| `cq` | Quality target passed unchanged as AMF's `qvbr_quality_level`. Lower = better. Range 0–51; defaults 24 (H.264), 25 (HEVC), 32 (AV1). |
+| `cq` | Portable quality target; lower = better. H.264/AV1 pass it unchanged as `qvbr_quality_level`. HEVC full renders use it unchanged as CQP I/P QP; Linux AMD HEVC Smart Render fragments use `CQ + 2`, capped to 0–51, to avoid the unstable fragment QVBR path. Range 0–51; defaults 24 (H.264), 25 (HEVC), 32 (AV1). |
 | `qvbr_quality_level` | AMF's native alias. Accepted in CLI advanced settings when `--cq` is omitted; not accepted in the GUI custom-args field. |
 | `usage` | Encoder usage profile. Default `high_quality`. |
 | `quality` | Speed/quality preset: `speed`, `balanced`, `quality` (default). |
-| `rc` | Rate-control mode. Default `qvbr`. |
+| `rc` | Rate-control mode. Defaults to `qvbr` for H.264/AV1 and `cqp` for HEVC. |
 | `preset` | AMF preset. |
 | `g` | Keyframe interval in frames. Default 250. |
 | `bf` | Max consecutive B-frames. |
-| `preanalysis` | Pre-analysis pass, enabled by default. |
+| `preanalysis` | Pre-analysis pass. Enabled by default for H.264/AV1; disabled for the default HEVC CQP path and Linux AMD HEVC Smart Render fragments. |
 | `vbaq` | Variance-based adaptive quantization, enabled by default. |
-| `maxrate` / `bufsize` | Bitrate cap and VBV buffer size, in bits per second. Set automatically from the source bitrate unless you pass `maxrate`. |
+| `maxrate` / `bufsize` | Bitrate cap and VBV buffer size, in bits per second. Source-derived when the selected rate-control mode supports a ceiling; the default HEVC CQP path does not use a VBV cap. |
 | `profile` / `level` | Codec profile and level. |
 
 Per-codec extras:
