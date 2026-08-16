@@ -42,12 +42,17 @@ from jasna.segments import SegmentRange, normalize_segments
 
 
 PRE_SCAN_SCHEMA_VERSION = 1
-PRE_SCAN_ALGORITHM_VERSION = "jasna-pre-scan-v3-sample-grid-ranges"
+PRE_SCAN_ALGORITHM_VERSION = "jasna-pre-scan-v4-short-range-confidence"
 CHECKPOINT_SAMPLE_BATCH = 256
 CHECKPOINT_MAX_SECONDS = 30.0
-TIMELINE_HEAD_TAIL_PAD_SECONDS = 5.0
-TIMELINE_MERGE_GAP_SECONDS = 30.0
-TIMELINE_MIN_SEGMENT_SECONDS = 30.0
+TIMELINE_PAD_AUTO = "auto"
+TIMELINE_PAD_AUTO_MIN_SECONDS = 0.5
+TIMELINE_PAD_AUTO_MAX_SECONDS = 1.0
+TIMELINE_MERGE_GAP_SECONDS = 0.0
+SHORT_CANDIDATE_IGNORE_SECONDS = 1.0
+SHORT_CANDIDATE_MAX_SECONDS = 10.0
+SHORT_CANDIDATE_HIGH_CONFIDENCE = 0.90
+SHORT_CANDIDATE_CORE_SECONDS = 2.0
 
 PreScanPath = Literal["full", "smart", "copy"]
 
@@ -203,33 +208,29 @@ def normalize_scan_segments(
     segments: tuple[SegmentRange, ...] | list[SegmentRange],
     *,
     duration: float,
-    pad_seconds: float = TIMELINE_HEAD_TAIL_PAD_SECONDS,
+    pad_seconds: float,
     merge_gap_seconds: float = TIMELINE_MERGE_GAP_SECONDS,
-    min_segment_seconds: float = TIMELINE_MIN_SEGMENT_SECONDS,
 ) -> tuple[SegmentRange, ...]:
-    """Apply the established 0.9.1 timeline pad/minimum/merge rules."""
+    """Pad precise ranges and merge only overlapping/touching results."""
 
     duration = float(duration)
     if duration <= 0 or not segments:
         return ()
+    pad_seconds = float(pad_seconds)
+    merge_gap_seconds = float(merge_gap_seconds)
+    if not math.isfinite(pad_seconds) or pad_seconds < 0:
+        raise ValueError("scan range padding must be finite and non-negative")
+    if not math.isfinite(merge_gap_seconds) or merge_gap_seconds < 0:
+        raise ValueError("scan range merge gap must be finite and non-negative")
     padded: list[SegmentRange] = []
     for segment in normalize_segments(tuple(segments), duration=duration):
-        start = max(0.0, segment.start - float(pad_seconds))
-        end = min(duration, segment.end + float(pad_seconds))
-        missing = max(0.0, float(min_segment_seconds) - (end - start))
-        if missing:
-            start = max(0.0, start - missing / 2.0)
-            end = min(duration, end + missing / 2.0)
-            if end - start < min_segment_seconds:
-                if start <= 0.0:
-                    end = min(duration, float(min_segment_seconds))
-                elif end >= duration:
-                    start = max(0.0, duration - float(min_segment_seconds))
+        start = max(0.0, segment.start - pad_seconds)
+        end = min(duration, segment.end + pad_seconds)
         padded.append(SegmentRange(start, end))
 
     merged: list[SegmentRange] = []
     for segment in sorted(padded):
-        if merged and segment.start <= merged[-1].end + float(merge_gap_seconds):
+        if merged and segment.start <= merged[-1].end + merge_gap_seconds:
             previous = merged[-1]
             merged[-1] = SegmentRange(previous.start, max(previous.end, segment.end))
         else:
@@ -255,14 +256,107 @@ def precise_scan_segments(
     result: MosaicScanResult,
     *,
     threshold: float,
+    pad_seconds: float | None = None,
 ) -> tuple[SegmentRange, ...]:
-    """Build safe restoration ranges directly from the precise sample grid.
+    """Build restoration ranges from the precise sample grid."""
 
-    A precise scan already limits boundary uncertainty to one configured sample
-    interval.  The established five-second padding, minimum-duration, and merge
-    rules dominate that uncertainty, so per-frame boundary re-scanning adds
-    substantial decode cost without a meaningful change to the restored range.
-    """
+    _sampled, _filtered, normalized = _precise_scan_segment_stages(
+        result,
+        threshold=threshold,
+        pad_seconds=pad_seconds,
+    )
+    return normalized
+
+
+def resolve_timeline_pad_seconds(value: object, *, fine_interval: float) -> float:
+    """Resolve Auto padding to the precise interval, clamped to 0.5-1.0s."""
+
+    text = str(value).strip().lower()
+    if text == TIMELINE_PAD_AUTO:
+        interval = float(fine_interval)
+        if not math.isfinite(interval) or interval <= 0:
+            raise ValueError("precise scan interval must be finite and positive")
+        return min(
+            TIMELINE_PAD_AUTO_MAX_SECONDS,
+            max(TIMELINE_PAD_AUTO_MIN_SECONDS, interval),
+        )
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("scan range padding must be Auto or a number") from exc
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError("scan range padding must be finite and non-negative")
+    return seconds
+
+
+def _has_sustained_high_confidence_core(
+    result: MosaicScanResult,
+    segment: SegmentRange,
+    *,
+    threshold: float = SHORT_CANDIDATE_HIGH_CONFIDENCE,
+    core_seconds: float = SHORT_CANDIDATE_CORE_SECONDS,
+) -> bool:
+    stride = float(result.stride)
+    epsilon = max(1e-9, stride * 0.01)
+    run_start: float | None = None
+    run_end: float | None = None
+    for seconds, score in zip(result.times, result.scores):
+        seconds = float(seconds)
+        if seconds < segment.start - epsilon:
+            continue
+        if seconds >= segment.end - epsilon:
+            break
+        sample_start = max(segment.start, seconds)
+        sample_end = min(segment.end, seconds + stride)
+        if float(score) >= float(threshold) and sample_end > sample_start:
+            if run_start is None or run_end is None or sample_start > run_end + epsilon:
+                run_start = sample_start
+                run_end = sample_end
+            else:
+                run_end = max(run_end, sample_end)
+            if run_end - run_start + epsilon >= float(core_seconds):
+                return True
+        else:
+            run_start = None
+            run_end = None
+    return False
+
+
+def filter_short_scan_candidates(
+    result: MosaicScanResult,
+    segments: tuple[SegmentRange, ...] | list[SegmentRange],
+    *,
+    detection_threshold: float,
+) -> tuple[SegmentRange, ...]:
+    """Reject isolated or weak short candidates before padding."""
+
+    high_threshold = max(float(detection_threshold), SHORT_CANDIDATE_HIGH_CONFIDENCE)
+    kept: list[SegmentRange] = []
+    for segment in segments:
+        if segment.duration <= SHORT_CANDIDATE_IGNORE_SECONDS + 1e-9:
+            continue
+        if segment.duration > SHORT_CANDIDATE_MAX_SECONDS + 1e-9:
+            kept.append(segment)
+            continue
+        if _has_sustained_high_confidence_core(
+            result,
+            segment,
+            threshold=high_threshold,
+        ):
+            kept.append(segment)
+    return tuple(kept)
+
+
+def _precise_scan_segment_stages(
+    result: MosaicScanResult,
+    *,
+    threshold: float,
+    pad_seconds: float | None,
+) -> tuple[
+    tuple[SegmentRange, ...],
+    tuple[SegmentRange, ...],
+    tuple[SegmentRange, ...],
+]:
 
     sampled = segments_from_scores(
         result.times,
@@ -272,7 +366,22 @@ def precise_scan_segments(
         duration=result.duration,
         pad=0.0,
     )
-    return normalize_scan_segments(sampled, duration=result.duration)
+    filtered = filter_short_scan_candidates(
+        result,
+        sampled,
+        detection_threshold=threshold,
+    )
+    resolved_pad = (
+        resolve_timeline_pad_seconds(TIMELINE_PAD_AUTO, fine_interval=result.stride)
+        if pad_seconds is None
+        else float(pad_seconds)
+    )
+    normalized = normalize_scan_segments(
+        filtered,
+        duration=result.duration,
+        pad_seconds=resolved_pad,
+    )
+    return sampled, filtered, normalized
 
 
 class _ScanCheckpointStore:
@@ -526,6 +635,10 @@ def _checkpoint_signature(
 
     model_name = coerce_detection_model_name(str(settings.detection_model))
     model_path = require_detection_model_weights(model_name)
+    resolved_pad_seconds = resolve_timeline_pad_seconds(
+        settings.pre_scan_pad_seconds,
+        fine_interval=float(settings.pre_scan_fine_interval),
+    )
     return {
         "algorithm_version": PRE_SCAN_ALGORITHM_VERSION,
         "source": source_identity(source),
@@ -548,10 +661,18 @@ def _checkpoint_signature(
                 "coverage_policy": "duration-weighted-midpoints-v1",
             },
             "vr_mode": str(settings.vr_mode),
-            "pad_seconds": TIMELINE_HEAD_TAIL_PAD_SECONDS,
+            "pad_seconds": {
+                "configured": str(settings.pre_scan_pad_seconds),
+                "resolved": resolved_pad_seconds,
+            },
             "merge_gap_seconds": TIMELINE_MERGE_GAP_SECONDS,
-            "min_segment_seconds": TIMELINE_MIN_SEGMENT_SECONDS,
-            "precise_range_policy": "sample-grid-plus-normalization-v1",
+            "short_candidate_policy": {
+                "ignore_at_or_below_seconds": SHORT_CANDIDATE_IGNORE_SECONDS,
+                "high_confidence_at_or_below_seconds": SHORT_CANDIDATE_MAX_SECONDS,
+                "high_confidence_threshold": SHORT_CANDIDATE_HIGH_CONFIDENCE,
+                "high_confidence_core_seconds": SHORT_CANDIDATE_CORE_SECONDS,
+            },
+            "precise_range_policy": "confidence-filter-plus-sample-padding-v2",
         },
     }
 
@@ -691,7 +812,23 @@ class PreScanCoordinator:
             fine_interval,
             seed_samples=coarse_known,
         )
-        normalized = precise_scan_segments(fine, threshold=threshold)
+        try:
+            pad_seconds = resolve_timeline_pad_seconds(
+                self.settings.pre_scan_pad_seconds,
+                fine_interval=fine_interval,
+            )
+        except ValueError as exc:
+            raise PreScanFailed(str(exc)) from exc
+        sampled, filtered, normalized = _precise_scan_segment_stages(
+            fine,
+            threshold=threshold,
+            pad_seconds=pad_seconds,
+        )
+        self._log(
+            "INFO",
+            f"精扫候选区间：{len(sampled)}；短命中过滤后：{len(filtered)}；"
+            f"扩边：前后各 {pad_seconds:g} 秒",
+        )
         coverage = segment_coverage(normalized, float(self.metadata.duration))
         self._log("INFO", f"最终有码覆盖率：{coverage:.1%}")
         if not normalized:

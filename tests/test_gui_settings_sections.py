@@ -87,6 +87,17 @@ def _fake_section_widgets() -> dict:
             {"0.25": "0.25 s", "0.5": "0.5 s", "1.0": "1.0 s"},
             "0.5",
         ),
+        "pre_scan_pad_seconds": _FakeValueMenu(
+            {
+                "auto": "Auto",
+                "0.0": "None",
+                "0.5": "0.5 s",
+                "1.0": "1.0 s",
+                "2.0": "2.0 s",
+                "5.0": "5.0 s",
+            },
+            "auto",
+        ),
         "compile_basicvsrpp": _FakeWidget(1),
         "file_conflict": _FakeValueMenu({"auto_rename": "A", "overwrite": "B", "skip": "C"}, "skip"),
         "temporal_overlap": _FakeWidget(8),
@@ -149,6 +160,7 @@ def test_sections_collect_internal_values_without_translation_lookups() -> None:
     assert values["pre_scan_full_threshold"] == pytest.approx(0.85)
     assert values["pre_scan_coarse_interval"] == pytest.approx(4.0)
     assert values["pre_scan_fine_interval"] == pytest.approx(0.5)
+    assert values["pre_scan_pad_seconds"] == "auto"
     assert values["vr_mode"] == "off"
     assert values["denoise_strength"] == "high"
     assert values["denoise_step"] == "after_secondary"
@@ -171,6 +183,7 @@ def test_sections_collect_internal_values_without_translation_lookups() -> None:
 
 def test_auto_coarse_scan_defaults_to_four_seconds() -> None:
     assert AppSettings().pre_scan_coarse_interval == pytest.approx(4.0)
+    assert AppSettings().pre_scan_pad_seconds == "auto"
     assert 4.0 in PRE_SCAN_COARSE_INTERVALS
 
 
