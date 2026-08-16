@@ -163,3 +163,40 @@ def test_split_forward_path_used_when_available(monkeypatch) -> None:
     assert len(captured) == 1
     assert captured[0].shape == (1, 1, 3, br.INFERENCE_SIZE, br.INFERENCE_SIZE)
     assert model.captured_inputs is None
+
+
+def test_independent_batch_safety_policy_is_amd_only(monkeypatch) -> None:
+    import jasna.restorer.basicvsrpp_mosaic_restorer as br
+
+    monkeypatch.setattr(
+        br,
+        "load_model",
+        lambda config, checkpoint_path, device, fp16: _CaptureIdentityModel(),
+    )
+    monkeypatch.setattr(br, "is_amd_device", lambda _device: True)
+    amd_restorer = br.BasicvsrppMosaicRestorer(
+        checkpoint_path="unused.pth",
+        device=torch.device("cuda:0"),
+        max_clip_size=60,
+        use_tensorrt=False,
+        fp16=False,
+    )
+
+    assert amd_restorer.independent_clip_batch_size == 2
+    assert amd_restorer.independent_clip_batch_min_frames == 60
+    assert amd_restorer.independent_clip_batch_max_padding_frames == 4
+    assert amd_restorer.independent_clip_batch_min_free_bytes == 768 * 1024**2
+
+    monkeypatch.setattr(br, "is_amd_device", lambda _device: False)
+    nvidia_restorer = br.BasicvsrppMosaicRestorer(
+        checkpoint_path="unused.pth",
+        device=torch.device("cuda:0"),
+        max_clip_size=60,
+        use_tensorrt=False,
+        fp16=False,
+    )
+
+    assert nvidia_restorer.independent_clip_batch_size == 1
+    assert nvidia_restorer.independent_clip_batch_min_frames == 0
+    assert nvidia_restorer.independent_clip_batch_max_padding_frames == 0
+    assert nvidia_restorer.independent_clip_batch_min_free_bytes == 0

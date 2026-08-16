@@ -138,6 +138,19 @@ class TestPipelineColorspaceCheck:
 
 
 class TestPipelineRun:
+    def test_primary_clip_queue_capacity_tracks_rocm_batch_only(self, monkeypatch):
+        import jasna.pipeline as pipeline_module
+
+        pipeline = _make_pipeline()
+        pipeline.max_clip_size = 60
+        pipeline.restoration_pipeline.independent_clip_batch_size = 2
+
+        monkeypatch.setattr(pipeline_module, "is_amd_device", lambda _device: True)
+        assert pipeline._primary_clip_queue_capacity() == 120
+
+        monkeypatch.setattr(pipeline_module, "is_amd_device", lambda _device: False)
+        assert pipeline._primary_clip_queue_capacity() == 60
+
     def test_retarget_high_fps_propagates_to_both_readers_encoder_and_progress(self):
         p = _make_pipeline()
         p.retarget_high_fps = True

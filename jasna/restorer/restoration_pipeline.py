@@ -61,6 +61,32 @@ class RestorationPipeline:
             int(getattr(self.restorer, "independent_clip_batch_min_frames", 0)),
         )
 
+    @property
+    def independent_clip_batch_max_padding_frames(self) -> int:
+        return max(
+            0,
+            int(
+                getattr(
+                    self.restorer,
+                    "independent_clip_batch_max_padding_frames",
+                    0,
+                )
+            ),
+        )
+
+    @property
+    def independent_clip_batch_min_free_bytes(self) -> int:
+        return max(
+            0,
+            int(
+                getattr(
+                    self.restorer,
+                    "independent_clip_batch_min_free_bytes",
+                    0,
+                )
+            ),
+        )
+
     def _apply_denoise(self, frames: torch.Tensor) -> torch.Tensor:
         return apply_denoise(frames, self._denoise_strength)
 
@@ -136,23 +162,34 @@ class RestorationPipeline:
     ) -> list[PrimaryRestoreResult]:
         if not items:
             return []
-        frame_count = len(items[0].raw_crops)
-        if frame_count <= 0 or any(
-            len(item.raw_crops) != frame_count for item in items
-        ):
-            raise ValueError("primary restoration batches require equal clip lengths")
+        frame_counts = [len(item.raw_crops) for item in items]
+        frame_count = max(frame_counts, default=0)
+        if frame_count <= 0 or any(count <= 0 for count in frame_counts):
+            raise ValueError("primary restoration batches require non-empty clips")
+        max_padding = self.independent_clip_batch_max_padding_frames
+        if any(frame_count - count > max_padding for count in frame_counts):
+            raise ValueError(
+                "primary restoration batch padding exceeds the configured limit"
+            )
 
         prepared = [
             self._prepare_from_raw_crops(item.raw_crops) for item in items
         ]
-        primary_batches = self.restorer.raw_process_batch(
-            [entry[0] for entry in prepared]
-        )
+        resized_batches = []
+        for resized, count in zip(
+            (entry[0] for entry in prepared), frame_counts, strict=True
+        ):
+            padded = list(resized)
+            if count < frame_count:
+                padded.extend([padded[-1]] * (frame_count - count))
+            resized_batches.append(padded)
+        primary_batches = self.restorer.raw_process_batch(resized_batches)
         results: list[PrimaryRestoreResult] = []
-        for item, primary_raw, metadata in zip(
-            items, primary_batches, prepared, strict=True
+        for item, original_count, primary_raw, metadata in zip(
+            items, frame_counts, primary_batches, prepared, strict=True
         ):
             _resized, enlarged_bboxes, crop_shapes, pad_offsets, resize_shapes = metadata
+            primary_raw = primary_raw[:original_count]
             if self._denoise_step is DenoiseStep.AFTER_PRIMARY:
                 primary_raw = self._apply_denoise(primary_raw)
             results.append(
