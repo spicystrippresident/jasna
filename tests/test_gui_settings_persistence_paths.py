@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import MagicMock
 
 from jasna import os_utils
 from jasna.gui.models import AppSettings, PresetManager, get_settings_path
@@ -92,6 +93,39 @@ def test_preset_manager_persists_working_directory(monkeypatch, tmp_path: Path) 
     loaded = mgr2.get_preset("WithWorkDir")
     assert loaded is not None
     assert loaded.working_directory == r"D:\scratch"
+
+
+def test_preset_manager_saves_last_working_directory_separately(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(os_utils.sys, "platform", "win32", raising=False)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
+
+    manager = PresetManager()
+    assert manager.get_last_working_directory() is None
+    manager.set_last_working_directory(r"D:\scratch\jobs")
+
+    reloaded = PresetManager()
+    assert reloaded.get_last_working_directory() == r"D:\scratch\jobs"
+    data = json.loads(get_settings_path().read_text(encoding="utf-8"))
+    assert data["last_working_directory"] == r"D:\scratch\jobs"
+
+
+def test_settings_panel_restores_last_working_directory() -> None:
+    from jasna.gui.settings_panel import SettingsPanel
+
+    panel = SettingsPanel.__new__(SettingsPanel)
+    entry = MagicMock()
+    panel._widgets = {"working_directory": entry}
+    panel._preset_manager = MagicMock()
+    panel._preset_manager.get_last_working_directory.return_value = "/fast/jobs"
+    panel._update_modified_indicator = MagicMock()
+
+    panel._restore_last_working_directory()
+
+    entry.delete.assert_called_once_with(0, "end")
+    entry.insert.assert_called_once_with(0, "/fast/jobs")
+    panel._update_modified_indicator.assert_called_once_with()
 
 
 def test_preset_manager_persists_frame_rate_retargeting(monkeypatch, tmp_path: Path) -> None:

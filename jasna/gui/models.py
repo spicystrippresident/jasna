@@ -303,6 +303,7 @@ class PresetManager:
         self._last_selected: str = "Default"
         self._last_output_folder: str = ""
         self._last_output_pattern: str = "{original}_restored.mp4"
+        self._last_working_directory: str | None = None
         self._system_check_passed_version: str = ""
         self._load()
         
@@ -319,6 +320,7 @@ class PresetManager:
             self._last_selected = data.get("last_selected", "Default")
             self._last_output_folder = data.get("last_output_folder", "")
             self._last_output_pattern = data.get("last_output_pattern", "{original}_restored.mp4")
+            self._last_working_directory = data.get("last_working_directory")
             self._system_check_passed_version = data.get("system_check_passed_version", "")
             
             for name, preset_dict in data.get("user_presets", {}).items():
@@ -345,6 +347,10 @@ class PresetManager:
         data["user_presets"] = {name: asdict(preset) for name, preset in self._user_presets.items()}
         data["last_output_folder"] = self._last_output_folder
         data["last_output_pattern"] = self._last_output_pattern
+        if self._last_working_directory is None:
+            data.pop("last_working_directory", None)
+        else:
+            data["last_working_directory"] = self._last_working_directory
         data["system_check_passed_version"] = self._system_check_passed_version
         
         try:
@@ -423,6 +429,13 @@ class PresetManager:
 
     def set_last_output_pattern(self, pattern: str):
         self._last_output_pattern = pattern or "{original}_restored.mp4"
+        self._save()
+
+    def get_last_working_directory(self) -> str | None:
+        return self._last_working_directory
+
+    def set_last_working_directory(self, path: str):
+        self._last_working_directory = path or ""
         self._save()
 
     def get_system_check_passed_version(self) -> str:

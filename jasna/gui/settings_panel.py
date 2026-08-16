@@ -52,6 +52,7 @@ class SettingsPanel(ctk.CTkFrame):
         self._build_scrollable()
         self._build_sections()
         self._apply_preset(self._current_preset)
+        self._restore_last_working_directory()
 
     def _build_preset_bar(self):
         bar = ctk.CTkFrame(self, fg_color="transparent", height=48)
@@ -172,6 +173,20 @@ class SettingsPanel(ctk.CTkFrame):
 
     def set_last_output_pattern(self, pattern: str):
         self._preset_manager.set_last_output_pattern(pattern)
+
+    def persist_working_directory(self, path: str | None = None):
+        if path is None:
+            path = self._widgets["working_directory"].get().strip()
+        self._preset_manager.set_last_working_directory(path)
+
+    def _restore_last_working_directory(self):
+        path = self._preset_manager.get_last_working_directory()
+        if path is None:
+            return
+        entry = self._widgets["working_directory"]
+        entry.delete(0, "end")
+        entry.insert(0, path)
+        self._update_modified_indicator()
 
     def _update_button_states(self):
         """Update button states based on current preset."""
