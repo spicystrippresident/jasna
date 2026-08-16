@@ -110,11 +110,11 @@ def test_signature_change_uses_a_different_workspace(tmp_path: Path) -> None:
     assert first.path != second.path
 
 
-def test_algorithm_version_bump_invalidates_v1_fragments(tmp_path: Path) -> None:
+def test_algorithm_version_bump_invalidates_v2_fragments(tmp_path: Path) -> None:
     current_signature = _signature(tmp_path)
     legacy_signature = {
         **current_signature,
-        "algorithm_version": "jasna-smart-render-workspace-v1",
+        "algorithm_version": "jasna-smart-render-workspace-v2",
     }
     legacy_workspace = SmartRenderWorkspace.open(
         tmp_path,
@@ -122,7 +122,7 @@ def test_algorithm_version_bump_invalidates_v1_fragments(tmp_path: Path) -> None
         signature=legacy_signature,
     )
     legacy_fragment = legacy_workspace.fragment_path(1, ".ts")
-    legacy_fragment.write_bytes(b"v1-fragment")
+    legacy_fragment.write_bytes(b"v2-fragment")
     legacy_workspace.mark_complete(1, legacy_fragment)
 
     current_workspace = SmartRenderWorkspace.open(
@@ -131,7 +131,7 @@ def test_algorithm_version_bump_invalidates_v1_fragments(tmp_path: Path) -> None
         signature=current_signature,
     )
 
-    assert WORKSPACE_ALGORITHM_VERSION == "jasna-smart-render-workspace-v2"
+    assert WORKSPACE_ALGORITHM_VERSION == "jasna-smart-render-workspace-v3"
     assert current_workspace.path != legacy_workspace.path
     assert current_workspace.reusable_fragment(1) is None
 

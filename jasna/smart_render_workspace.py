@@ -14,7 +14,7 @@ from typing import Any, Mapping
 
 
 WORKSPACE_SCHEMA_VERSION = 1
-WORKSPACE_ALGORITHM_VERSION = "jasna-smart-render-workspace-v2"
+WORKSPACE_ALGORITHM_VERSION = "jasna-smart-render-workspace-v3"
 
 
 def _canonical_hash(value: Any) -> str:
