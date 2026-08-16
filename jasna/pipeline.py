@@ -365,7 +365,15 @@ class Pipeline:
         metadata_queue: Queue[FrameMeta | object] = Queue(maxsize=self.max_clip_size * 5)
 
         error_holder: list[BaseException] = []
-        blend_buffer = BlendBuffer(device=device, vr_projector=self._vr_projector)
+        blend_buffer = BlendBuffer(
+            device=device,
+            vr_projector=self._vr_projector,
+            fisheye_eye_width=(
+                int(metadata.video_width) // 2
+                if self._vr_resolution.fisheye_mask_geometry
+                else None
+            ),
+        )
         crop_buffers: dict[int, CropBuffer] = {}
         crop_lock = threading.Lock()
         primary_idle_event = threading.Event()
@@ -449,6 +457,7 @@ class Pipeline:
                     output_fps=float(frame_rate.output_fps),
                     vr_mode=self._vr_resolution.resolved,
                     vr_projector=self._vr_projector,
+                    fisheye_mask_geometry=self._vr_resolution.fisheye_mask_geometry,
                     cancel_event=self._cancel_event,
                 ),
                 name="DecodeDetect", daemon=True,

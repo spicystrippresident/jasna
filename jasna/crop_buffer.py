@@ -7,10 +7,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from jasna.vr_mask_geometry import sbs_fisheye_dilation_ratios
+
 RESTORATION_SIZE = 256
 BORDER_RATIO = 0.06
 MIN_BORDER = 20
 MAX_EXPANSION_FACTOR = 1.0
+MAX_SBS_BORDER_FACTOR = 0.5
 
 
 def _torch_pad_reflect(image: torch.Tensor, paddings: tuple[int, int, int, int]) -> torch.Tensor:
@@ -25,15 +28,20 @@ def _torch_pad_reflect(image: torch.Tensor, paddings: tuple[int, int, int, int])
 
 def expand_bbox(
     x1: int, y1: int, x2: int, y2: int, frame_h: int, frame_w: int,
+    *,
+    min_border_y: int = 0,
+    min_border_x: int = 0,
 ) -> tuple[int, int, int, int]:
     w = x2 - x1
     h = y2 - y1
 
     border = max(MIN_BORDER, int(max(w, h) * BORDER_RATIO)) if BORDER_RATIO > 0.0 else 0
-    x1_exp = max(0, x1 - border)
-    y1_exp = max(0, y1 - border)
-    x2_exp = min(frame_w, x2 + border)
-    y2_exp = min(frame_h, y2 + border)
+    border_y = max(border, int(min_border_y))
+    border_x = max(border, int(min_border_x))
+    x1_exp = max(0, x1 - border_x)
+    y1_exp = max(0, y1 - border_y)
+    x2_exp = min(frame_w, x2 + border_x)
+    y2_exp = min(frame_h, y2 + border_y)
 
     w = x2_exp - x1_exp
     h = y2_exp - y1_exp
@@ -110,6 +118,8 @@ def compute_enlarged_bbox(
     frame_h: int,
     frame_w: int,
     x_bounds: tuple[int, int] | None = None,
+    *,
+    fisheye_geometry: bool = False,
 ) -> tuple[int, int, int, int]:
     """Clamp ``bbox`` to ``x_bounds`` (an SBS eye seam) and grow it toward the
     256 restoration aspect via ``expand_bbox``. Shared by the axis-aligned 2D
@@ -126,6 +136,17 @@ def compute_enlarged_bbox(
     x2 = max(x_min, min(x2, x_max))
     y2 = max(0, min(y2, frame_h))
 
+    min_border_y = min_border_x = 0
+    if fisheye_geometry and x_bounds is not None and x2 > x1 and y2 > y1:
+        ratio_y, ratio_x = sbs_fisheye_dilation_ratios(
+            (x1, y1, x2, y2), frame_h, x_max - x_min
+        )
+        # Keep enough restored context for the wider rim mask without letting a
+        # small detection turn into a huge, low-detail 256px restoration crop.
+        border_cap = max(MIN_BORDER, round(max(x2 - x1, y2 - y1) * MAX_SBS_BORDER_FACTOR))
+        min_border_y = min(round(frame_h * ratio_y), border_cap)
+        min_border_x = min(round(frame_h * ratio_x), border_cap)
+
     x1_exp, y1_exp, x2_exp, y2_exp = expand_bbox(
         x1 - x_min,
         y1,
@@ -133,6 +154,8 @@ def compute_enlarged_bbox(
         y2,
         frame_h,
         x_max - x_min,
+        min_border_y=min_border_y,
+        min_border_x=min_border_x,
     )
     return x1_exp + x_min, y1_exp, x2_exp + x_min, y2_exp
 
@@ -144,9 +167,14 @@ def extract_crop(
     frame_w: int,
     *,
     x_bounds: tuple[int, int] | None = None,
+    fisheye_geometry: bool = False,
 ) -> RawCrop:
     x1_exp, y1_exp, x2_exp, y2_exp = compute_enlarged_bbox(
-        bbox, frame_h, frame_w, x_bounds
+        bbox,
+        frame_h,
+        frame_w,
+        x_bounds,
+        fisheye_geometry=fisheye_geometry,
     )
     if frame.device.type == "cpu":
         crop = torch.from_numpy(np.array(frame.numpy()[:, y1_exp:y2_exp, x1_exp:x2_exp]))

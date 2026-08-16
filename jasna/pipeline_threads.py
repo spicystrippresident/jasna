@@ -60,6 +60,7 @@ def decode_detect_loop(
     debug_memory: PipelineDebugMemoryLogger | None = None,
     vr_mode: str = "off",
     vr_projector=None,
+    fisheye_mask_geometry: bool = False,
 ) -> None:
     timer = LoopTimer("decode-detect")
     try:
@@ -184,6 +185,7 @@ def decode_detect_loop(
                                     min_detection_duration=min_detection_duration,
                                     scene_detector=scene_detector,
                                     vr_projector=vr_projector,
+                                    fisheye_mask_geometry=fisheye_mask_geometry,
                                 )
                                 frame_idx = res.next_frame_idx
                             else:
