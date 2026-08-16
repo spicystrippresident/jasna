@@ -832,7 +832,7 @@ def main() -> None:
         raise ValueError(f"Unsupported restoration model: {restoration_model_name}")
 
     if args.license_email and args.license_key:
-        from jasna.protection import license_store
+        from jasna.license_api import license_store
         license_store.set_license(args.license_email, args.license_key)
 
     lut_arg = str(args.lut).strip()
