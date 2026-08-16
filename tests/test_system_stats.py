@@ -43,9 +43,10 @@ def test_color_for_percent_interpolates_midpoints() -> None:
 
 
 def test_parse_nvidia_smi_csv_line_parses_gpu_and_vram_pct() -> None:
-    gpu, vram = system_stats._parse_nvidia_smi_csv_line("85, 1200, 2400")
+    gpu, vram, total = system_stats._parse_nvidia_smi_csv_line("85, 1200, 2400")
     assert gpu == 85
     assert vram == 50
+    assert total == 2400 * 1024 * 1024
 
 
 def test_read_gpu_vram_returns_none_when_gpu_tools_and_amd_sysfs_are_missing(
@@ -59,9 +60,10 @@ def test_read_gpu_vram_returns_none_when_gpu_tools_and_amd_sysfs_are_missing(
 
     monkeypatch.setattr(system_stats.subprocess, "run", _should_not_run)
 
-    gpu, vram = system_stats.read_gpu_vram()
+    gpu, vram, total = system_stats.read_gpu_vram()
     assert gpu is None
     assert vram is None
+    assert total is None
 
 
 def test_read_gpu_vram_reads_amd_sysfs_without_torch(monkeypatch, tmp_path) -> None:
@@ -74,7 +76,7 @@ def test_read_gpu_vram_reads_amd_sysfs_without_torch(monkeypatch, tmp_path) -> N
     monkeypatch.setattr(system_stats.os_utils, "find_executable", lambda name: None)
     monkeypatch.setattr(system_stats, "_DRM_CLASS_PATH", tmp_path)
 
-    assert system_stats.read_gpu_vram() == (73, 25)
+    assert system_stats.read_gpu_vram() == (73, 25, 1200)
 
 
 def test_read_gpu_vram_parses_first_device(monkeypatch) -> None:
@@ -85,9 +87,10 @@ def test_read_gpu_vram_parses_first_device(monkeypatch) -> None:
 
     monkeypatch.setattr(system_stats.subprocess, "run", _fake_run)
 
-    gpu, vram = system_stats.read_gpu_vram()
+    gpu, vram, total = system_stats.read_gpu_vram()
     assert gpu == 85
     assert vram == 50
+    assert total == 2400 * 1024 * 1024
 
 
 def test_read_cpu_ram_uses_psutil(monkeypatch) -> None:
