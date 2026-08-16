@@ -62,6 +62,44 @@ class VideoDecodeError(RuntimeError):
     pass
 
 
+def _requires_software_pyav_fallback(
+    metadata: VideoMetadata,
+    vendor: AcceleratorVendor,
+) -> bool:
+    """Return whether AMF cannot safely replace a failed native decoder."""
+
+    return (
+        sys.platform == "linux"
+        and vendor is AcceleratorVendor.AMD
+        and str(metadata.codec_name).lower() == "hevc"
+        and bool(metadata.is_10bit)
+    )
+
+
+def _should_auto_rocdecode(
+    metadata: VideoMetadata,
+    vendor: AcceleratorVendor,
+) -> bool:
+    if (
+        not ROCDECODE_AUTO_ENABLED
+        or sys.platform != "linux"
+        or vendor is not AcceleratorVendor.AMD
+    ):
+        return False
+    codec_name = str(metadata.codec_name).lower()
+    if codec_name not in _ROCDECODE_AUTO_CODECS:
+        return False
+    if _requires_software_pyav_fallback(metadata, vendor):
+        # Linux AMF can open Main10 HEVC, but PyAV cannot transfer the P010
+        # surface to host memory. Prefer rocDecode even below the normal
+        # performance threshold so this route remains functional.
+        return True
+    return (
+        int(metadata.video_width) * int(metadata.video_height)
+        >= _ROCDECODE_AUTO_MIN_PIXELS
+    )
+
+
 def _decode_backend() -> str:
     backend = os.environ.get(DECODE_BACKEND_ENV, DECODE_BACKEND)
     if backend not in _DECODE_BACKENDS:
@@ -582,11 +620,7 @@ class NvidiaVideoReader:
                 raise VideoDecodeError("The VALI decode backend requires an NVIDIA device")
         if backend == "rocdecode" or (
             backend == "auto"
-            and ROCDECODE_AUTO_ENABLED
-            and self.vendor is AcceleratorVendor.AMD
-            and str(self.metadata.codec_name).lower() in _ROCDECODE_AUTO_CODECS
-            and int(self.metadata.video_width) * int(self.metadata.video_height)
-            >= _ROCDECODE_AUTO_MIN_PIXELS
+            and _should_auto_rocdecode(self.metadata, self.vendor)
         ):
             if self.vendor is not AcceleratorVendor.AMD:
                 raise VideoDecodeError("The rocDecode backend requires an AMD device")
@@ -612,18 +646,33 @@ class NvidiaVideoReader:
                         ) from exc
                     if backend == "rocdecode":
                         raise VideoDecodeError(f"rocDecode cannot open {self.file}: {exc}") from exc
+                    fallback_name = (
+                        "FFmpeg software decoding"
+                        if _requires_software_pyav_fallback(
+                            self.metadata,
+                            self.vendor,
+                        )
+                        else "PyAV"
+                    )
                     log.warning(
-                        "rocDecode cannot open %s (codec %s): %s; falling back to PyAV",
+                        "rocDecode cannot open %s (codec %s): %s; falling back to %s",
                         self.file,
                         self.metadata.codec_name,
                         exc,
+                        fallback_name,
                     )
                 else:
                     self.width = self._rocdecode_source.width
                     self.height = self._rocdecode_source.height
                     log.info("Using rocDecode hardware decoder for %s", self.file)
                     return self
-        self._open_pyav(backend)
+        pyav_backend = (
+            "pyav-sw"
+            if backend == "auto"
+            and _requires_software_pyav_fallback(self.metadata, self.vendor)
+            else backend
+        )
+        self._open_pyav(pyav_backend)
         return self
 
     def _open_pyav(self, backend: str) -> None:
@@ -888,7 +937,12 @@ class NvidiaVideoReader:
                 )
                 source.close(discard_decoder=True)
                 self._rocdecode_source = None
-                self._open_pyav("auto")
+                fallback_backend = (
+                    "pyav-sw"
+                    if _requires_software_pyav_fallback(self.metadata, self.vendor)
+                    else "auto"
+                )
+                self._open_pyav(fallback_backend)
                 yield from self._frames_pyav(seek_ts, after_pts=last_pts)
                 return
         yield from self._frames_pyav(seek_ts)
