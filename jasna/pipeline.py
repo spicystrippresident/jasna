@@ -111,6 +111,8 @@ class Pipeline:
         segments: tuple[SegmentRange, ...] | None = None,
         splice_plan: SplicePlan | None = None,
         working_dir: Path | None = None,
+        detection_model: object | None = None,
+        detection_session: object | None = None,
     ) -> None:
         self.input_video = input_video
         self.output_video = output_video
@@ -144,14 +146,28 @@ class Pipeline:
             "sharpen_strength": float(sharpen_strength),
         }
 
-        self.detection_model = build_detection_model(
-            detection_model_name,
-            detection_model_path,
-            batch_size=self.batch_size,
-            device=self.device,
-            score_threshold=float(detection_score_threshold),
-            fp16=bool(fp16),
+        self._owns_detection_model = (
+            detection_model is None and detection_session is None
         )
+        if detection_model is not None:
+            self.detection_model = detection_model
+        elif detection_session is not None:
+            self.detection_model = detection_session.get_detection_model(
+                name=detection_model_name,
+                path=detection_model_path,
+                batch_size=self.batch_size,
+                score_threshold=float(detection_score_threshold),
+                fp16=bool(fp16),
+            )
+        else:
+            self.detection_model = build_detection_model(
+                detection_model_name,
+                detection_model_path,
+                batch_size=self.batch_size,
+                device=self.device,
+                score_threshold=float(detection_score_threshold),
+                fp16=bool(fp16),
+            )
         self.restoration_pipeline = restoration_pipeline
         self.disable_progress = bool(disable_progress)
         self.progress_callback = progress_callback
@@ -199,10 +215,14 @@ class Pipeline:
         )
 
     def close(self) -> None:
-        if hasattr(self, "detection_model") and self.detection_model is not None:
+        if (
+            getattr(self, "_owns_detection_model", True)
+            and hasattr(self, "detection_model")
+            and self.detection_model is not None
+        ):
             if hasattr(self.detection_model, "close"):
                 self.detection_model.close()
-            self.detection_model = None
+        self.detection_model = None
         self.restoration_pipeline = None
 
     _ASYNC_POLL_TIMEOUT = 0.05
