@@ -183,13 +183,14 @@ def _parse_ffmpeg_major_version(version_output: str) -> int:
         raise ValueError(f"Unexpected ffmpeg/ffprobe version output: {first_line!r}")
 
     ver = m.group(1)
-    if ver.startswith(("N-", "git-", "GIT-")):
-        return parse_major_from_libavutil(version_output)
-
-    m = re.search(r"(\d+)", ver)
-    if not m:
-        raise ValueError(f"Could not parse ffmpeg major version from: {ver!r}")
-    return int(m.group(1))
+    # Release builds start with an optional ``n`` followed by the semantic
+    # major. Snapshot distributors may instead put a build date or git label in
+    # this field (for example ``2026-06-15-git-...``); those numbers are not the
+    # FFmpeg major, so derive it from the library ABI below.
+    release = re.match(r"^[nN]?(\d+)(?:\.|$)", ver)
+    if release:
+        return int(release.group(1))
+    return parse_major_from_libavutil(version_output)
 
 
 FFMPEG_DOWNLOAD_LINKS = (

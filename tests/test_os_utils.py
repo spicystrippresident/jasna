@@ -82,6 +82,17 @@ def test_parse_ffmpeg_major_version_parses_nightly_build_from_libavutil() -> Non
     assert os_utils._parse_ffmpeg_major_version(out) == 8
 
 
+def test_parse_ffmpeg_major_version_parses_date_snapshot_from_libavutil() -> None:
+    out = "\n".join(
+        [
+            "ffprobe version 2026-06-15-git-44d082edc8-full_build-www.gyan.dev "
+            "Copyright (c) ...",
+            "libavutil      60. 33.100 / 60. 33.100",
+        ]
+    )
+    assert os_utils._parse_ffmpeg_major_version(out) == 8
+
+
 def test_check_required_executables_uses_expected_version_commands(monkeypatch) -> None:
     monkeypatch.setattr(os_utils.shutil, "which", lambda exe: f"/fake/{exe}")
 
