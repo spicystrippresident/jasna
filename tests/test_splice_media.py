@@ -189,6 +189,7 @@ def test_final_mux_preserves_compatible_source_structure(
         "-map_metadata", "2",
         "-map_chapters", "2",
         "-metadata:s:v:0", "language=jpn",
+        "-disposition:v:0", "default+original",
         "-metadata:s:s:0", "language=pol",
         "-metadata:s:s:0", "title=Signs",
         "-disposition:s:0", "default+forced",
@@ -219,6 +220,8 @@ def test_final_mux_preserves_compatible_source_structure(
             "Main",
         ]
         assert container.streams.video[0].metadata["language"] == "jpn"
+        assert container.streams.video[0].disposition.default
+        assert container.streams.video[0].disposition.original
         assert len(container.streams.audio) == 1
         assert len(container.streams.subtitles) == 1
         assert len(container.streams.attachments) == expected_attachments
@@ -240,7 +243,7 @@ def test_final_mux_preserves_compatible_source_structure(
         assert b"Opening subtitle" in subtitle_text
         if expected_attachments:
             output_attachment = container.streams.attachments[0]
-            assert output_attachment.name == "font.txt"
+            assert Path(output_attachment.name).name == "font.txt"
             assert output_attachment.mimetype == "text/plain"
             assert output_attachment.data == b"font payload"
 

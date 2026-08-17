@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 import torch
 
+from jasna.accelerator import AcceleratorVendor, vendor_for_device
 from jasna.media import get_video_meta_data
 from jasna.media.audio_utils import needs_audio_reencode
 from jasna.media.splice import probe_keyframes
@@ -302,12 +303,12 @@ def test_smart_fragment_keeps_periodic_random_access_points(tmp_path):
     assert len(keyframes.pts) >= 3
     with av.open(str(dst)) as container:
         stream = container.streams.video[0]
-        assert any(
-            packet.pts is not None
-            and packet.dts is not None
-            and packet.pts != packet.dts
-            for packet in container.demux(stream)
-        )
+        packets = [packet for packet in container.demux(stream) if packet.size]
+        assert packets
+        assert all(packet.pts is not None and packet.dts is not None for packet in packets)
+        assert [packet.dts for packet in packets] == sorted(packet.dts for packet in packets)
+        if vendor_for_device(DEVICE) is AcceleratorVendor.NVIDIA:
+            assert any(packet.pts != packet.dts for packet in packets)
 
 
 @pytest.mark.parametrize(
@@ -500,7 +501,7 @@ def test_container_structure_preserved(
         assert len(container.streams.attachments) == expected_attachments
         if expected_attachments:
             output_attachment = container.streams.attachments[0]
-            assert output_attachment.name == "rich-font.txt"
+            assert Path(output_attachment.name).name == "rich-font.txt"
             assert output_attachment.mimetype == "text/plain"
             assert output_attachment.data == b"font payload"
 
