@@ -1,6 +1,6 @@
 # Windows AMD 开发、验证与交接清单
 
-最后更新：2026-08-17
+最后更新：2026-08-18
 
 本文记录同一个 Jasna 项目在 Windows AMD 环境中的开发状态、分支规则、已完成证据和
 剩余验收项。开始工作前应同时阅读 `docs/en/development.md` 和仓库中的 `AGENTS.md`。
@@ -21,10 +21,11 @@ Windows、Linux、AMD、NVIDIA 都属于同一个项目，不建立长期分叉�
 |---|---|
 | `upstream/main` | `592472bda8aeb1fc0d5cea3d3ff6607add0ab0a7` |
 | 完整集成分支 | `integration/v0.10-full` |
-| 最近功能验收提交 | `c5bc7644b339c2d4a93f5e738eff723ae4f5623c` |
-| 已纳入集成的候选 | PR #297～#323、#326、#327 的功能 |
-| 当前 Draft | PR #319，等待 NVIDIA 24 GiB 硬件 A/B |
+| 最近功能验收提交 | `14859d576f5fefc4404be607a622ff32b972ecdf` |
+| 已纳入集成的候选 | PR #297～#323、#326、#327；含 PR #319/#323 最新 head |
+| 当前 Draft | PR #319 `5489a7e`，Windows AMD 已通过，仍等待 NVIDIA 24 GiB 硬件 A/B |
 | Windows AMD Main10 修复 | 解码 PR #326 `f8d4a3d`；编码 PR #297 `48de7f0` |
+| 厂商测试隔离 | PR #323 `7b0daf9`；GUI preflight 同步隔离 accelerator/registry 绑定 |
 
 ### 聚焦 PR 工作流
 
@@ -215,6 +216,55 @@ Windows AMF 把 1080 高度的 AV1 输出报告为 1082 行，同时在 Matroska
 `av1_amf` 也会复现同一对齐行为，因此当前按有效裁剪高度验收，后续仅在播放器兼容性
 出现实际问题时再拆成独立 AMF/封装任务。
 
+### 3.6 真实 2D HEVC 8-bit 与 Main10 Full
+
+Windows AMD Stage B 已补齐两项非 VR 真实短片全片矩阵。
+
+HEVC 8-bit：
+
+- Jasna 退出码：0；墙钟时间：117.521 秒；
+- 自动解码：`hevc_amf`；
+- 视频：源/输出 1200 / 1200 帧，8192×4096、HEVC Main、`yuv420p`；
+- 输出 AAC 完整解码 939 帧；
+- FFmpeg 严格完整音视频解码退出码：0。
+
+HEVC Main10：
+
+- Jasna 退出码：0；墙钟时间：31.854 秒；
+- Windows P010 路线：FFmpeg 软件解码后批量上传 ROCm，输出使用 `hevc_amf`；
+- 视频：源/输出 480 / 480 帧，3840×1920、HEVC Main 10、`yuv420p10le`；
+- AAC：源/输出 376 / 376 帧；
+- FFmpeg 严格完整音视频解码退出码：0。
+
+两项均未出现 OOM、GPU reset、native fallback 或封装失败。2026-08-18 的独立复核还对
+既有 H.264、AV1 8-bit/Main10、VR/SBS HEVC Main10 和 Smart Render 样本重新执行了
+`ffprobe -count_frames` 与严格 FFmpeg 解码，所有命令均退出 0；旧 integration 的
+Smart Render 素材只证明媒体完整性，不代替新的 Windows AMD Smart Render 专项运行。
+
+### 3.7 Windows AMD GUI 遥测与厂商测试隔离
+
+PR #319 `5489a7e` 补齐 Windows AMD 显存遥测。实机 RX 7900 XTX 的变化为：
+
+```text
+原行为：read_gpu_vram=(None, None, None)，RF-DETR v6 batch=4
+现行为：read_gpu_vram=(None, 1, 25753026560)，RF-DETR v6 batch=8
+```
+
+遥测不冷导入 torch，使用与 GUI 推理一致的逻辑 `cuda:0`；已加载 HIP 后若查询暂时失败，
+会保留未知状态等待后续轮询，不会借用另一张 NVIDIA 卡的容量。Linux AMD sysfs 和
+NVIDIA-only SMI 路线不变。PR #319 的同命令基线/修改测试为 19 / 23 passed，随后设备与
+来源隔离增量为 23 / 25 passed；两次回滚均恢复原哈希和原行为。
+
+PR #323 `7b0daf9` 修复 GUI engine preflight 测试夹具：accelerator 的延迟导入和
+detection registry 的直接绑定现在使用同一个可选参数厂商 fake，并显式断言 AMD 使用
+`.pt`。完整模块由 6 failed、2 passed、1 skipped 变为 8 passed、1 skipped。
+
+在 `integration/v0.10-full@14859d5` 上，system stats、hardware policy、GUI 关闭、engine
+preflight、detection registry/compiler/model-weight/postprocess 的集合验收为 112 passed、
+1 skipped；实机显存探针继续得到 25,753,026,560 bytes 和 batch 8。系统检查、ROCm、
+FFmpeg/FFprobe 和 engine preflight 的自动化/实机命令行证据已通过。GUI 完整向导仍标记
+🟡，因为 100%/125%/150% DPI、真实窗口点击、输出打开和关闭 race 仍需人工矩阵。
+
 ## 4. 当前开发与验收总表
 
 状态含义：✅ 已完成；🟡 已发现或部分完成；⬜ 未开始/待验证；⛔ 阻断。
@@ -231,9 +281,9 @@ Windows AMF 把 1080 高度的 AV1 输出报告为 1082 行，同时在 Matroska
 | H.264 / HEVC 8-bit AMF 隔离回归 | ✅ | 自动测试确认继续选择 AMF |
 | NVIDIA 路线单元隔离 | ✅ | 自动测试确认 Windows Main10 策略不影响 NVIDIA |
 | NVIDIA 实机冒烟 | ⬜ | 共享解码代码进入上游前请求 NVIDIA 硬件验证 |
-| GUI 启动与完整向导 | ⬜ | 检查系统页、模型页、队列、日志保存和最终打开文件 |
-| 2D HEVC 8-bit Full | ⬜ | 真实短片；核对 AMF、帧数、音频、严格解码 |
-| 2D HEVC Main10 Full | 🟡 | 解码首帧已通过；仍需非 VR 全片矩阵样本 |
+| GUI 启动与完整向导 | 🟡 | 系统检查、ROCm、FFmpeg、preflight 和 VRAM telemetry 已通过；人工 DPI/点击/关闭矩阵待完成 |
+| 2D HEVC 8-bit Full | ✅ | 1200 帧、HEVC Main、`yuv420p`、AAC 与严格解码通过 |
+| 2D HEVC Main10 Full | ✅ | 480 帧、HEVC Main 10、`yuv420p10le`、376 AAC 帧与严格解码通过 |
 | AV1 8-bit Full | ✅ | 150 帧、215 AAC 帧、严格解码通过 |
 | AV1 Main10 Full | ✅ | PR #297；417 帧、816 AAC 帧、Main10 保持、严格解码通过 |
 | `Auto / Scan / Off` | ⬜ | 分别核对路由、manifest、阶段名和 ETA |
@@ -243,7 +293,7 @@ Windows AMF 把 1080 高度的 AV1 输出报告为 1082 行，同时在 Matroska
 | 扫描中断继续 | ⬜ | 检查 checkpoint、重复扫描和取消传播 |
 | 修复中断继续 | ⬜ | 检查 workspace、重复修复和最终原子替换 |
 | 文件夹批处理与恢复 | ⬜ | 已完成跳过、停止后不新建后续任务目录 |
-| 字幕、章节与 metadata | ⬜ | MP4/MKV 各选一个真实多流样本 |
+| 字幕、章节与 metadata | 🟡 | 既有 rich H.264 Smart Render 样本的字幕、附件、章节已复核；Windows 新运行待完成 |
 | Triton 缺失告警展示 | 🟡 | Torch GPU 回退正确；后续单独减少 traceback 噪音 |
 | watchdog 启动期误报 | 🟡 | VR Full 完成但打印过一次 30 秒 stall diagnostics |
 | Windows 完整 pytest 整理 | 🟡 | 按 TensorRT、GUI、编码器、公开源码边界拆分独立 PR |
@@ -254,12 +304,12 @@ Windows AMF 把 1080 高度的 AV1 输出报告为 1082 行，同时在 Matroska
 
 按以下顺序继续，避免一次混改多个子系统：
 
-1. **GUI Windows AMD 基线**：启动向导、系统检查、模型检测、队列、工作目录、诊断日志；
-2. **完成剩余 2D 格式矩阵**：HEVC 8-bit、HEVC Main10；AV1 两项已完成；
-3. **扫描矩阵**：同一真实片段分别运行 `Auto / Scan / Off`；
-4. **Smart Render**：先 HEVC，再 H.264；核对关键帧、接缝、音画同步和流保留；
-5. **恢复语义**：扫描中断、修复中断、程序重启、保留 workspace；
-6. **批处理**：多文件、有成功文件、有失败文件、用户停止；
+1. **GUI Windows AMD 人工矩阵**：100%/125%/150% DPI、向导点击、队列、工作目录、日志、打开输出和关闭；
+2. **扫描矩阵**：同一真实片段分别运行 `Auto / Scan / Off`；
+3. **Smart Render**：先 HEVC，再 H.264；核对关键帧、接缝、音画同步和流保留；
+4. **恢复语义**：扫描中断、修复中断、程序重启、保留 workspace；
+5. **批处理**：多文件、有成功文件、有失败文件、用户停止；
+6. **多流 metadata**：在 Windows 新运行中核对字幕、附件和章节；
 7. **GUI/pytest 已知失败拆分**：一个功能一个 PR；
 8. **长跑**：至少一条多小时真实视频和一次多文件过夜批处理。
 
