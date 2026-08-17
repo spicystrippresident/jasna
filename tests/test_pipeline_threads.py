@@ -650,10 +650,15 @@ class TestOfflineFrameWriter:
     def test_write_enters_ctx_once_and_encodes(self):
         from jasna.pipeline import _OfflineFrameWriter
         mock_enc = MagicMock()
-        mock_enc.__enter__ = MagicMock(return_value=mock_enc)
+        heartbeat: list[float | None] = [None]
+
+        def enter_encoder():
+            assert heartbeat[0] is not None
+            return mock_enc
+
+        mock_enc.__enter__ = MagicMock(side_effect=enter_encoder)
         mock_enc.__exit__ = MagicMock(return_value=False)
 
-        heartbeat = [0.0]
         writer = _OfflineFrameWriter(mock_enc, heartbeat)
 
         frame = torch.zeros(3, 8, 8)

@@ -270,6 +270,23 @@ class TestEncodeStallDetection:
         offloader._check_encode_stall()
         assert offloader._last_stall_warn_time == 0.0
 
+    def test_no_warning_before_first_encode_attempt(self):
+        offloader = VramOffloader(
+            device=torch.device("cpu"),
+            blend_buffer=BlendBuffer(device=torch.device("cpu")),
+            crop_buffers={},
+            crop_lock=threading.Lock(),
+            vram_limit=0.001,
+            safetynet=0,
+        )
+        offloader.set_encode_heartbeat([None])
+
+        with patch.object(offloader, "_dump_stall_diagnostics") as diagnostics:
+            offloader._check_encode_stall()
+
+        assert offloader._last_stall_warn_time == 0.0
+        diagnostics.assert_not_called()
+
     def test_no_warning_when_recent(self):
         import time
         offloader = VramOffloader(

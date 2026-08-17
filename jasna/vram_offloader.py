@@ -83,7 +83,7 @@ class VramOffloader:
         self.stats = VramStats()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="VramOffloader", daemon=True)
-        self._last_encode_time: list[float] | None = None
+        self._last_encode_time: list[float | None] | None = None
         self._last_stall_warn_time: float = 0.0
         self._stall_check_paused = False
         self._pipeline_queues: dict[str, object] | None = None
@@ -96,7 +96,7 @@ class VramOffloader:
             safetynet // _MIB,
         )
 
-    def set_encode_heartbeat(self, shared_time: list[float]) -> None:
+    def set_encode_heartbeat(self, shared_time: list[float | None]) -> None:
         self._last_encode_time = shared_time
 
     def set_pipeline_queues(
@@ -145,7 +145,7 @@ class VramOffloader:
 
     def _check_encode_stall(self) -> None:
         hb = self._last_encode_time
-        if hb is None or self._stall_check_paused:
+        if hb is None or hb[0] is None or self._stall_check_paused:
             return
         now = time.monotonic()
         elapsed = now - hb[0]

@@ -50,13 +50,20 @@ log = logging.getLogger(__name__)
 
 
 class _OfflineFrameWriter:
-    def __init__(self, encoder_ctx: NvidiaVideoEncoder, encode_heartbeat: list[float]):
+    def __init__(
+        self,
+        encoder_ctx: NvidiaVideoEncoder,
+        encode_heartbeat: list[float | None],
+    ):
         self._encoder_ctx = encoder_ctx
         self._encode_heartbeat = encode_heartbeat
         self._entered = False
 
     def write(self, frame: torch.Tensor, pts: int, *, apply_lut: bool = True) -> None:
         if not self._entered:
+            # Slow detection/restoration before the first output frame is not an
+            # encoder stall. Arm the watchdog only when encoding is attempted.
+            self._encode_heartbeat[0] = time.monotonic()
             self._encoder_ctx.__enter__()
             self._entered = True
         self._encoder_ctx.encode(frame, pts, apply_lut=apply_lut)
@@ -371,7 +378,7 @@ class Pipeline:
         primary_idle_event = threading.Event()
         frame_shape: list[tuple[int, int]] = []
 
-        encode_heartbeat: list[float] = [time.monotonic()]
+        encode_heartbeat: list[float | None] = [None]
         frame_writer = _OfflineFrameWriter(encoder_ctx, encode_heartbeat)
         vram_offloader = VramOffloader(
             device=device,
