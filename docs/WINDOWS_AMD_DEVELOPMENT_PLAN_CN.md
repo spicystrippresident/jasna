@@ -92,21 +92,23 @@ py -3.12 -m venv .venv
 python -m pip install --upgrade pip uv
 
 $R = "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1"
-pip install --no-deps `
+pip install --no-cache-dir `
   "$R/rocm_sdk_core-7.2.1-py3-none-win_amd64.whl" `
+  "$R/rocm_sdk_devel-7.2.1-py3-none-win_amd64.whl" `
   "$R/rocm_sdk_libraries_custom-7.2.1-py3-none-win_amd64.whl" `
-  "$R/torch-2.9.1+rocm7.2.1-cp312-cp312-win_amd64.whl" `
-  "$R/torchvision-0.24.1+rocm7.2.1-cp312-cp312-win_amd64.whl"
+  "$R/rocm-7.2.1.tar.gz"
 
-uv pip install -e ".[amd,dev]"
+uv pip install -e ".[amd,dev]" --find-links "$R/"
 python -c "import torch, torchvision; assert torch.version.hip and '+rocm' in torchvision.__version__; print('ROCm OK', torch.__version__, torchvision.__version__, torch.cuda.get_device_name(0))"
 ffmpeg -version
 ffmpeg -hide_banner -encoders | findstr /I "amf"
 ffprobe -version
 ```
 
-如果最后的 ROCm 断言失败，停止后续视频测试，先修复环境；不要让 pip 用 PyPI CPU
-版 `torch==2.9.1` 替换 ROCm wheel。
+`rocm_sdk_devel` 和 `rocm-7.2.1.tar.gz` 是 AMD 官方 Windows 环境步骤的一部分；后者
+提供 torch 启动时导入的 `rocm_sdk` 模块。`--find-links` 让 uv 在解析项目依赖时继续
+选择 ROCm torch/torchvision，而不是换成 PyPI CPU wheel。如果最后的 ROCm 断言失败，
+停止后续视频测试，先修复环境。
 
 `model_weights` 中的实际模型文件应保持未跟踪。公开源码不包含私有 protection
 子模块，因此 supporter-only 的 unet-4x/SD 1.5 路线不能作为公开源码基线的必测成功项；
