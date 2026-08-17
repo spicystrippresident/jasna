@@ -132,7 +132,17 @@ class ResizeNormalizer:
 
                 self._kernel = TritonResizeNormalizeKernel()
                 self._backend = "triton-rocm"
-            except (ImportError, RuntimeError):
+            except ImportError as exc:
+                logger.warning(
+                    "ROCm fused resize-normalize is unavailable; using Torch (%s)",
+                    exc,
+                )
+                logger.debug(
+                    "ROCm fused resize-normalize import failure",
+                    exc_info=True,
+                )
+                self._kernel = None
+            except RuntimeError:
                 logger.warning(
                     "ROCm fused resize-normalize is unavailable; using Torch",
                     exc_info=True,
