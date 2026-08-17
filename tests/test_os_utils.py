@@ -340,9 +340,8 @@ def test_find_executable_prefers_source_tool_over_path_when_not_frozen(
 ) -> None:
     source_root = tmp_path / "source-checkout"
     monkeypatch.setattr(os_utils, "__file__", str(source_root / "jasna" / "os_utils.py"))
-    monkeypatch.setattr(os_utils.os, "name", "posix", raising=False)
     monkeypatch.setattr(os_utils, "is_frozen", lambda: False)
-    source_tool = source_root / "tools" / name
+    source_tool = source_root / "tools" / os_utils._bundled_exe_filename(name)
     source_tool.parent.mkdir(parents=True)
     source_tool.write_bytes(b"")
     monkeypatch.setattr(os_utils.shutil, "which", lambda exe: f"/path/{exe}")
@@ -354,7 +353,6 @@ def test_find_executable_prefers_source_tool_over_path_when_not_frozen(
 def test_find_executable_uses_path_when_source_tool_is_missing(monkeypatch, tmp_path, name) -> None:
     source_root = tmp_path / "source-checkout"
     monkeypatch.setattr(os_utils, "__file__", str(source_root / "jasna" / "os_utils.py"))
-    monkeypatch.setattr(os_utils.os, "name", "posix", raising=False)
     monkeypatch.setattr(os_utils, "is_frozen", lambda: False)
     path_tool = f"/path/{name}"
     monkeypatch.setattr(os_utils.shutil, "which", lambda exe: path_tool)
@@ -365,14 +363,14 @@ def test_find_executable_uses_path_when_source_tool_is_missing(monkeypatch, tmp_
 def test_find_executable_keeps_frozen_bundle_before_source_and_path(monkeypatch, tmp_path) -> None:
     source_root = tmp_path / "source-checkout"
     monkeypatch.setattr(os_utils, "__file__", str(source_root / "jasna" / "os_utils.py"))
-    monkeypatch.setattr(os_utils.os, "name", "posix", raising=False)
     monkeypatch.setattr(os_utils, "is_frozen", lambda: True)
     monkeypatch.setattr(os_utils.sys, "executable", str(tmp_path / "dist" / "jasna"), raising=False)
     monkeypatch.setattr(os_utils.shutil, "which", lambda exe: f"/path/{exe}")
-    source_tool = source_root / "tools" / "ffmpeg"
+    exe_name = os_utils._bundled_exe_filename("ffmpeg")
+    source_tool = source_root / "tools" / exe_name
     source_tool.parent.mkdir(parents=True)
     source_tool.write_bytes(b"source")
-    bundled_tool = tmp_path / "dist" / "tools" / "ffmpeg"
+    bundled_tool = tmp_path / "dist" / "tools" / exe_name
     bundled_tool.parent.mkdir(parents=True)
     bundled_tool.write_bytes(b"frozen")
 
