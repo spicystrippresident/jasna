@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import traceback
 
 from tkinterdnd2 import TkinterDnD, DND_FILES
 
@@ -31,6 +32,7 @@ from jasna.gui.log_panel import LogPanel
 from jasna.gui.log_filter import runtime_log_level_for_filter
 from jasna.gui.run_log import AsyncRunLog, RunTelemetrySampler
 from jasna.gui.processor import Processor, ProgressUpdate, _is_linux_amd_runtime
+from jasna.gui.thread_dispatch import GuiThreadDispatcher
 from jasna.gui.models import JobStatus, PresetManager
 from jasna.gui.locales import get_locale, t, LANGUAGE_NAMES
 from jasna.gui.font_backend import (
@@ -102,12 +104,16 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self._run_telemetry_sampler: RunTelemetrySampler | None = None
         self._closing_run_logs: list[AsyncRunLog] = []
 
+        self._gui_dispatcher = GuiThreadDispatcher()
+        self._gui_dispatch_after_id: str | None = None
+
         self._system_stats_stop = threading.Event()
         self._system_stats_thread: threading.Thread | None = None
         
         self._build_ui()
         self._t_ui_built = startup_timing.elapsed_ms()
         self._setup_processor()
+        self._start_gui_dispatcher()
         self._start_system_stats_poller()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -404,6 +410,42 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
         threading.Thread(target=_run, daemon=True, name="cuda-warmup").start()
 
+    def _start_gui_dispatcher(self) -> None:
+        if self._gui_dispatch_after_id is None and not self._gui_dispatcher.closed:
+            self._gui_dispatch_after_id = self.after(0, self._drain_gui_dispatcher)
+
+    def _post_to_gui(self, callback, *args, **kwargs) -> bool:
+        """Queue a GUI callback without entering Tcl from the producer thread."""
+
+        return self._gui_dispatcher.post(callback, *args, **kwargs)
+
+    def _drain_gui_dispatcher(self) -> None:
+        self._gui_dispatch_after_id = None
+        if self._gui_dispatcher.closed:
+            return
+        for call in self._gui_dispatcher.take():
+            try:
+                call.callback(*call.args, **call.kwargs)
+            except Exception:
+                print("GUI callback failed", file=sys.stderr)
+                traceback.print_exc(file=sys.stderr)
+        delay_ms = 0 if self._gui_dispatcher.has_pending() else 20
+        if not self._gui_dispatcher.closed:
+            self._gui_dispatch_after_id = self.after(
+                delay_ms,
+                self._drain_gui_dispatcher,
+            )
+
+    def _stop_gui_dispatcher(self) -> None:
+        self._gui_dispatcher.close()
+        after_id = self._gui_dispatch_after_id
+        self._gui_dispatch_after_id = None
+        if after_id is not None:
+            try:
+                self.after_cancel(after_id)
+            except (tk.TclError, RuntimeError):
+                pass
+
     def _start_system_stats_poller(self):
         if self._system_stats_thread and self._system_stats_thread.is_alive():
             return
@@ -414,10 +456,7 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
             from jasna.gui.system_stats import read_system_stats
             while not self._system_stats_stop.is_set():
                 stats = read_system_stats()
-                try:
-                    self.after(0, lambda s=stats: self._apply_system_stats(s))
-                except Exception:
-                    logger.debug("System stats poller stopping (widget gone)", exc_info=True)
+                if not self._post_to_gui(self._apply_system_stats, stats):
                     return
                 self._system_stats_stop.wait(1.5)
 
@@ -512,13 +551,11 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
     def _on_run_log_status(self, level: str, message: str) -> None:
         if level.upper() != "WARNING":
             return
-        try:
-            self.after(
-                0,
-                lambda: self._log_panel.add_log("WARNING", t("run_log_unavailable")),
-            )
-        except Exception:
-            pass
+        self._post_to_gui(
+            self._log_panel.add_log,
+            "WARNING",
+            t("run_log_unavailable"),
+        )
 
     def _run_telemetry_context(self) -> dict[str, object]:
         context: dict[str, object] = {"gui_pid": os.getpid()}
@@ -577,6 +614,7 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
         except Exception:
             logger.debug("Could not persist working directory during shutdown", exc_info=True)
         try:
+            self._stop_gui_dispatcher()
             if self._processor:
                 self._processor.stop()
                 self._processor.join(timeout=5.0)
@@ -687,7 +725,7 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self._set_preview_gpu_busy(False)
         if self._closing_after_player:
             self._closing_after_player = False
-            self.after(0, self._on_close)
+            self._post_to_gui(self._on_close)
         
     def _update_start_button_state(self):
         jobs = self._queue_panel.get_jobs()
@@ -713,11 +751,11 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
         )
 
     def _set_preview_gpu_busy(self, busy: bool) -> None:
-        self._preview_gpu_busy = bool(busy)
-        try:
-            self.after(0, self._update_start_button_state)
-        except (tk.TclError, RuntimeError):
-            pass
+        self._post_to_gui(self._apply_preview_gpu_busy, bool(busy))
+
+    def _apply_preview_gpu_busy(self, busy: bool) -> None:
+        self._preview_gpu_busy = busy
+        self._update_start_button_state()
         
     def _show_toast(self, message: str, type_: str = "info"):
         """Show a toast notification."""
@@ -844,8 +882,7 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
             self._log_panel.pack_forget()
             
     def _on_processor_progress(self, update: ProgressUpdate):
-        # Schedule UI update on main thread
-        self.after(0, lambda: self._handle_progress(update))
+        self._post_to_gui(self._handle_progress, update)
         
     def _handle_progress(self, update: ProgressUpdate):
         jobs = self._queue_panel.get_jobs()
@@ -894,10 +931,10 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
             
     def _on_processor_log(self, level: str, message: str):
         self._enqueue_run_log(level, message)
-        self.after(0, lambda: self._log_panel.add_log(level, message))
+        self._post_to_gui(self._log_panel.add_log, level, message)
         
     def _on_processor_complete(self):
-        self.after(0, self._handle_complete)
+        self._post_to_gui(self._handle_complete)
         
     def _handle_complete(self):
         try:
@@ -1007,9 +1044,10 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
 class GUILogHandler(logging.Handler):
     """Custom logging handler that forwards logs to the GUI log panel."""
     
-    def __init__(self, log_panel: LogPanel, on_log=None):
+    def __init__(self, log_panel: LogPanel, post_to_gui, on_log=None):
         super().__init__()
         self._log_panel = log_panel
+        self._post_to_gui = post_to_gui
         self._on_log = on_log
         
     def emit(self, record):
@@ -1017,8 +1055,7 @@ class GUILogHandler(logging.Handler):
             msg = self.format(record)
             if self._on_log is not None:
                 self._on_log(record.levelname, msg)
-            # Use after_idle to thread-safely update GUI
-            self._log_panel.after_idle(self._log_panel.add_log, record.levelname, msg)
+            self._post_to_gui(self._log_panel.add_log, record.levelname, msg)
         except Exception:
             pass  # Ignore errors in log handler
 
@@ -1054,7 +1091,11 @@ def run_gui():
         return
     
     # Replace console handler with GUI handler for all jasna loggers
-    gui_handler = GUILogHandler(app._log_panel, on_log=app._enqueue_run_log)
+    gui_handler = GUILogHandler(
+        app._log_panel,
+        app._post_to_gui,
+        on_log=app._enqueue_run_log,
+    )
     gui_handler.setFormatter(logging.Formatter('%(message)s'))
     
     # Set up root logger to capture all logs
