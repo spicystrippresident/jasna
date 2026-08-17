@@ -1,5 +1,6 @@
 import io
 import json
+import os
 from pathlib import Path
 import stat
 from unittest.mock import patch
@@ -64,7 +65,7 @@ def test_request_round_trip_preserves_job_snapshot_and_settings(tmp_path: Path) 
     assert job.detection_score_threshold == 0.45
     assert settings.post_export_action == "command"
     assert payload["disable_basicvsrpp_tensorrt"] is True
-    if stat.S_IMODE(path.stat().st_mode):
+    if os.name != "nt" and stat.S_IMODE(path.stat().st_mode):
         assert stat.S_IMODE(path.stat().st_mode) & 0o077 == 0
 
 
