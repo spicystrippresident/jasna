@@ -1,12 +1,12 @@
 """First-run wizard for dependency checking."""
 
 import logging
-import os
 import subprocess
+import sys
 import threading
 import time
 import webbrowser
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 import customtkinter as ctk
 
@@ -25,6 +25,22 @@ _HELP_URLS = {
 }
 
 _WARNING_ONLY_CHECKS = {"sysmem"}
+
+
+def _should_check_nvidia_sysmem(
+    *,
+    platform_name: str | None = None,
+    nvidia_probe: Callable[[], bool] | None = None,
+) -> bool:
+    """Return whether the Windows-only NVIDIA sysmem check applies."""
+    resolved_platform = sys.platform if platform_name is None else platform_name
+    if resolved_platform != "win32":
+        return False
+    if nvidia_probe is None:
+        from jasna.accelerator import is_nvidia_device
+
+        nvidia_probe = is_nvidia_device
+    return bool(nvidia_probe())
 
 
 def _evaluate_check_results(
@@ -55,6 +71,7 @@ class FirstRunWizard(ctk.CTkToplevel):
         self._checks_passed = False
         self._has_required_failure = True
         self._check_results = {}
+        self._include_sysmem_check = _should_check_nvidia_sysmem()
         
         self.title(t("wizard_window_title"))
         self.resizable(True, False)
@@ -127,7 +144,7 @@ class FirstRunWizard(ctk.CTkToplevel):
             ("cuda", t("wizard_check_cuda")),
             ("driver", t("wizard_check_driver")),
         ]
-        if os.name == "nt":
+        if self._include_sysmem_check:
             checks.append(("sysmem", t("wizard_check_sysmem")))
         
         for key, label in checks:
@@ -281,7 +298,7 @@ class FirstRunWizard(ctk.CTkToplevel):
         self._check_results["gpu"] = self._check_gpu()
         self._check_results["cuda"] = self._check_cuda()
         self._check_results["driver"] = os_utils.check_gpu_driver_version()
-        if os.name == "nt":
+        if self._include_sysmem_check:
             self._check_results["sysmem"] = os_utils.check_windows_nvidia_sysmem_fallback_policy()
 
     def _check_executable(self, name: str) -> tuple[bool, str]:
