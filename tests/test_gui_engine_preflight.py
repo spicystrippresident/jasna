@@ -13,8 +13,13 @@ from jasna.gui.models import AppSettings
 @pytest.fixture(autouse=True)
 def _use_nvidia_preflight_by_default(monkeypatch):
     import jasna.accelerator as accelerator
+    import jasna.mosaic.detection_registry as registry
 
-    monkeypatch.setattr(accelerator, "is_amd_device", lambda _device: False)
+    def fake_is_amd(_device=None):
+        return False
+
+    monkeypatch.setattr(accelerator, "is_amd_device", fake_is_amd)
+    monkeypatch.setattr(registry, "is_amd_device", fake_is_amd)
 
 
 def _touch(path: Path) -> None:
@@ -163,10 +168,17 @@ def test_amd_preflight_has_no_engine_requirements(
     (tmp_path / "model_weights").mkdir(parents=True, exist_ok=True)
 
     import jasna.accelerator as accelerator
+    import jasna.mosaic.detection_registry as registry
 
     # AMD runs RF-DETR (rfdetr torch model) and YOLO through PyTorch and skips
     # BasicVSR++ TensorRT, so nothing needs precompiling.
-    monkeypatch.setattr(accelerator, "is_amd_device", lambda _device: True)
+    def fake_is_amd(_device=None):
+        return True
+
+    monkeypatch.setattr(accelerator, "is_amd_device", fake_is_amd)
+    monkeypatch.setattr(registry, "is_amd_device", fake_is_amd)
+
+    assert registry.rfdetr_weights_suffix() == ".pt"
 
     result = run_engine_preflight(AppSettings(compile_basicvsrpp=True))
 
