@@ -35,8 +35,8 @@ _libcuda: ctypes.CDLL | None = None
 # - "auto":    NVIDIA tries VALI first and falls back to PyAV hwaccel, then PyAV
 #              software, when VALI cannot open or decode the first frame. AMD
 #              tries rocDecode when enabled, then keeps its AMF -> software
-#              escalation. Windows HEVC Main10/P010 uses software decode plus
-#              ROCm upload directly because PyAV cannot transfer AMF P010 frames.
+#              escalation. Windows HEVC Main10/P010 and AV1 use software decode
+#              plus ROCm upload directly.
 # - "vali":    VALI only; any failure raises (NVIDIA only).
 # - "rocdecode": rocDecode only; any failure raises (Linux AMD only).
 # - "pyav-hw": skip VALI, use the PyAV hwaccel path with its software fallback.
@@ -67,14 +67,18 @@ def _requires_software_pyav_fallback(
     metadata: VideoMetadata,
     vendor: AcceleratorVendor,
 ) -> bool:
-    """Return whether PyAV AMF cannot transfer this input's hardware frames."""
+    """Return whether the platform must avoid PyAV AMF for this input."""
 
-    return (
-        sys.platform in {"linux", "win32"}
-        and vendor is AcceleratorVendor.AMD
-        and str(metadata.codec_name).lower() == "hevc"
-        and bool(metadata.is_10bit)
-    )
+    if vendor is not AcceleratorVendor.AMD:
+        return False
+    codec_name = str(metadata.codec_name).lower()
+    if sys.platform == "linux":
+        return codec_name == "hevc" and bool(metadata.is_10bit)
+    if sys.platform == "win32":
+        return codec_name == "av1" or (
+            codec_name == "hevc" and bool(metadata.is_10bit)
+        )
+    return False
 
 
 def _should_auto_rocdecode(
@@ -682,12 +686,21 @@ class NvidiaVideoReader:
             self.vendor,
         )
         if software_fallback and sys.platform == "win32":
-            log.warning(
-                "Windows AMD HEVC Main10/P010 cannot transfer PyAV AMF hardware "
-                "frames; using FFmpeg software decoding and uploading frames to ROCm "
-                "for %s",
-                self.file,
-            )
+            codec_name = str(self.metadata.codec_name).lower()
+            if codec_name == "av1":
+                log.warning(
+                    "Windows AMD AV1 PyAV AMF decoding is unreliable across frame "
+                    "transfer and shutdown; using FFmpeg software decoding and "
+                    "uploading frames to ROCm for %s",
+                    self.file,
+                )
+            else:
+                log.warning(
+                    "Windows AMD HEVC Main10/P010 cannot transfer PyAV AMF hardware "
+                    "frames; using FFmpeg software decoding and uploading frames to "
+                    "ROCm for %s",
+                    self.file,
+                )
         pyav_backend = "pyav-sw" if software_fallback else backend
         self._open_pyav(pyav_backend)
         return self
