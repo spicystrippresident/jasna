@@ -841,6 +841,18 @@ def concatenate_fragments(
     )
 
 
+def _ffmpeg_disposition(disposition) -> str:
+    """Serialize PyAV disposition flags for FFmpeg's stream option."""
+
+    value = int(disposition)
+    flags = [
+        name
+        for name, member in av.stream.Disposition.__members__.items()
+        if value & int(member)
+    ]
+    return "+".join(flags) if flags else "0"
+
+
 def mux_final_output(
     video: Path,
     source: Path,
@@ -930,7 +942,9 @@ def _final_mux_args(
 
     args = [*video_input_args, "-map", "0:v:0"]
     with av.open(str(source)) as container:
-        primary_video_index = container.streams.video[0].index
+        primary_video = container.streams.video[0]
+        primary_video_index = primary_video.index
+        primary_video_disposition = _ffmpeg_disposition(primary_video.disposition)
         copied_streams = []
         transcoded_subtitles: dict[int, str] = {}
         source_formats = set(container.format.name.split(","))
@@ -999,6 +1013,7 @@ def _final_mux_args(
             "-map_metadata:s:v:0", f"{source_input_index}:s:v:0",
             "-map_chapters", str(source_input_index),
             "-c", "copy",
+            "-disposition:v:0", primary_video_disposition,
         ]
         for output_index, stream in enumerate(copied_streams, start=1):
             args += [
