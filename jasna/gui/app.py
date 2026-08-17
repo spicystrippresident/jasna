@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import traceback
 
 from tkinterdnd2 import TkinterDnD, DND_FILES
 
@@ -414,7 +415,8 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
             try:
                 call.callback(*call.args, **call.kwargs)
             except Exception:
-                logger.warning("GUI callback failed", exc_info=True)
+                print("GUI callback failed", file=sys.stderr)
+                traceback.print_exc(file=sys.stderr)
         delay_ms = 0 if self._gui_dispatcher.has_pending() else 20
         if not self._gui_dispatcher.closed:
             self._gui_dispatch_after_id = self.after(
