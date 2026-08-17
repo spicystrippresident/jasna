@@ -123,10 +123,11 @@ With `--segments`, the codec is locked to the input video's codec and
 the command line is sent to the active encoder unchanged; switching codecs does
 not translate it. Lower values improve quality and increase file size.
 
-Linux AMD 10-bit AV1 is an exception: AMF cannot open P010 with PreAnalysis,
-and QVBR without PreAnalysis does not honor the bitrate ceiling. Jasna therefore
-uses source-tied peak VBR for that combination; `--cq` is accepted for interface
-compatibility but is not applied as a QVBR quality target.
+AMD 10-bit AV1 is an exception on both Linux and Windows: AMF cannot reliably
+open P010 with PreAnalysis, and QVBR without PreAnalysis does not honor the
+bitrate ceiling. Jasna therefore uses source-tied peak VBR for that combination;
+`--cq` is accepted for interface compatibility but is not applied as a QVBR
+quality target.
 
 | GPU | H.264 default | HEVC default | AV1 default | Accepted range |
 | --- | ---: | ---: | ---: | --- |
@@ -214,15 +215,15 @@ Per-codec extras:
 
 | Key | What it does |
 | --- | ------------ |
-| `cq` | Quality target passed unchanged as AMF's `qvbr_quality_level`. Lower = better. Range 0–51; defaults 24 (H.264), 25 (HEVC), 32 (AV1). Linux AMD 10-bit AV1 uses the source-tied peak-VBR exception above. |
+| `cq` | Quality target passed unchanged as AMF's `qvbr_quality_level`. Lower = better. Range 0–51; defaults 24 (H.264), 25 (HEVC), 32 (AV1). AMD 10-bit AV1 uses the source-tied peak-VBR exception above on Linux and Windows. |
 | `qvbr_quality_level` | AMF's native alias. Accepted in CLI advanced settings when `--cq` is omitted; not accepted in the GUI custom-args field. |
 | `usage` | Encoder usage profile. Default `high_quality`. |
 | `quality` | Speed/quality preset: `speed`, `balanced`, `quality` (default). |
-| `rc` | Rate-control mode. Default `qvbr`; Linux AMD 10-bit AV1 is forced to `vbr_peak`. |
+| `rc` | Rate-control mode. Default `qvbr`; AMD 10-bit AV1 is forced to `vbr_peak` on Linux and Windows. |
 | `preset` | AMF preset. |
 | `g` | Keyframe interval in frames. Default 250. |
 | `bf` | Max consecutive B-frames. |
-| `preanalysis` | Pre-analysis pass, enabled by default and forced off for Linux AMD 10-bit AV1. |
+| `preanalysis` | Pre-analysis pass, enabled by default and forced off for AMD 10-bit AV1 on Linux and Windows. |
 | `vbaq` | Variance-based adaptive quantization for H.264/HEVC. AV1 uses `aq_mode`. |
 | `maxrate` / `bufsize` | Bitrate cap and VBV buffer size, in bits per second. Set automatically from the source bitrate unless you pass `maxrate`. |
 | `profile` / `level` | Codec profile and level. |

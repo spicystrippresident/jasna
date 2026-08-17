@@ -119,9 +119,9 @@ jasna --input input_folder --output output_folder
 `--cq` 是主要的质量控制。GUI 显示或命令行输入的数值会原样传给当前编码器；
 切换编解码器不会转换数值。数值越低，质量越好，文件越大。
 
-Linux AMD 10-bit AV1 是例外：AMF 无法在 P010 输入上启用 PreAnalysis，而关闭
-PreAnalysis 的 QVBR 不会遵守码率上限。因此 Jasna 对这一组合使用与源码率绑定的峰值
-VBR；`--cq` 为保持接口兼容仍可使用，但不会作为 QVBR 质量目标生效。
+Linux 和 Windows 上的 AMD 10-bit AV1 是例外：AMF 无法在 P010 输入上稳定启用
+PreAnalysis，而关闭 PreAnalysis 的 QVBR 不会遵守码率上限。因此 Jasna 对这一组合使用
+与源码率绑定的峰值 VBR；`--cq` 为保持接口兼容仍可使用，但不会作为 QVBR 质量目标生效。
 
 | GPU | H.264 默认值 | HEVC 默认值 | AV1 默认值 | 允许范围 |
 | --- | ---: | ---: | ---: | --- |
@@ -203,15 +203,15 @@ NVIDIA H.264 获得更多余量，因为保留修复后的细节需要更多码�
 
 | 参数 | 作用 |
 | --- | ------------ |
-| `cq` | 数值不变、作为 AMF `qvbr_quality_level` 传递的质量目标。越低越好。范围 0–51；默认 24（H.264）、25（HEVC）、32（AV1）。Linux AMD 10-bit AV1 使用上文的源码率峰值 VBR 例外。 |
+| `cq` | 数值不变、作为 AMF `qvbr_quality_level` 传递的质量目标。越低越好。范围 0–51；默认 24（H.264）、25（HEVC）、32（AV1）。Linux 和 Windows 上的 AMD 10-bit AV1 使用上文的源码率峰值 VBR 例外。 |
 | `qvbr_quality_level` | AMF 原生别名。省略 `--cq` 时可用于 CLI 高级设置；GUI 自定义参数中不接受。 |
 | `usage` | 编码器用途配置。默认 `high_quality`。 |
 | `quality` | 速度/质量预设: `speed`、`balanced`、`quality`（默认）。 |
-| `rc` | 码率控制模式。默认 `qvbr`；Linux AMD 10-bit AV1 强制使用 `vbr_peak`。 |
+| `rc` | 码率控制模式。默认 `qvbr`；Linux 和 Windows 上的 AMD 10-bit AV1 强制使用 `vbr_peak`。 |
 | `preset` | AMF 预设。 |
 | `g` | 关键帧间隔（帧数）。默认 250。 |
 | `bf` | 最大连续 B 帧数。 |
-| `preanalysis` | 预分析，默认开启；Linux AMD 10-bit AV1 强制关闭。 |
+| `preanalysis` | 预分析，默认开启；Linux 和 Windows 上的 AMD 10-bit AV1 强制关闭。 |
 | `vbaq` | H.264/HEVC 的基于方差自适应量化；AV1 使用 `aq_mode`。 |
 | `maxrate` / `bufsize` | 码率上限和 VBV 缓冲区大小（比特/秒）。除非指定 `maxrate`，否则会根据源码率自动设置。 |
 | `profile` / `level` | 编解码器 profile 和 level。 |

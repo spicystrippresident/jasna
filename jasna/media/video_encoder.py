@@ -3,7 +3,6 @@ from __future__ import annotations
 import heapq
 import logging
 import queue
-import sys
 import threading
 from collections import deque
 from dataclasses import dataclass, field
@@ -492,16 +491,15 @@ class NvidiaVideoEncoder:
         self.encoder_options = dict(spec.default_options)
         overrides: dict[str, str] = {}
         self._target_bit_rate: int | None = None
-        linux_amd_av1_main10 = (
+        amd_av1_main10 = (
             self.vendor is AcceleratorVendor.AMD
-            and sys.platform == "linux"
             and codec == "av1"
             and spec.ten_bit
         )
-        if linux_amd_av1_main10:
-            # Linux AMF 1.4.37 cannot open P010 AV1 while PreAnalysis is
-            # enabled. Keep the hardware encoder and disable only the
-            # incompatible analysis stage.
+        if amd_av1_main10:
+            # AMD AMF cannot reliably open P010 AV1 with PreAnalysis enabled
+            # on the supported Linux and Windows runtimes. Keep the hardware
+            # encoder and disable only the incompatible analysis stage.
             self.encoder_options["preanalysis"] = "0"
         if encoder_settings:
             overrides = {k: _option_value(v) for k, v in encoder_settings.items()}
@@ -533,7 +531,7 @@ class NvidiaVideoEncoder:
                 )
             )
         self.encoder_options.update(overrides)
-        if linux_amd_av1_main10:
+        if amd_av1_main10:
             # Without PreAnalysis, AMF QVBR ignores maxrate/bufsize and can
             # exceed 600 Mbps on 8K input. Peak VBR plus codec_context.bit_rate
             # preserves the existing source-tied rate contract at the same
