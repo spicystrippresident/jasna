@@ -1,4 +1,6 @@
+import sys
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -298,21 +300,29 @@ class TestRfDetrCall:
 
 
 class TestCompileRfdetrEngine:
-    def test_delegates_to_compile_onnx(self):
-        with patch("jasna.trt.compile_onnx_to_tensorrt_engine", return_value=Path("out.engine")) as mock_compile:
-            result = compile_rfdetr_engine(
-                Path("model.onnx"),
-                torch.device("cuda:0"),
-                batch_size=4,
-                resolution=576,
-                dynamic_batch=True,
-                fp16=True,
-            )
-            mock_compile.assert_called_once_with(
-                Path("model.onnx"), torch.device("cuda:0"),
-                batch_size=4, fp16=True, workspace_gb=20, dynamic_batch=True,
-            )
-            assert result == Path("out.engine")
+    def test_delegates_to_compile_onnx(self, monkeypatch):
+        import jasna.mosaic.rfdetr as module
+
+        mock_compile = MagicMock(return_value=Path("out.engine"))
+        trt_module = ModuleType("jasna.trt")
+        trt_module.compile_onnx_to_tensorrt_engine = mock_compile
+        monkeypatch.setitem(sys.modules, "jasna.trt", trt_module)
+        monkeypatch.setattr(module, "is_amd_device", lambda _device: False)
+        monkeypatch.setattr(module, "is_nvidia_device", lambda _device: True)
+
+        result = compile_rfdetr_engine(
+            Path("model.onnx"),
+            torch.device("cuda:0"),
+            batch_size=4,
+            resolution=576,
+            dynamic_batch=True,
+            fp16=True,
+        )
+        mock_compile.assert_called_once_with(
+            Path("model.onnx"), torch.device("cuda:0"),
+            batch_size=4, fp16=True, workspace_gb=20, dynamic_batch=True,
+        )
+        assert result == Path("out.engine")
 
     def test_amd_is_a_noop_returning_the_weights_path(self, monkeypatch, tmp_path):
         import jasna.mosaic.rfdetr as module
