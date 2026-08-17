@@ -877,6 +877,8 @@ class Pipeline:
                 manifest=workspace.path / "fragments.ffconcat",
                 codec=codec,
             )
+            if self._cancel_event.is_set():
+                return
             try:
                 workspace.cleanup()
             except OSError:
