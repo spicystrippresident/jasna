@@ -64,7 +64,7 @@ def _read_amd_sysfs() -> tuple[int | None, int | None, int | None]:
 
 
 def _read_loaded_torch_amd() -> tuple[int | None, int | None, int | None]:
-    """Read the active HIP device without importing or initializing torch here."""
+    """Read GUI device zero from HIP without importing or initializing torch."""
     torch = sys.modules.get("torch")
     if torch is None or not getattr(getattr(torch, "version", None), "hip", None):
         return None, None, None
@@ -73,7 +73,9 @@ def _read_loaded_torch_amd() -> tuple[int | None, int | None, int | None]:
         cuda = torch.cuda
         if not cuda.is_available():
             return None, None, None
-        device = cuda.current_device()
+        # GUI sessions currently run inference on logical ``cuda:0``. Query the
+        # same device instead of inheriting mutable per-thread CUDA state.
+        device = 0
         total = int(cuda.get_device_properties(device).total_memory)
         if total <= 0:
             return None, None, None
@@ -94,9 +96,14 @@ def _read_loaded_torch_amd() -> tuple[int | None, int | None, int | None]:
 
 def read_gpu_vram() -> tuple[int | None, int | None, int | None]:
     if sys.platform == "win32":
-        amd_stats = _read_loaded_torch_amd()
-        if amd_stats[2] is not None:
-            return amd_stats
+        torch = sys.modules.get("torch")
+        if torch is not None and getattr(
+            getattr(torch, "version", None), "hip", None
+        ):
+            # Once the loaded runtime identifies the GUI as AMD, never mix in
+            # capacity from a second NVIDIA adapter after a transient HIP query
+            # failure. A later poll can retry the same AMD source.
+            return _read_loaded_torch_amd()
 
     exe_path = os_utils.find_executable("nvidia-smi")
     if exe_path is None:

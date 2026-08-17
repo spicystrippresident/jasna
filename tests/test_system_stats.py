@@ -118,6 +118,57 @@ def test_read_gpu_vram_prefers_loaded_hip_torch_on_windows(monkeypatch) -> None:
     assert system_stats.read_gpu_vram() == (None, 25, 1200)
 
 
+def test_read_loaded_torch_amd_uses_gui_device_zero(monkeypatch) -> None:
+    calls = []
+
+    def _get_properties(device):
+        calls.append(("properties", device))
+        return SimpleNamespace(total_memory=1200)
+
+    def _get_memory(device):
+        calls.append(("memory", device))
+        return 900, 1200
+
+    fake_torch = SimpleNamespace(
+        version=SimpleNamespace(hip="7.2"),
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            current_device=lambda: (_ for _ in ()).throw(
+                AssertionError("system telemetry must match GUI cuda:0")
+            ),
+            get_device_properties=_get_properties,
+            mem_get_info=_get_memory,
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    assert system_stats._read_loaded_torch_amd() == (None, 25, 1200)
+    assert calls == [("properties", 0), ("memory", 0)]
+
+
+def test_read_gpu_vram_does_not_mix_loaded_hip_and_nvidia_on_windows(
+    monkeypatch,
+) -> None:
+    fake_torch = SimpleNamespace(
+        version=SimpleNamespace(hip="7.2"),
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            get_device_properties=lambda _device: (_ for _ in ()).throw(
+                RuntimeError("HIP capacity query failed")
+            ),
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(system_stats.sys, "platform", "win32")
+
+    def _should_not_find(_name):
+        raise AssertionError("loaded HIP runtime must not use NVIDIA capacity")
+
+    monkeypatch.setattr(system_stats.os_utils, "find_executable", _should_not_find)
+
+    assert system_stats.read_gpu_vram() == (None, None, None)
+
+
 def test_read_loaded_torch_amd_does_not_import_torch(monkeypatch) -> None:
     monkeypatch.delitem(sys.modules, "torch", raising=False)
 
