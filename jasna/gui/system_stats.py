@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
-import subprocess
 
 from jasna import os_utils
 
@@ -62,7 +63,41 @@ def _read_amd_sysfs() -> tuple[int | None, int | None, int | None]:
     return None, None, None
 
 
+def _read_loaded_torch_amd() -> tuple[int | None, int | None, int | None]:
+    """Read the active HIP device without importing or initializing torch here."""
+    torch = sys.modules.get("torch")
+    if torch is None or not getattr(getattr(torch, "version", None), "hip", None):
+        return None, None, None
+
+    try:
+        cuda = torch.cuda
+        if not cuda.is_available():
+            return None, None, None
+        device = cuda.current_device()
+        total = int(cuda.get_device_properties(device).total_memory)
+        if total <= 0:
+            return None, None, None
+    except Exception:
+        return None, None, None
+
+    vram_util: int | None = None
+    try:
+        free, _driver_total = cuda.mem_get_info(device)
+        used = max(0, total - int(free))
+        vram_util = _clamp_pct((used / total) * 100.0)
+    except Exception:
+        # Total capacity is enough for the hidden batch policy. Utilization is
+        # best-effort because some Windows ROCm builds omit AMD SMI support.
+        pass
+    return None, vram_util, total
+
+
 def read_gpu_vram() -> tuple[int | None, int | None, int | None]:
+    if sys.platform == "win32":
+        amd_stats = _read_loaded_torch_amd()
+        if amd_stats[2] is not None:
+            return amd_stats
+
     exe_path = os_utils.find_executable("nvidia-smi")
     if exe_path is None:
         return _read_amd_sysfs()
