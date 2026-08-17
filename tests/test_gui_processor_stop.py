@@ -152,6 +152,53 @@ def test_video_post_export_runs_after_final_output_validation(tmp_path):
     assert output_paths_during_validation == [None]
 
 
+def test_stop_during_final_validation_prevents_completion_markers(tmp_path):
+    def write_new_output(job_id, input_path, output_path, **kwargs):
+        output_path.write_bytes(b"new completed output")
+
+    processor, job, updates = _processor_with_job(tmp_path, write_new_output)
+    processor._settings.pre_scan_policy = "off"
+
+    def validate(*_args, **_kwargs):
+        processor.stop()
+
+    with patch(
+        "jasna.media.splice.sync_and_validate_final_output",
+        side_effect=validate,
+    ):
+        processor._run()
+
+    assert processor._stop_event.is_set()
+    assert job.status is JobStatus.PENDING
+    assert job.output_path is None
+    assert getattr(processor, "completed_processing_path", lambda _job_id: None)(job.id) is None
+    assert updates[-1].status is JobStatus.PENDING
+
+
+def test_stop_during_post_export_prevents_completion_markers(tmp_path):
+    def write_new_output(job_id, input_path, output_path, **kwargs):
+        output_path.write_bytes(b"new completed output")
+
+    processor, job, updates = _processor_with_job(tmp_path, write_new_output)
+    processor._settings = AppSettings(post_export_video_command="remux {output}")
+    processor._settings.pre_scan_policy = "off"
+
+    with (
+        patch("jasna.media.splice.sync_and_validate_final_output"),
+        patch(
+            "jasna.post_export_action.run_post_export_video_command",
+            side_effect=lambda *_args, **_kwargs: processor.stop(),
+        ),
+    ):
+        processor._run()
+
+    assert processor._stop_event.is_set()
+    assert job.status is JobStatus.PENDING
+    assert job.output_path is None
+    assert getattr(processor, "completed_processing_path", lambda _job_id: None)(job.id) is None
+    assert updates[-1].status is JobStatus.PENDING
+
+
 def test_validation_failure_skips_video_post_export_command(tmp_path):
     def write_new_output(job_id, input_path, output_path, **kwargs):
         output_path.write_bytes(b"new completed output")

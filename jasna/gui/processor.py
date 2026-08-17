@@ -66,6 +66,7 @@ class Processor:
         
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        self._completion_lock = threading.Lock()
         self._pause_event = threading.Event()
         self._pause_event.set()  # Not paused by default
         
@@ -99,7 +100,8 @@ class Processor:
         self._output_pattern = output_pattern
         self._disable_basicvsrpp_tensorrt_for_run = bool(disable_basicvsrpp_tensorrt)
         
-        self._stop_event.clear()
+        with self._completion_lock:
+            self._stop_event.clear()
         self._pause_event.set()
         
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -115,7 +117,11 @@ class Processor:
         return not self._pause_event.is_set()
         
     def stop(self):
-        self._stop_event.set()
+        # Linearize Stop against the final job-state commit. If Stop wins this
+        # lock after output validation, the current job remains pending; if the
+        # completion commit wins, the completed job remains authoritative.
+        with self._completion_lock:
+            self._stop_event.set()
         self._pause_event.set()  # Unpause to allow thread to exit
         pipeline = self._current_pipeline
         if pipeline is not None:
@@ -199,6 +205,15 @@ class Processor:
             raise ValueError(
                 f"completed output was not created or changed by this job: {output_path}"
             )
+
+    def _commit_completed_job(self, job: JobItem, output_path: Path) -> None:
+        """Commit terminal job fields atomically with respect to ``stop()``."""
+
+        with self._completion_lock:
+            if self._stop_event.is_set():
+                raise ProcessingStopped("Processing stopped")
+            job.output_path = output_path
+            job.status = JobStatus.COMPLETED
 
     def _run(self):
         self._log("INFO", "Processing started")
@@ -328,10 +343,9 @@ class Processor:
                     previous_fingerprint=previous_output_fingerprint,
                 )
 
-            job.output_path = output_path
             if not is_image:
                 self._run_post_export_video_command(input_path, output_path)
-            job.status = JobStatus.COMPLETED
+            self._commit_completed_job(job, output_path)
             self._progress(ProgressUpdate(
                 job_id=job.id,
                 status=JobStatus.COMPLETED,
