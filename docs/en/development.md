@@ -37,21 +37,20 @@ uv pip install ".[amd]" \
   --find-links https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/
 ```
 
-**AMD Windows** (ROCm 7.2.1 — Python 3.12, Adrenalin ≥ 26.2.2). Install the ROCm
-SDK + torch/torchvision ROCm wheels FIRST, with `--no-deps` so pip cannot silently
-replace them with the CPU `torch==2.9.1` from PyPI when a later dependency
-(torchvision, rfdetr, …) pulls torch — that swap is the usual cause of a
-"non-ROCm torch/torchvision" env:
+**AMD Windows** (ROCm 7.2.1 — Python 3.12, Adrenalin ≥ 26.2.2). Install the full
+ROCm environment listed by AMD, then expose the ROCm wheel directory to uv while
+installing Jasna. The `--find-links` argument is important: without it uv can
+replace a previously installed `torch==2.9.1+rocm7.2.1` with the PyPI CPU
+`torch==2.9.1` while resolving the remaining project dependencies.
 
 ```powershell
 $R = "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1"
-pip install --no-deps `
+pip install --no-cache-dir `
   "$R/rocm_sdk_core-7.2.1-py3-none-win_amd64.whl" `
+  "$R/rocm_sdk_devel-7.2.1-py3-none-win_amd64.whl" `
   "$R/rocm_sdk_libraries_custom-7.2.1-py3-none-win_amd64.whl" `
-  "$R/torch-2.9.1+rocm7.2.1-cp312-cp312-win_amd64.whl" `
-  "$R/torchvision-0.24.1+rocm7.2.1-cp312-cp312-win_amd64.whl"
-# then the remaining AMD deps (torch/torchvision above already satisfy the pins)
-uv pip install ".[amd]"
+  "$R/rocm-7.2.1.tar.gz"
+uv pip install -e ".[amd,dev]" --find-links "$R/"
 ```
 
 The `rocm_sdk_core` / `rocm_sdk_libraries_*` wheels are the ROCm runtime itself.
@@ -68,7 +67,9 @@ Verify ROCm actually stuck on either OS (the Linux Docker build asserts the same
 python -c "import torch, torchvision; assert torch.version.hip and '+rocm' in torchvision.__version__; print('ROCm OK', torch.__version__, torchvision.__version__)"
 ```
 
-`jasna[amd]` pins `torch==2.9.1` as a plain version on purpose: the ROCm wheels
+The `rocm_sdk_devel` wheel and `rocm` package are required parts of AMD's Windows
+environment setup; `rocm` provides the `rocm_sdk` module imported by torch at
+startup. `jasna[amd]` pins `torch==2.9.1` as a plain version on purpose: the ROCm wheels
 (`2.9.1+rocm7.2.1`) satisfy it, and a `+rocm7.2.1` *local-version* pin can't be
 shared across OSes. torchvision is pinned per OS (`0.24.0` on Linux, `0.24.1`
 on Windows) because the ROCm channels ship different versions — the Linux
