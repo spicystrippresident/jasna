@@ -27,7 +27,8 @@ _libcuda: ctypes.CDLL | None = None
 # Decode backend selection (`JASNA_DECODE_BACKEND` overrides the default):
 # - "auto":    NVIDIA tries VALI first and falls back to PyAV hwaccel, then PyAV
 #              software, when VALI cannot open or decode the first frame. AMD
-#              keeps its AMF -> software escalation.
+#              keeps its AMF -> software escalation except that Windows HEVC
+#              Main10/P010 uses software decode plus ROCm upload directly.
 # - "vali":    VALI only; any failure raises (NVIDIA only).
 # - "pyav-hw": skip VALI, use the PyAV hwaccel path with its software fallback.
 # - "pyav-sw": force FFmpeg software decoding with GPU upload on every vendor.
@@ -55,6 +56,26 @@ def _decode_backend() -> str:
             f"expected {_DECODE_BACKENDS}"
         )
     return backend
+
+
+def _requires_windows_amd_software_decode(
+    metadata: VideoMetadata,
+    vendor: AcceleratorVendor,
+) -> bool:
+    """Return whether auto mode must avoid PyAV's AMF decoder.
+
+    PyAV can open AMF for HEVC Main10 on Windows, but cannot transfer the
+    resulting P010 hardware frame into a usable ``VideoFrame``.  Decode those
+    inputs with FFmpeg on the CPU and keep the existing ROCm upload path.  An
+    explicit ``pyav-hw`` selection still bypasses this automatic workaround so
+    AMF remains available for diagnostics.
+    """
+    return (
+        sys.platform == "win32"
+        and vendor is AcceleratorVendor.AMD
+        and str(metadata.codec_name).lower() == "hevc"
+        and bool(metadata.is_10bit)
+    )
 
 
 def _cuda_driver() -> ctypes.CDLL:
@@ -286,8 +307,19 @@ class NvidiaVideoReader:
                     return self
             elif backend == "vali":
                 raise VideoDecodeError("The VALI decode backend requires an NVIDIA device")
-        software_only = backend == "pyav-sw"
+        windows_amd_main10 = backend == "auto" and _requires_windows_amd_software_decode(
+            self.metadata,
+            self.vendor,
+        )
+        software_only = backend == "pyav-sw" or windows_amd_main10
         self._software_only = software_only
+        if windows_amd_main10:
+            log.warning(
+                "Windows AMD HEVC Main10/P010 cannot transfer PyAV AMF hardware "
+                "frames; using FFmpeg software decoding and uploading frames to ROCm "
+                "for %s",
+                self.file,
+            )
         try:
             if not software_only and self.vendor is AcceleratorVendor.NVIDIA:
                 hwaccel = HWAccel(
