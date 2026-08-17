@@ -399,15 +399,19 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self._system_stats_stop.clear()
 
         def _loop():
-            from jasna.gui.system_stats import read_system_stats
-            while not self._system_stats_stop.is_set():
-                stats = read_system_stats()
-                try:
-                    self.after(0, lambda s=stats: self._apply_system_stats(s))
-                except Exception:
-                    logger.debug("System stats poller stopping (widget gone)", exc_info=True)
-                    return
-                self._system_stats_stop.wait(1.5)
+            from jasna.gui.system_stats import close_gpu_telemetry, read_system_stats
+
+            try:
+                while not self._system_stats_stop.is_set():
+                    stats = read_system_stats()
+                    try:
+                        self.after(0, lambda s=stats: self._apply_system_stats(s))
+                    except Exception:
+                        logger.debug("System stats poller stopping (widget gone)", exc_info=True)
+                        return
+                    self._system_stats_stop.wait(1.5)
+            finally:
+                close_gpu_telemetry()
 
         self._system_stats_thread = threading.Thread(target=_loop, daemon=True)
         self._system_stats_thread.start()
