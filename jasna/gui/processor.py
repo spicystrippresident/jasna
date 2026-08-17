@@ -164,25 +164,48 @@ class Processor:
             ),
         )
 
-    def _skip_existing_final_output(
+    def _handle_existing_final_output(
         self,
         job: JobItem,
         output_path: Path,
         *,
         file_conflict: str,
-    ) -> bool:
-        """Skip completed preserved-folder outputs when a batch is resumed."""
+        is_image: bool,
+        configured_codec: str,
+    ) -> str:
+        """Return ``process``, ``replace`` or ``skip`` for an existing output."""
 
         preserved_folder_batch = (
             job.input_root is not None
             and bool(self._output_folder)
             and self._preserve_input_structure
         )
-        should_skip = file_conflict == "skip" or (
-            preserved_folder_batch and file_conflict == "auto_rename"
-        )
-        if not should_skip or not output_path.is_file():
-            return False
+        if not output_path.is_file():
+            return "process"
+        if file_conflict == "skip":
+            action = "skip"
+        elif preserved_folder_batch and file_conflict == "auto_rename":
+            action = "skip"
+            if not is_image:
+                from jasna.gui.resume_validation import (
+                    ResumeOutputValidationError,
+                    validate_resume_video_output,
+                )
+
+                try:
+                    validate_resume_video_output(
+                        job.path,
+                        output_path,
+                        configured_codec=configured_codec,
+                    )
+                except ResumeOutputValidationError as exc:
+                    self._log(
+                        "WARNING",
+                        f"Existing output is incomplete; replacing {output_path.name}: {exc}",
+                    )
+                    return "replace"
+        else:
+            return "process"
         job.status = JobStatus.SKIPPED
         self._progress(ProgressUpdate(
             job_id=job.id,
@@ -190,7 +213,7 @@ class Processor:
             message=f"Output file already exists: {output_path.name}",
         ))
         self._log("WARNING", f"Skipped {job.filename}: output file already exists")
-        return True
+        return action
 
     def _run(self):
         self._log("INFO", "Processing started")
@@ -266,14 +289,20 @@ class Processor:
         # Handle file conflict based on settings
         file_conflict = job_settings.file_conflict
         
-        if self._skip_existing_final_output(
+        existing_output_action = self._handle_existing_final_output(
             job,
             output_path,
             file_conflict=file_conflict,
-        ):
+            is_image=is_image,
+            configured_codec=job_settings.codec,
+        )
+        if existing_output_action == "skip":
             return
         if output_path.exists():
-            if file_conflict == "auto_rename":
+            if (
+                file_conflict == "auto_rename"
+                and existing_output_action != "replace"
+            ):
                 output_path = self._get_unique_output_path(output_path)
                 self._log("INFO", f"Renamed output to {output_path.name} to avoid overwrite")
             # "overwrite" - just proceed and let the file be replaced
