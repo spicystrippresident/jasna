@@ -8,6 +8,8 @@ from pathlib import Path
 from jasna import os_utils
 
 _DRM_CLASS_PATH = Path("/sys/class/drm")
+_windows_gpu_reader = None
+_windows_gpu_reader_luid: str | None = None
 
 
 @dataclass(frozen=True)
@@ -82,6 +84,10 @@ def _read_loaded_torch_amd() -> tuple[int | None, int | None, int | None]:
     except Exception:
         return None, None, None
 
+    gpu_util: int | None = None
+    if sys.platform == "win32":
+        gpu_util = _read_windows_amd_gpu_util(str(torch.version.hip), device)
+
     vram_util: int | None = None
     try:
         free, _driver_total = cuda.mem_get_info(device)
@@ -91,7 +97,48 @@ def _read_loaded_torch_amd() -> tuple[int | None, int | None, int | None]:
         # Total capacity is enough for the hidden batch policy. Utilization is
         # best-effort because some Windows ROCm builds omit AMD SMI support.
         pass
-    return None, vram_util, total
+    return gpu_util, vram_util, total
+
+
+def _loaded_hip_device_luid(hip_version: str, device: int) -> str | None:
+    from jasna.gui.windows_gpu_usage import hip_luid_from_loaded_runtime
+
+    return hip_luid_from_loaded_runtime(hip_version, device)
+
+
+def _new_windows_gpu_reader():
+    from jasna.gui.windows_gpu_usage import WindowsGpuUsageReader
+
+    return WindowsGpuUsageReader()
+
+
+def _read_windows_amd_gpu_util(hip_version: str, device: int) -> int | None:
+    global _windows_gpu_reader, _windows_gpu_reader_luid
+
+    try:
+        luid = _loaded_hip_device_luid(hip_version, device)
+        if luid is None:
+            return None
+        if _windows_gpu_reader is None or _windows_gpu_reader_luid != luid:
+            close_gpu_telemetry()
+            _windows_gpu_reader = _new_windows_gpu_reader()
+            _windows_gpu_reader_luid = luid
+        return _windows_gpu_reader.read_percent(luid)
+    except Exception:
+        close_gpu_telemetry()
+        return None
+
+
+def close_gpu_telemetry() -> None:
+    global _windows_gpu_reader, _windows_gpu_reader_luid
+
+    reader, _windows_gpu_reader = _windows_gpu_reader, None
+    _windows_gpu_reader_luid = None
+    if reader is not None:
+        try:
+            reader.close()
+        except Exception:
+            pass
 
 
 def read_gpu_vram() -> tuple[int | None, int | None, int | None]:

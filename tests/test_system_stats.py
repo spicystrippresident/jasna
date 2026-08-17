@@ -109,13 +109,18 @@ def test_read_gpu_vram_prefers_loaded_hip_torch_on_windows(monkeypatch) -> None:
     )
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
     monkeypatch.setattr(system_stats.sys, "platform", "win32")
+    monkeypatch.setattr(
+        system_stats,
+        "_read_windows_amd_gpu_util",
+        lambda _hip_version, _device: 61,
+    )
 
     def _should_not_find(_name):
         raise AssertionError("active HIP telemetry must precede nvidia-smi")
 
     monkeypatch.setattr(system_stats.os_utils, "find_executable", _should_not_find)
 
-    assert system_stats.read_gpu_vram() == (None, 25, 1200)
+    assert system_stats.read_gpu_vram() == (61, 25, 1200)
 
 
 def test_read_loaded_torch_amd_uses_gui_device_zero(monkeypatch) -> None:
@@ -141,9 +146,19 @@ def test_read_loaded_torch_amd_uses_gui_device_zero(monkeypatch) -> None:
         ),
     )
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(system_stats.sys, "platform", "win32")
+    monkeypatch.setattr(
+        system_stats,
+        "_read_windows_amd_gpu_util",
+        lambda hip_version, device: calls.append(("util", hip_version, device)) or 62,
+    )
 
-    assert system_stats._read_loaded_torch_amd() == (None, 25, 1200)
-    assert calls == [("properties", 0), ("memory", 0)]
+    assert system_stats._read_loaded_torch_amd() == (62, 25, 1200)
+    assert calls == [
+        ("properties", 0),
+        ("util", "7.2", 0),
+        ("memory", 0),
+    ]
 
 
 def test_read_gpu_vram_does_not_mix_loaded_hip_and_nvidia_on_windows(
@@ -203,8 +218,74 @@ def test_read_loaded_torch_amd_keeps_total_when_usage_query_fails(
         ),
     )
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(system_stats.sys, "platform", "win32")
+    monkeypatch.setattr(
+        system_stats,
+        "_read_windows_amd_gpu_util",
+        lambda _hip_version, _device: 45,
+    )
 
-    assert system_stats._read_loaded_torch_amd() == (None, None, 1200)
+    assert system_stats._read_loaded_torch_amd() == (45, None, 1200)
+
+
+def test_windows_amd_gpu_reader_is_reused_after_its_prime_sample(monkeypatch) -> None:
+    class Reader:
+        def __init__(self):
+            self.values = iter((None, 74))
+            self.closed = False
+
+        def read_percent(self, luid):
+            assert luid == "0x00000000_0x0000f823"
+            return next(self.values)
+
+        def close(self):
+            self.closed = True
+
+    reader = Reader()
+    monkeypatch.setattr(
+        system_stats,
+        "_loaded_hip_device_luid",
+        lambda _hip_version, _device: "0x00000000_0x0000f823",
+    )
+    monkeypatch.setattr(system_stats, "_new_windows_gpu_reader", lambda: reader)
+    system_stats.close_gpu_telemetry()
+
+    assert system_stats._read_windows_amd_gpu_util("7.2", 0) is None
+    assert system_stats._read_windows_amd_gpu_util("7.2", 0) == 74
+    assert not reader.closed
+    system_stats.close_gpu_telemetry()
+    assert reader.closed
+
+
+def test_windows_amd_gpu_reader_failure_resets_for_a_later_poll(monkeypatch) -> None:
+    readers = []
+
+    class Reader:
+        def __init__(self):
+            self.closed = False
+            readers.append(self)
+
+        def read_percent(self, _luid):
+            if len(readers) == 1:
+                raise OSError("PDH query failed")
+            return 33
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(
+        system_stats,
+        "_loaded_hip_device_luid",
+        lambda _hip_version, _device: "0x00000000_0x0000f823",
+    )
+    monkeypatch.setattr(system_stats, "_new_windows_gpu_reader", Reader)
+    system_stats.close_gpu_telemetry()
+
+    assert system_stats._read_windows_amd_gpu_util("7.2", 0) is None
+    assert readers[0].closed
+    assert system_stats._read_windows_amd_gpu_util("7.2", 0) == 33
+    assert len(readers) == 2
+    system_stats.close_gpu_telemetry()
 
 
 def test_read_cpu_ram_uses_psutil(monkeypatch) -> None:
