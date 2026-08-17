@@ -48,9 +48,10 @@ class _StreamingFrameWriter:
         if frames_written == 1:
             log.debug("[stream-blend-encode] first frame encoded: %.2fs", time.monotonic() - self._t0)
         elif frames_written % 100 == 0:
+            elapsed = max(1e-6, time.monotonic() - self._t0)
             log.debug(
                 "[stream-blend-encode] %d frames encoded (%.1f fps)",
-                frames_written, frames_written / (time.monotonic() - self._t0),
+                frames_written, frames_written / elapsed,
             )
 
         current_seg = self._start_segment + frames_written // self._frames_per_seg
