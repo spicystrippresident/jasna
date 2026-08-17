@@ -113,10 +113,10 @@ def test_auto_rocdecode_keeps_existing_threshold_for_other_inputs(
     assert _should_auto_rocdecode(metadata, vendor) is expected
 
 
-def test_auto_rocdecode_does_not_change_windows_amd(monkeypatch) -> None:
+def test_windows_amd_main10_skips_rocdecode_and_requires_software_pyav(monkeypatch) -> None:
     monkeypatch.setattr("jasna.media.video_decoder.sys.platform", "win32")
 
     metadata = _metadata(is_10bit=True, width=8192, height=4096)
 
     assert not _should_auto_rocdecode(metadata, AcceleratorVendor.AMD)
-    assert not _requires_software_pyav_fallback(metadata, AcceleratorVendor.AMD)
+    assert _requires_software_pyav_fallback(metadata, AcceleratorVendor.AMD)
