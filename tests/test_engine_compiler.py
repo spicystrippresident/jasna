@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import MagicMock
 
 import pytest
@@ -13,6 +15,19 @@ from jasna.engine_compiler import (
     _unet4x_engine_exists,
     ensure_engines_compiled,
 )
+
+
+@pytest.fixture
+def nvidia_vendor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make TensorRT engine expectations independent of the host GPU."""
+    import jasna.accelerator as accelerator
+
+    monkeypatch.setattr(
+        accelerator, "is_amd_device", lambda *_args, **_kwargs: False
+    )
+    monkeypatch.setattr(
+        accelerator, "is_nvidia_device", lambda *_args, **_kwargs: True
+    )
 
 
 def _mock_proc(lines: list[str], returncode: int = 0) -> MagicMock:
@@ -41,7 +56,9 @@ def test_request_defaults() -> None:
     assert req.unet4x is False
 
 
-def test_ensure_no_subprocess_when_basicvsrpp_exists(monkeypatch) -> None:
+def test_ensure_no_subprocess_when_basicvsrpp_exists(
+    monkeypatch, nvidia_vendor: None
+) -> None:
     monkeypatch.setattr("jasna.engine_compiler._basicvsrpp_engines_exist", lambda *_a, **_kw: True)
     req = EngineCompilationRequest(device="cuda:0", fp16=True, basicvsrpp=True, basicvsrpp_model_path="x")
     assert ensure_engines_compiled(req).use_basicvsrpp_tensorrt is True
@@ -53,7 +70,7 @@ def test_ensure_no_subprocess_when_not_requested() -> None:
     assert result.use_basicvsrpp_tensorrt is False
 
 
-def test_ensure_all_exist_no_subprocess(monkeypatch) -> None:
+def test_ensure_all_exist_no_subprocess(monkeypatch, nvidia_vendor: None) -> None:
     monkeypatch.setattr("jasna.engine_compiler._basicvsrpp_engines_exist", lambda *_a, **_kw: True)
     monkeypatch.setattr("jasna.engine_compiler._detection_engine_exists", lambda *_a, **_kw: True)
     monkeypatch.setattr("jasna.engine_compiler._unet4x_engine_exists", lambda *_a, **_kw: True)
@@ -64,12 +81,14 @@ def test_ensure_all_exist_no_subprocess(monkeypatch) -> None:
     assert ensure_engines_compiled(req).use_basicvsrpp_tensorrt is True
 
 
-def test_ensure_basicvsrpp_fp32_no_tensorrt() -> None:
+def test_ensure_basicvsrpp_fp32_no_tensorrt(nvidia_vendor: None) -> None:
     req = EngineCompilationRequest(device="cuda:0", fp16=False, basicvsrpp=True, basicvsrpp_model_path="x")
     assert ensure_engines_compiled(req).use_basicvsrpp_tensorrt is False
 
 
-def test_ensure_spawns_subprocess_on_missing(monkeypatch) -> None:
+def test_ensure_spawns_subprocess_on_missing(
+    monkeypatch, nvidia_vendor: None
+) -> None:
     popen_calls = []
     proc = _mock_proc(["Compiling...\n", "Done.\n"])
     monkeypatch.setattr("jasna.engine_compiler.subprocess.Popen", lambda cmd, **kw: (popen_calls.append(cmd), proc)[1])
@@ -91,7 +110,9 @@ def test_ensure_spawns_subprocess_on_missing(monkeypatch) -> None:
     assert any("Compiling" in m for m in log_messages)
 
 
-def test_ensure_subprocess_failure_raises(monkeypatch) -> None:
+def test_ensure_subprocess_failure_raises(
+    monkeypatch, nvidia_vendor: None
+) -> None:
     monkeypatch.setattr("jasna.engine_compiler._basicvsrpp_engines_exist", lambda *_a, **_kw: False)
     monkeypatch.setattr("jasna.engine_compiler.subprocess.Popen", lambda *a, **kw: _mock_proc(["error\n"], returncode=1))
 
@@ -100,7 +121,9 @@ def test_ensure_subprocess_failure_raises(monkeypatch) -> None:
         ensure_engines_compiled(req)
 
 
-def test_ensure_frozen_exe_uses_compile_engines_flag(monkeypatch) -> None:
+def test_ensure_frozen_exe_uses_compile_engines_flag(
+    monkeypatch, nvidia_vendor: None
+) -> None:
     monkeypatch.setattr("jasna.engine_compiler._basicvsrpp_engines_exist", lambda *_a, **_kw: False)
     monkeypatch.setattr("jasna.engine_compiler.is_frozen", lambda: True)
     fake_sys = type("FakeSys", (), {"executable": "C:/app/jasna.exe"})()
@@ -119,7 +142,9 @@ def test_ensure_frozen_exe_uses_compile_engines_flag(monkeypatch) -> None:
     assert "-m" not in popen_calls[0]
 
 
-def test_ensure_create_no_window_on_windows(monkeypatch) -> None:
+def test_ensure_create_no_window_on_windows(
+    monkeypatch, nvidia_vendor: None
+) -> None:
     monkeypatch.setattr("jasna.engine_compiler._basicvsrpp_engines_exist", lambda *_a, **_kw: False)
     monkeypatch.setattr("jasna.engine_compiler.os.name", "nt")
     # CREATE_NO_WINDOW is a Windows-only subprocess attribute; inject it so the nt branch
@@ -137,7 +162,9 @@ def test_ensure_create_no_window_on_windows(monkeypatch) -> None:
     assert popen_kwargs.get("creationflags") == subprocess.CREATE_NO_WINDOW
 
 
-def test_ensure_does_not_print_when_log_callback_given(monkeypatch) -> None:
+def test_ensure_does_not_print_when_log_callback_given(
+    monkeypatch, nvidia_vendor: None
+) -> None:
     # The frozen GUI drops its console (FreeConsole), so stdout is invalid — an
     # unconditional print() would raise WinError 6. With a log_callback (GUI path), the
     # progress message must go to the callback and never to print().
@@ -154,7 +181,9 @@ def test_ensure_does_not_print_when_log_callback_given(monkeypatch) -> None:
     assert any("Compiling" in m for m in log_messages)
 
 
-def test_ensure_popen_stdin_is_devnull(monkeypatch) -> None:
+def test_ensure_popen_stdin_is_devnull(
+    monkeypatch, nvidia_vendor: None
+) -> None:
     # The detached GUI's stdin handle is invalid; the child must not inherit it.
     monkeypatch.setattr("jasna.engine_compiler._basicvsrpp_engines_exist", lambda *_a, **_kw: False)
     popen_kwargs: dict = {}
@@ -178,14 +207,16 @@ def test_subprocess_compile_patches_frozen_torch(monkeypatch) -> None:
     assert called, "patch_frozen_torch must run before any torch_tensorrt/_inductor import"
 
 
-def test_detection_engine_exists_rfdetr(tmp_path: Path) -> None:
+def test_detection_engine_exists_rfdetr(
+    tmp_path: Path, nvidia_vendor: None
+) -> None:
     onnx_path = tmp_path / "model.onnx"
     onnx_path.write_text("x")
     assert _detection_engine_exists(
         "rfdetr-v5", str(onnx_path), 4, True, "cuda:0"
     ) is False
 
-    from jasna.trt import get_onnx_tensorrt_engine_path
+    from jasna.engine_paths import get_onnx_tensorrt_engine_path
     engine = get_onnx_tensorrt_engine_path(
         onnx_path,
         batch_size=4,
@@ -200,12 +231,12 @@ def test_detection_engine_exists_rfdetr(tmp_path: Path) -> None:
 
 
 def test_detection_engine_exists_rfdetr_v6_uses_dynamic_path(
-    tmp_path: Path,
+    tmp_path: Path, nvidia_vendor: None
 ) -> None:
     onnx_path = tmp_path / "rfdetr-v6.onnx"
     onnx_path.write_text("x")
 
-    from jasna.trt import get_onnx_tensorrt_engine_path
+    from jasna.engine_paths import get_onnx_tensorrt_engine_path
 
     engine = get_onnx_tensorrt_engine_path(
         onnx_path,
@@ -252,9 +283,16 @@ def test_unet4x_engine_exists_encrypted(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr("jasna.engine_paths.UNET4X_ONNX_PATH", onnx_path)
     enc_engine = tmp_path / "unet-4x.fp16.linux.engine.enc"
     monkeypatch.setattr("jasna.engine_paths.get_unet4x_encrypted_engine_path", lambda fp16=True: enc_engine)
-    monkeypatch.setattr(
-        "jasna.protection.protected_model.decrypt_engine_bytes",
-        lambda model_id, data: b"decrypted-engine",
+    protected_model = ModuleType("jasna.protection.protected_model")
+    protected_model.decrypt_engine_bytes = (
+        lambda model_id, data: b"decrypted-engine"
+    )
+    protection = ModuleType("jasna.protection")
+    protection.ProtectionError = type("ProtectionError", (Exception,), {})
+    protection.protected_model = protected_model
+    monkeypatch.setitem(sys.modules, "jasna.protection", protection)
+    monkeypatch.setitem(
+        sys.modules, "jasna.protection.protected_model", protected_model
     )
 
     assert _unet4x_engine_exists(fp16=True) is False
