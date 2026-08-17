@@ -21,10 +21,10 @@ Windows、Linux、AMD、NVIDIA 都属于同一个项目，不建立长期分叉�
 |---|---|
 | `upstream/main` | `592472bda8aeb1fc0d5cea3d3ff6607add0ab0a7` |
 | 完整集成分支 | `integration/v0.10-full` |
-| 当前完整集成提交 | `a8c0c664a647167090f8e9f8ba605232cfb96890` |
-| 已纳入集成的候选 | PR #297～#323、#326 的功能 |
+| 最近功能验收提交 | `c5bc7644b339c2d4a93f5e738eff723ae4f5623c` |
+| 已纳入集成的候选 | PR #297～#323、#326、#327 的功能 |
 | 当前 Draft | PR #319，等待 NVIDIA 24 GiB 硬件 A/B |
-| Windows Main10 修复 | PR #326，提交 `fc10db220897d0133f5bfa113a73a40b7c87f909` |
+| Windows AMD Main10 修复 | 解码 PR #326 `f8d4a3d`；编码 PR #297 `48de7f0` |
 
 ### 聚焦 PR 工作流
 
@@ -55,12 +55,12 @@ Windows、Linux、AMD、NVIDIA 都属于同一个项目，不建立长期分叉�
 | HIP | 7.2.53211-158bd99533 | ✅ |
 | GPU | AMD Radeon RX 7900 XTX 24 GiB | ✅ |
 | 显卡驱动 | 32.0.31021.1015，2026-06-20 | ✅ |
-| FFmpeg/FFprobe | 8.0.1 full shared build | ✅ |
+| FFmpeg/FFprobe | FFmpeg 8；日期型 git build 通过 `libavutil=60` 正确识别 | ✅ |
 | AMF 编码器 | `h264_amf`、`hevc_amf`、`av1_amf` | ✅ |
 | GitHub CLI | 已登录 fork 账户 | ✅ |
 
 项目当前严格要求 FFmpeg/FFprobe 主版本为 8。运行测试前必须把 FFmpeg 8 的 `bin` 放在
-`PATH` 最前面，避免系统中的日期型 git build 被误识别为主版本 `2026`。
+`PATH` 最前面；发布版和日期型 git build 都通过库版本识别，当前日期型构建已实测通过。
 
 Windows 必须使用自己的 `.venv` 和 Windows 版 FFmpeg。不要复制 Ubuntu 的虚拟环境、
 二进制或软链接。模型权重、媒体、日志、虚拟环境和机器路径都保持未跟踪。
@@ -178,6 +178,43 @@ watchdog 的启动期判定。
 Windows 缺少 Triton，因此 resize-normalize 会打印 traceback 风格告警并显式回退到
 Torch GPU 路径。处理结果正确，但告警展示和 Windows 专用优化仍可作为后续独立任务。
 
+### 3.5 Windows AMD AV1 8-bit 与 Main10 Full
+
+PR #326 先把 Windows AMD 的 AV1 自动解码明确为 FFmpeg 软件解码，再批量上传到 ROCm，
+避免 PyAV AMF 在帧传输和关闭阶段的不稳定行为。AV1 8-bit 真实短片随后完成全片处理：
+
+- Jasna 退出码：0；
+- 视频帧：源 150 / 输出 150；
+- AAC 帧：源 215 / 输出 215；
+- FFmpeg 严格解码退出码：0。
+
+AV1 Main10 的首次全片运行已完成解码，但 `av1_amf` 在 `preanalysis=1` 时初始化失败并返回
+`encoder->Init() failed with error 10`。这与现有 PR #297 的 Linux AMD Main10 功能相同，
+因此没有新建重复 PR，而是把该 PR 扩展为 Linux/Windows 共用策略：
+
+- AMD AV1 Main10 使用 `preanalysis=0`、`rc=vbr_peak`；
+- 删除该组合的 `qvbr_quality_level`；
+- `codec_context.bit_rate` 使用源码率，缺失时使用 2～100 Mbps 的有界像素率回退；
+- AMD AV1 8-bit 继续使用 QVBR + PreAnalysis；
+- NVIDIA/NVENC 路线保持不变。
+
+合入 `integration/v0.10-full@c5bc764` 后，RX 7900 XTX 上的 1920×1080、23.976 fps、
+AV1 Main、`yuv420p10le` 真实短片完成全片处理：
+
+- Jasna 退出码：0；墙钟时间：39.497 秒；
+- 修复活动：1 clip / 1 unique track；
+- 视频帧：源 417 / 输出 417；
+- AAC 帧：源 816 / 输出 816；
+- 时长：源 17.410 秒 / 输出 17.409 秒；
+- 输出保持 AV1 Main、`yuv420p10le`；
+- FFmpeg 严格完整视频解码退出码：0；
+- 聚焦集合测试：78 passed，1 skipped。
+
+Windows AMF 把 1080 高度的 AV1 输出报告为 1082 行，同时在 Matroska 写入
+`Frame Cropping: crop_bottom=2`，有效显示尺寸仍为 1920×1080。直接调用 FFmpeg
+`av1_amf` 也会复现同一对齐行为，因此当前按有效裁剪高度验收，后续仅在播放器兼容性
+出现实际问题时再拆成独立 AMF/封装任务。
+
 ## 4. 当前开发与验收总表
 
 状态含义：✅ 已完成；🟡 已发现或部分完成；⬜ 未开始/待验证；⛔ 阻断。
@@ -185,7 +222,7 @@ Torch GPU 路径。处理结果正确，但告警展示和 Windows 专用优化�
 | 功能或验证项 | 状态 | 当前证据 / 下一步 |
 |---|---:|---|
 | Windows ROCm Python 环境 | ✅ | torch、torchvision、HIP、RX 7900 XTX 实机断言通过 |
-| FFmpeg 8 与 AMF 三编码器 | ✅ | 8.0.1；H.264/HEVC/AV1 AMF 均可见 |
+| FFmpeg 8 与 AMF 三编码器 | ✅ | 发布版/日期型构建识别通过；H.264/HEVC/AV1 AMF 均可见 |
 | GitHub 分支与 PR 流程 | ✅ | 聚焦 PR → `integration/v0.10-full` → 集合验证 |
 | 完整 pytest 基线 | ✅ | 上游基线与集成结果均已保存；当前不是全绿 |
 | 2D H.264 8-bit Full | ✅ | 951 帧、1366 AAC 帧、严格解码通过 |
@@ -197,8 +234,8 @@ Torch GPU 路径。处理结果正确，但告警展示和 Windows 专用优化�
 | GUI 启动与完整向导 | ⬜ | 检查系统页、模型页、队列、日志保存和最终打开文件 |
 | 2D HEVC 8-bit Full | ⬜ | 真实短片；核对 AMF、帧数、音频、严格解码 |
 | 2D HEVC Main10 Full | 🟡 | 解码首帧已通过；仍需非 VR 全片矩阵样本 |
-| AV1 8-bit Full | ⬜ | 真实短片；检查 AV1 AMF 和最终封装 |
-| AV1 Main10 Full | ⬜ | 真实短片；检查 P010、AMF PreAnalysis 限制 |
+| AV1 8-bit Full | ✅ | 150 帧、215 AAC 帧、严格解码通过 |
+| AV1 Main10 Full | ✅ | PR #297；417 帧、816 AAC 帧、Main10 保持、严格解码通过 |
 | `Auto / Scan / Off` | ⬜ | 分别核对路由、manifest、阶段名和 ETA |
 | 粗扫/精扫默认值 | ⬜ | 4 秒、0.5 秒、85% 全片阈值不得擅自改变 |
 | 短段过滤与区间扩边 | ⬜ | 用边界附近真实马赛克片段核对首尾帧 |
@@ -218,7 +255,7 @@ Torch GPU 路径。处理结果正确，但告警展示和 Windows 专用优化�
 按以下顺序继续，避免一次混改多个子系统：
 
 1. **GUI Windows AMD 基线**：启动向导、系统检查、模型检测、队列、工作目录、诊断日志；
-2. **2D 格式矩阵**：HEVC 8-bit、HEVC Main10、AV1 8-bit、AV1 Main10；
+2. **完成剩余 2D 格式矩阵**：HEVC 8-bit、HEVC Main10；AV1 两项已完成；
 3. **扫描矩阵**：同一真实片段分别运行 `Auto / Scan / Off`；
 4. **Smart Render**：先 HEVC，再 H.264；核对关键帧、接缝、音画同步和流保留；
 5. **恢复语义**：扫描中断、修复中断、程序重启、保留 workspace；
