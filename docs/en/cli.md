@@ -123,10 +123,11 @@ With `--segments`, the codec is locked to the input video's codec and
 the command line is sent to the active encoder unchanged; switching codecs does
 not translate it. Lower values improve quality and increase file size.
 
-Linux AMD 10-bit AV1 is an exception: AMF cannot open P010 with PreAnalysis,
-and QVBR without PreAnalysis does not honor the bitrate ceiling. Jasna therefore
-uses source-tied peak VBR for that combination; `--cq` is accepted for interface
-compatibility but is not applied as a QVBR quality target.
+AMD 10-bit AV1 is an exception on both Linux and Windows: AMF cannot reliably
+open P010 with PreAnalysis, and QVBR without PreAnalysis does not honor the
+bitrate ceiling. Jasna therefore uses source-tied peak VBR for that combination;
+`--cq` is accepted for interface compatibility but is not applied as a QVBR
+quality target.
 
 | GPU | H.264 default | HEVC default | AV1 default | Accepted range |
 | --- | ---: | ---: | ---: | --- |
@@ -214,15 +215,15 @@ Per-codec extras:
 
 | Key | What it does |
 | --- | ------------ |
-| `cq` | Portable quality target; lower = better. H.264 and ordinary AV1 pass it unchanged as `qvbr_quality_level`; Linux AMD 10-bit AV1 uses the source-tied peak-VBR exception above. HEVC full renders use it unchanged as CQP I/P QP; Linux AMD HEVC Smart Render fragments use `CQ + 2`, capped to 0–51. Range 0–51; defaults 24 (H.264), 25 (HEVC), 32 (AV1). |
+| `cq` | Portable quality target; lower = better. H.264 and ordinary AV1 pass it unchanged as `qvbr_quality_level`; AMD 10-bit AV1 on Linux and Windows uses the source-tied peak-VBR exception above. HEVC full renders use it unchanged as CQP I/P QP; Linux AMD HEVC Smart Render fragments use `CQ + 2`, capped to 0–51. Range 0–51; defaults 24 (H.264), 25 (HEVC), 32 (AV1). |
 | `qvbr_quality_level` | AMF's native alias. Accepted in CLI advanced settings when `--cq` is omitted; not accepted in the GUI custom-args field. |
 | `usage` | Encoder usage profile. Default `high_quality`. |
 | `quality` | Speed/quality preset: `speed`, `balanced`, `quality` (default). |
-| `rc` | Rate-control mode. Defaults to `qvbr` for H.264/AV1 and `cqp` for HEVC; Linux AMD 10-bit AV1 is forced to `vbr_peak`. |
+| `rc` | Rate-control mode. Defaults to `qvbr` for H.264/AV1 and `cqp` for HEVC; AMD 10-bit AV1 is forced to `vbr_peak` on Linux and Windows. |
 | `preset` | AMF preset. |
 | `g` | Keyframe interval in frames. Default 250. |
 | `bf` | Max consecutive B-frames. |
-| `preanalysis` | Enabled by default for H.264/AV1, except Linux AMD 10-bit AV1. Disabled for the default HEVC CQP path and Linux AMD HEVC Smart Render fragments. |
+| `preanalysis` | Enabled by default for H.264/AV1, except AMD 10-bit AV1 on Linux and Windows. Disabled for the default HEVC CQP path and Linux AMD HEVC Smart Render fragments. |
 | `vbaq` | Variance-based adaptive quantization for H.264/HEVC; disabled for HEVC CQP. AV1 uses `aq_mode`. |
 | `maxrate` / `bufsize` | Bitrate cap and VBV buffer size. Source-derived when the selected rate control supports a ceiling; the default HEVC CQP path does not use a VBV cap. |
 | `profile` / `level` | Codec profile and level. |
