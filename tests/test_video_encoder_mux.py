@@ -3,6 +3,7 @@ audio copy vs aac fallback, metadata/disposition, faststart, pts passthrough.
 Requires a CUDA GPU and an ffmpeg binary for fixture generation."""
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -37,13 +38,21 @@ _EXPECTED_STREAM = {
 
 
 def _av1_probe(tmp_path_factory) -> str | None:
-    """One minimal av1_nvenc open; returns the failure text when AV1 NVENC is missing."""
+    """One minimal AV1 encoder open; returns its capability failure text."""
     import av as _av
 
     tmp = tmp_path_factory.mktemp("av1probe")
     src = _make_source(tmp, "probe_src.mp4", acodec=None)
     metadata = get_video_meta_data(str(src))
-    frame = torch.zeros((3, 256, 256), dtype=torch.uint8, device=DEVICE)
+    vendor = vendor_for_device(DEVICE)
+    height, width = (480, 852) if vendor == AcceleratorVendor.AMD else (256, 256)
+    metadata = replace(
+        metadata,
+        video_width=width,
+        video_height=height,
+        video_bitrate=0,
+    )
+    frame = torch.zeros((3, height, width), dtype=torch.uint8, device=DEVICE)
     try:
         with NvidiaVideoEncoder(
             str(tmp / "probe.mp4"), device=DEVICE, metadata=metadata, codec="av1", encoder_settings={}
@@ -51,7 +60,8 @@ def _av1_probe(tmp_path_factory) -> str | None:
             for i in range(8):
                 enc.encode(frame.clone(), i * 512)
     except RuntimeError as exc:
-        if "Failed to open av1 encoder (av1_nvenc)" in str(exc):
+        encoder_name = "av1_amf" if vendor == AcceleratorVendor.AMD else "av1_nvenc"
+        if f"Failed to open av1 encoder ({encoder_name})" in str(exc):
             return str(exc)
         raise
     return None
@@ -61,7 +71,7 @@ def _av1_probe(tmp_path_factory) -> str | None:
 def av1_capability(tmp_path_factory):
     failure = _av1_probe(tmp_path_factory)
     if failure is not None:
-        pytest.skip(f"AV1 NVENC unavailable on this GPU: {failure}")
+        pytest.skip(f"AV1 encoder unavailable on this GPU: {failure}")
 
 
 @pytest.fixture
@@ -219,6 +229,34 @@ def _run_unaligned_pitch_probe(src: str, dst: str, codec: str, width: int) -> No
             encoder.encode(frame.clone(), index * 512)
 
 
+def _probe_first_frame_crop(path: Path) -> tuple[int, int, int, int]:
+    result = subprocess.run(
+        [
+            resolve_executable("ffprobe"),
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_frames",
+            "-read_intervals",
+            "%+#1",
+            "-show_entries",
+            "frame=crop_left,crop_right,crop_top,crop_bottom",
+            "-of",
+            "json",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    frame = json.loads(result.stdout)["frames"][0]
+    return tuple(
+        int(frame.get(name, 0))
+        for name in ("crop_left", "crop_right", "crop_top", "crop_bottom")
+    )
+
+
 @pytest.mark.parametrize("width", [852, 854, 860])
 @pytest.mark.parametrize("codec", ["hevc", "h264", "av1"])
 def test_unaligned_pitch_encodes_in_isolated_process(
@@ -249,13 +287,19 @@ def test_unaligned_pitch_encodes_in_isolated_process(
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
+    crop_left, crop_right, crop_top, crop_bottom = _probe_first_frame_crop(dst)
     with av.open(str(dst)) as container:
         video = container.streams.video[0]
-        assert video.width == width
-        assert video.height == 480
+        assert video.width - crop_left - crop_right == width
+        assert video.height - crop_top - crop_bottom == 480
         frames = list(container.decode(video))
         assert len(frames) == 12
         rgb = frames[0].to_ndarray(format="rgb24")
+        rgb = rgb[
+            crop_top : rgb.shape[0] - crop_bottom if crop_bottom else None,
+            crop_left : rgb.shape[1] - crop_right if crop_right else None,
+        ]
+        assert rgb.shape[:2] == (480, width)
         assert rgb[:, -width // 4 :, 0].mean() > rgb[:, : width // 4, 0].mean() + 100
         assert rgb[-120:, :, 1].mean() > rgb[:120, :, 1].mean() + 100
 
@@ -648,7 +692,10 @@ def _encode_synthetic_vfr(tmp_path: Path, codec: str, suffix: str) -> tuple[Path
         pts_list.append(pts)
         pts += step
     with NvidiaVideoEncoder(str(dst), device=DEVICE, metadata=metadata, codec=codec, encoder_settings={}) as enc:
-        assert enc._cuda_ctx.cuda_stream == enc.stream.cuda_stream
+        if vendor_for_device(DEVICE) == AcceleratorVendor.NVIDIA:
+            assert enc._cuda_ctx.cuda_stream == enc.stream.cuda_stream
+        else:
+            assert enc._cuda_ctx is None
         for i, p in enumerate(pts_list):
             enc.encode(_gradient_frame(i, h, w), p)
     return dst, pts_list, metadata.time_base
@@ -686,7 +733,7 @@ def test_codec_smoke_matrix(tmp_path, codec, suffix, require_codec):
     # bf=4/b_ref_mode=middle defaults must yield B-frames: reordering shows up
     # as pts != dts on at least one packet. AV1 hides reordering behind
     # show_existing_frame, so its packets stay in presentation order.
-    if codec != "av1":
+    if codec != "av1" and vendor_for_device(DEVICE) == AcceleratorVendor.NVIDIA:
         with av.open(str(dst)) as c:
             v = c.streams.video[0]
             assert any(
