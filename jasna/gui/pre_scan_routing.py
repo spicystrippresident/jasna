@@ -14,12 +14,14 @@ import math
 import os
 import queue
 import re
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal
 
+from jasna.accelerator import AcceleratorVendor, vendor_for_device
 from jasna.gui.models import AppSettings
 from jasna.gui.mosaic_scan import (
     ADAPTIVE_COARSE_POLICY_VERSION,
@@ -55,6 +57,24 @@ SHORT_CANDIDATE_HIGH_CONFIDENCE = 0.90
 SHORT_CANDIDATE_CORE_SECONDS = 2.0
 
 PreScanPath = Literal["full", "smart", "copy"]
+CoarseExecutionStrategy = Literal["adaptive-direct-gop", "fixed-grid"]
+
+
+def coarse_execution_strategy(metadata) -> CoarseExecutionStrategy:
+    """Choose a coarse reader whose teardown is reliable on this platform."""
+
+    codec = str(getattr(metadata, "codec_name", "")).strip().lower()
+    windows_amd_hevc_main10 = (
+        sys.platform == "win32"
+        and vendor_for_device("cuda:0") is AcceleratorVendor.AMD
+        and codec in {"hevc", "h265"}
+        and bool(getattr(metadata, "is_10bit", False))
+    )
+    # Windows AMF cannot currently expose HEVC Main10/P010 frames to PyAV's
+    # tensor path, so NvidiaVideoReader falls back to frame-threaded software
+    # decoding. Closing a partly consumed per-GOP reader can then block in
+    # avcodec_free_context. The fixed-grid reader drains its single decoder.
+    return "fixed-grid" if windows_amd_hevc_main10 else "adaptive-direct-gop"
 
 
 def _write_json_atomic(path: Path, value: dict) -> None:
@@ -627,6 +647,7 @@ def _checkpoint_signature(
     source: Path,
     output: Path,
     settings: AppSettings,
+    metadata,
 ) -> dict:
     from jasna.mosaic.detection_registry import (
         coerce_detection_model_name,
@@ -654,6 +675,7 @@ def _checkpoint_signature(
             "policy": str(settings.pre_scan_policy),
             "full_threshold": float(settings.pre_scan_full_threshold),
             "coarse_interval": float(settings.pre_scan_coarse_interval),
+            "coarse_execution_strategy": coarse_execution_strategy(metadata),
             "fine_interval": float(settings.pre_scan_fine_interval),
             "adaptive_coarse": {
                 "policy_version": ADAPTIVE_COARSE_POLICY_VERSION,
@@ -681,8 +703,9 @@ def _checkpoint_path(
     source: Path,
     output: Path,
     settings: AppSettings,
+    metadata,
 ) -> tuple[Path, dict]:
-    signature = _checkpoint_signature(source, output, settings)
+    signature = _checkpoint_signature(source, output, settings, metadata)
     digest = _canonical_hash(signature)
     slug = re.sub(r"[^A-Za-z0-9._-]+", "_", output.stem).strip("._-")
     slug = (slug or "output")[:64]
@@ -733,7 +756,12 @@ class PreScanCoordinator:
         self._progress = progress
         self._worker_factory = worker_factory
         self._active_worker = None
-        checkpoint_path, signature = _checkpoint_path(self.source, self.output, settings)
+        checkpoint_path, signature = _checkpoint_path(
+            self.source,
+            self.output,
+            settings,
+            metadata,
+        )
         self.checkpoint = _ScanCheckpointStore(
             checkpoint_path,
             signature,
@@ -781,11 +809,20 @@ class PreScanCoordinator:
             raise PreScanFailed("扫描间隔必须大于 0 秒")
         if policy == "auto":
             coarse_interval = coarse_setting
-            self._log("INFO", f"阶段：自动粗扫（目标间隔 {coarse_interval:g} 秒）")
+            strategy = coarse_execution_strategy(self.metadata)
+            adaptive_coarse = strategy == "adaptive-direct-gop"
+            if adaptive_coarse:
+                self._log("INFO", f"阶段：自动粗扫（目标间隔 {coarse_interval:g} 秒）")
+            else:
+                self._log(
+                    "INFO",
+                    f"阶段：自动粗扫（固定网格 {coarse_interval:g} 秒；"
+                    "Windows AMD HEVC Main10 兼容路径）",
+                )
             coarse, _worker = self._run_stage(
                 "coarse",
                 coarse_interval,
-                adaptive_coarse=True,
+                adaptive_coarse=adaptive_coarse,
             )
             coverage = sampled_coverage(coarse, threshold=threshold)
             self._log("INFO", f"粗扫有码覆盖率：{coverage:.1%}")

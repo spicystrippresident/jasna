@@ -178,6 +178,26 @@ def test_manual_empty_selection_forces_full_processing(tmp_path):
     assert "segments" not in processor._run_pipeline.call_args.kwargs
 
 
+def test_off_policy_bypasses_pre_scan_and_processes_full_video(tmp_path):
+    source = tmp_path / "video.mp4"
+    source.touch()
+    job = JobItem(source)
+    processor = _processor(tmp_path, AppSettings(pre_scan_policy="off"))
+    processor._run_pipeline = MagicMock(return_value="full")
+
+    with (
+        patch("jasna.gui.pre_scan_routing.PreScanCoordinator") as coordinator,
+        patch("jasna.media.get_video_meta_data") as metadata,
+        patch("jasna.gui.processor._cleanup_torch"),
+    ):
+        processor._process_job(job)
+
+    coordinator.assert_not_called()
+    metadata.assert_not_called()
+    assert "segments" not in processor._run_pipeline.call_args.kwargs
+    assert processor.completed_processing_path(job.id) == "full"
+
+
 def test_zero_hit_copy_does_not_load_restoration_pipeline(tmp_path):
     source = tmp_path / "video.mp4"
     source.touch()
