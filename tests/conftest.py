@@ -19,7 +19,26 @@ collect_ignore = [] if _HAS_TENSORRT else [
 
 
 @pytest.fixture
-def hidpi(request):
+def static_ctk_scaling():
+    """Make simulated CTk scaling independent of the host monitor DPI."""
+    import customtkinter as ctk
+
+    original_auto = ctk.ScalingTracker.deactivate_automatic_dpi_awareness
+    original_widget = ctk.ScalingTracker.widget_scaling
+    original_window = ctk.ScalingTracker.window_scaling
+    ctk.deactivate_automatic_dpi_awareness()
+    ctk.set_widget_scaling(1.0)
+    ctk.set_window_scaling(1.0)
+    try:
+        yield
+    finally:
+        ctk.ScalingTracker.deactivate_automatic_dpi_awareness = original_auto
+        ctk.set_widget_scaling(original_widget)
+        ctk.set_window_scaling(original_window)
+
+
+@pytest.fixture
+def hidpi(request, static_ctk_scaling):
     """Reproduce Windows display scaling on a platform whose DPI factor is always 1.
 
     CustomTkinter multiplies its detected per-monitor DPI factor by these process-global
@@ -33,8 +52,4 @@ def hidpi(request):
     factor = request.param
     ctk.set_widget_scaling(factor)
     ctk.set_window_scaling(factor)
-    try:
-        yield factor
-    finally:
-        ctk.set_widget_scaling(1.0)
-        ctk.set_window_scaling(1.0)
+    return factor

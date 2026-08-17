@@ -415,7 +415,7 @@ def test_main_workspace_starts_wider_and_can_resize_queue_panel(hidpi) -> None:
         root.TkdndVersion = None
 
         JasnaApp._build_main_body(root)
-        root.update_idletasks()
+        root.update()
 
         assert isinstance(root._workspace, tk.PanedWindow)
         assert root._workspace.cget("background") == Colors.BORDER

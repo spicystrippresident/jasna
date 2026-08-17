@@ -8,6 +8,7 @@ window taller than the screen with an un-shrinkable minimum on Windows.
 from __future__ import annotations
 
 import threading
+import time
 from tkinter import TclError
 from types import SimpleNamespace
 
@@ -42,6 +43,15 @@ def _root() -> ctk.CTk:
         return ctk.CTk()
     except TclError as exc:
         pytest.skip(f"Tk display unavailable: {exc}")
+
+
+def _wait_until(root, predicate, *, timeout_seconds: float = 0.25) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        root.update()
+        if predicate():
+            return True
+    return bool(predicate())
 
 
 def _stub_main_body_callbacks(root) -> None:
@@ -88,10 +98,26 @@ def test_centered_position_clamps_into_the_given_monitor_rect():
     assert scaling.centered_position((400, 300), (2400, -100, 200, 100), bounds) == (2560, 0)
 
 
-def test_screen_rect_falls_back_to_the_full_screen_off_windows():
+def test_screen_rect_falls_back_to_the_full_screen_off_windows(monkeypatch):
+    monkeypatch.setattr(scaling.sys, "platform", "linux")
     window = SimpleNamespace(winfo_screenwidth=lambda: 1920, winfo_screenheight=lambda: 1080)
 
     assert scaling.screen_rect(window) == (0, 0, 1920, 1080)
+
+
+def test_screen_rect_delegates_to_the_windows_monitor_work_area(monkeypatch):
+    calls: list[int] = []
+    expected = (-1920, 40, 1920, 1040)
+    monkeypatch.setattr(scaling.sys, "platform", "win32")
+    monkeypatch.setattr(
+        scaling,
+        "_windows_monitor_work_area",
+        lambda hwnd: calls.append(hwnd) or expected,
+    )
+    window = SimpleNamespace(winfo_id=lambda: 41)
+
+    assert scaling.screen_rect(window) == expected
+    assert calls == [41]
 
 
 @pytest.mark.parametrize("dpi", [2.5, 3.0])
@@ -112,6 +138,7 @@ def test_static_scaling_is_identity_when_design_minimum_fits() -> None:
 def test_main_window_keeps_design_minimum_at_high_dpi_on_1440p(dpi, monkeypatch) -> None:
     factor = scaling._static_scaling(dpi, (2560, 1440), (900, 580), scaling.SCREEN_MARGIN)
     monkeypatch.setattr(scaling, "window_scaling", lambda _window: factor)
+    monkeypatch.setattr(scaling, "screen_rect", lambda _window: (0, 0, 2560, 1440))
     requested: list[str] = []
     minimum: list[tuple[int, int]] = []
     window = SimpleNamespace(
@@ -130,7 +157,9 @@ def test_main_window_keeps_design_minimum_at_high_dpi_on_1440p(dpi, monkeypatch)
     assert minimum[-1][0] >= 899 and minimum[-1][1] >= 579
 
 
-def test_activate_static_dpi_is_a_no_op_off_windows() -> None:
+def test_activate_static_dpi_is_a_no_op_off_windows(monkeypatch) -> None:
+    monkeypatch.setattr(scaling.sys, "platform", "darwin")
+
     scaling.activate_static_dpi((900, 580))
 
     assert not ctk.ScalingTracker.deactivate_automatic_dpi_awareness
@@ -160,7 +189,7 @@ def test_activate_static_dpi_windows_path(monkeypatch) -> None:
         ctk.set_window_scaling(1.0)
 
 
-def test_scaling_helpers_are_identity_without_scaling():
+def test_scaling_helpers_are_identity_without_scaling(static_ctk_scaling):
     root = _root()
     try:
         assert scaling.widget_scaling(root) == 1.0
@@ -196,6 +225,7 @@ def test_main_window_fits_screen_at_hidpi(hidpi, monkeypatch) -> None:
 @pytest.mark.parametrize("factor", [1.0, 1.5])
 def test_main_window_fits_a_small_screen(screen, factor, monkeypatch) -> None:
     monkeypatch.setattr(scaling, "window_scaling", lambda _window: factor)
+    monkeypatch.setattr(scaling, "screen_rect", lambda _window: (0, 0, *screen))
     requested: list[str] = []
     minimum: list[tuple[int, int]] = []
     window = SimpleNamespace(
@@ -223,6 +253,11 @@ def test_segment_editor_fits_screen_at_hidpi(factor, monkeypatch) -> None:
     from jasna.gui.segment_editor import SegmentEditor
 
     monkeypatch.setattr(segment_editor.scaling, "window_scaling", lambda _window: factor)
+    monkeypatch.setattr(
+        segment_editor.scaling,
+        "screen_rect",
+        lambda _window: (0, 0, 2560, 1440),
+    )
     editor = SimpleNamespace(
         winfo_screenwidth=lambda: 2560,
         winfo_screenheight=lambda: 1440,
@@ -316,8 +351,9 @@ def test_slider_value_label_font_scales_at_hidpi(hidpi) -> None:
     try:
         label = create_slider_value_label(root, "90", 4, Colors.BG_PANEL)
 
-        expected_size = round(Fonts.SIZE_NORMAL * hidpi)
-        assert label.cget("font") == f"{Fonts.FAMILY} -{expected_size}"
+        family, size = root.tk.splitlist(label.cget("font"))
+        assert family == Fonts.FAMILY
+        assert int(size) == -round(Fonts.SIZE_NORMAL * hidpi)
     finally:
         root.destroy()
 
@@ -337,7 +373,7 @@ def test_wizard_button_is_on_screen_at_hidpi(hidpi, monkeypatch) -> None:
         root.update()
 
         assert wizard.winfo_height() <= wizard.winfo_screenheight()
-        assert wizard._continue_btn.winfo_ismapped()
+        assert _wait_until(root, wizard._continue_btn.winfo_ismapped)
         button_bottom = wizard._continue_btn.winfo_rooty() + wizard._continue_btn.winfo_height()
         assert button_bottom <= wizard.winfo_screenheight()
     finally:
