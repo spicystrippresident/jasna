@@ -63,6 +63,15 @@ def _make_encoder(tmp_path, encoder_settings=None, codec="hevc", **meta_override
     )
 
 
+@pytest.fixture
+def nvidia_encoder_vendor(monkeypatch):
+    monkeypatch.setattr(
+        video_encoder_module,
+        "vendor_for_device",
+        lambda _device: AcceleratorVendor.NVIDIA,
+    )
+
+
 # Measured hevc_nvenc configuration; the HEVC path must never drift from it.
 _HEVC_OPTIONS_SNAPSHOT = {
     "preset": "p5",
@@ -427,6 +436,7 @@ class TestSourceContainerPreservation:
         encoder._src.demux.assert_not_called()
 
 
+@pytest.mark.usefixtures("nvidia_encoder_vendor")
 class TestEncoderOptions:
     def test_smart_fragment_preserves_normal_closed_gop_settings(self, tmp_path):
         enc = NvidiaVideoEncoder(
@@ -662,7 +672,9 @@ class TestSharpening:
         assert eight_bit._cas.ten_bit is False
         assert eight_bit._cas.peak == 255.0
 
-    def test_zero_strength_leaves_the_converted_frame_untouched(self, tmp_path, monkeypatch):
+    def test_zero_strength_leaves_the_converted_frame_untouched(
+        self, tmp_path, monkeypatch, nvidia_encoder_vendor
+    ):
         enc = _make_encoder(tmp_path, codec="h264")  # nv12, so planes stay uint8
         packed = torch.arange(24, dtype=torch.uint8, device=enc.device).reshape(6, 4)
         enc._converter = SimpleNamespace(
@@ -693,7 +705,9 @@ class TestSharpening:
 
         assert torch.equal(torch.cat(seen[0]), packed)
 
-    def test_sharpening_runs_before_pitch_alignment(self, tmp_path, monkeypatch):
+    def test_sharpening_runs_before_pitch_alignment(
+        self, tmp_path, monkeypatch, nvidia_encoder_vendor
+    ):
         enc = NvidiaVideoEncoder(
             file=str(tmp_path / "result.mkv"),
             device=torch.device("cuda:0"),
