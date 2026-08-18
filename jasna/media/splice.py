@@ -230,14 +230,14 @@ def sync_and_validate_final_output(
     )
 
 
-def _commit_smart_output(
+def commit_video_output(
     temporary: Path,
     destination: Path,
     *,
     source: Path,
     codec: str,
 ) -> None:
-    """Durably commit a structurally valid smart-render temporary output."""
+    """Durably publish a structurally valid video from a same-directory staging path."""
 
     validate_video_output(temporary, source=source, expected_codec=codec)
     _fsync_file(temporary)
@@ -247,6 +247,23 @@ def _commit_smart_output(
     _fsync_file(destination)
     _fsync_directory(destination.parent)
     validate_video_output(destination, source=source, expected_codec=codec)
+
+
+def _commit_smart_output(
+    temporary: Path,
+    destination: Path,
+    *,
+    source: Path,
+    codec: str,
+) -> None:
+    """Backward-compatible Smart Render wrapper around the generic commit."""
+
+    commit_video_output(
+        temporary,
+        destination,
+        source=source,
+        codec=codec,
+    )
 
 
 @dataclass(frozen=True)
