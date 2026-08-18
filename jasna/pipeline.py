@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import gc
 import logging
 import os
@@ -22,6 +23,7 @@ from jasna.media.video_encoder import NvidiaVideoEncoder
 from jasna.media.video_decoder import ReusableRocDecoder
 from jasna.media.frame_rate import resolve_frame_rate_retarget
 from jasna.media.splice import (
+    SmartRenderCompatibilityError,
     SplicePlan,
     build_splice_plan,
     create_copy_fragment,
@@ -29,6 +31,7 @@ from jasna.media.splice import (
     normalize_fragment,
     probe_keyframes,
     resolve_smart_encoder_settings,
+    validate_hevc_fragment_parameter_sets,
     validate_smart_render,
 )
 from jasna.mosaic.detection_registry import build_detection_model
@@ -880,13 +883,39 @@ class Pipeline:
 
             if self._cancel_event.is_set():
                 return
-            mux_fragments_final_output(
-                fragments,
-                self.input_video,
-                self.output_video,
-                manifest=workspace.path / "fragments.ffconcat",
-                codec=codec,
-            )
+            try:
+                if codec == "hevc":
+                    validate_hevc_fragment_parameter_sets(
+                        [
+                            (fragment, span.kind)
+                            for (fragment, _duration), span in zip(
+                                fragments,
+                                plan.spans,
+                            )
+                        ]
+                    )
+                mux_fragments_final_output(
+                    fragments,
+                    self.input_video,
+                    self.output_video,
+                    manifest=workspace.path / "fragments.ffconcat",
+                    codec=codec,
+                    copy_validation_ranges=(
+                        self._hevc_copy_validation_ranges(plan)
+                        if codec == "hevc"
+                        else ()
+                    ),
+                    cancelled=self._cancel_event.is_set,
+                )
+            except SmartRenderCompatibilityError:
+                try:
+                    workspace.cleanup()
+                except OSError:
+                    log.warning(
+                        "Could not clean rejected smart-render workspace %s",
+                        workspace.path,
+                    )
+                raise
             if self._cancel_event.is_set():
                 return
             try:
@@ -900,6 +929,36 @@ class Pipeline:
             for reusable_decoder in reusable_rocdecoders:
                 reusable_decoder.close()
             progress.close(ensure_completed_bar=True)
+
+    @staticmethod
+    def _hevc_copy_validation_ranges(
+        plan: SplicePlan,
+    ) -> tuple[tuple[float, float], ...]:
+        """Return one bounded GOP on every untouched side of a render seam."""
+
+        keyframes = plan.index.pts
+        ranges: set[tuple[int, int]] = set()
+        for span_index, span in enumerate(plan.spans):
+            if span.is_render:
+                continue
+            if span_index > 0 and plan.spans[span_index - 1].is_render:
+                next_keyframe = next(
+                    (pts for pts in keyframes if pts > span.start_pts),
+                    span.end_pts,
+                )
+                ranges.add((span.start_pts, min(span.end_pts, next_keyframe)))
+            if span_index + 1 < len(plan.spans) and plan.spans[span_index + 1].is_render:
+                previous_index = bisect.bisect_left(keyframes, span.end_pts) - 1
+                start_pts = keyframes[max(0, previous_index)]
+                ranges.add((max(span.start_pts, start_pts), span.end_pts))
+        return tuple(
+            (
+                plan.index.seconds_for_pts(start_pts),
+                float((end_pts - start_pts) * plan.index.time_base),
+            )
+            for start_pts, end_pts in sorted(ranges)
+            if end_pts > start_pts
+        )
 
     def run(self) -> None:
         metadata = get_video_meta_data(str(self.input_video))

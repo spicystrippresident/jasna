@@ -439,3 +439,94 @@ def test_manual_ranges_keep_smart_render_incompatibility_strict(tmp_path):
         )
 
     build.assert_not_called()
+
+
+def test_automatic_ranges_fall_back_on_runtime_seam_rejection(tmp_path):
+    from jasna.media.splice import SmartRenderCompatibilityError
+
+    source = tmp_path / "video.mkv"
+    output = tmp_path / "output.mkv"
+    processor = Processor()
+    processor._settings = AppSettings()
+    processor._video_session = MagicMock()
+    processor._ensure_video_session = MagicMock()
+    processor._prepare_job_detector = MagicMock()
+    processor._build_encoder_settings = MagicMock(return_value={})
+    processor._publish_full_render_unless_stopped = MagicMock()
+    smart = MagicMock(cancel_requested=False, completed=False)
+    smart.run.side_effect = SmartRenderCompatibilityError(
+        "shared HEVC parameter-set IDs",
+        reason="hevc_parameter_sets_incompatible",
+    )
+    full = MagicMock(cancel_requested=False, completed=True)
+
+    with (
+        patch(
+            "jasna.media.get_video_meta_data",
+            return_value=MagicMock(codec_name="hevc", duration=10.0),
+        ),
+        patch("jasna.media.splice.validate_smart_render"),
+        patch("jasna.media.splice.probe_keyframes", return_value=MagicMock()),
+        patch("jasna.media.splice.build_splice_plan", return_value=MagicMock()),
+        patch("jasna.gui.processor.video_session_config", return_value=MagicMock()),
+        patch(
+            "jasna.gui.processor.build_pipeline",
+            side_effect=[smart, full],
+        ) as build,
+    ):
+        route = processor._run_video_job(
+            1,
+            source,
+            output,
+            segments=(SegmentRange(1, 2),),
+            automatic_segments=True,
+        )
+
+    assert route == "full"
+    assert build.call_count == 2
+    assert build.call_args_list[0].kwargs["segments"] == (SegmentRange(1, 2),)
+    assert build.call_args_list[1].kwargs["segments"] is None
+    smart.close.assert_called_once_with()
+    full.close.assert_called_once_with()
+
+
+def test_manual_ranges_keep_runtime_seam_rejection_strict(tmp_path):
+    from jasna.media.splice import SmartRenderCompatibilityError
+
+    source = tmp_path / "video.mkv"
+    output = tmp_path / "output.mkv"
+    processor = Processor()
+    processor._settings = AppSettings()
+    processor._video_session = MagicMock()
+    processor._ensure_video_session = MagicMock()
+    processor._prepare_job_detector = MagicMock()
+    processor._build_encoder_settings = MagicMock(return_value={})
+    pipeline = MagicMock(cancel_requested=False, completed=False)
+    pipeline.run.side_effect = SmartRenderCompatibilityError(
+        "shared HEVC parameter-set IDs",
+        reason="hevc_parameter_sets_incompatible",
+    )
+
+    with (
+        patch(
+            "jasna.media.get_video_meta_data",
+            return_value=MagicMock(codec_name="hevc", duration=10.0),
+        ),
+        patch("jasna.media.splice.validate_smart_render"),
+        patch("jasna.media.splice.probe_keyframes", return_value=MagicMock()),
+        patch("jasna.media.splice.build_splice_plan", return_value=MagicMock()),
+        patch("jasna.gui.processor.video_session_config", return_value=MagicMock()),
+        patch("jasna.gui.processor.build_pipeline", return_value=pipeline),
+        pytest.raises(SmartRenderCompatibilityError) as rejected,
+    ):
+        processor._run_video_job(
+            1,
+            source,
+            output,
+            segments=(SegmentRange(1, 2),),
+            automatic_segments=False,
+        )
+
+    assert rejected.value.reason == "hevc_parameter_sets_incompatible"
+    pipeline.close.assert_called_once_with()
+    assert not output.exists()

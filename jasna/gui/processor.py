@@ -1244,6 +1244,8 @@ class Processor:
         automatic_segments: bool = False,
     ):
         settings = settings or self._settings
+        from jasna.media.splice import SmartRenderCompatibilityError
+
         if self._stop_event.is_set():
             raise ProcessingStopped("Processing stopped")
         codec = settings.codec
@@ -1251,7 +1253,6 @@ class Processor:
         if segments:
             from jasna.media import get_video_meta_data
             from jasna.media.splice import (
-                SmartRenderCompatibilityError,
                 build_splice_plan,
                 probe_keyframes,
                 validate_smart_render,
@@ -1333,7 +1334,27 @@ class Processor:
             self._current_pipeline = pipeline
             if self._stop_event.is_set():
                 pipeline.cancel()
-            pipeline.run()
+            try:
+                pipeline.run()
+            except SmartRenderCompatibilityError as exc:
+                if not automatic_segments:
+                    raise
+                self._log(
+                    "WARNING",
+                    "Automatic scan ranges failed the Smart Render seam gate; "
+                    f"falling back to full processing: {exc}",
+                )
+                pipeline.close()
+                pipeline = None
+                self._current_pipeline = None
+                return self._run_video_job(
+                    job_id,
+                    input_path,
+                    output_path,
+                    segments=(),
+                    settings=settings,
+                    automatic_segments=False,
+                )
             if _pipeline_was_stopped(pipeline):
                 raise ProcessingStopped("Processing stopped")
             if full_render_staging is not None:
