@@ -44,6 +44,7 @@ from jasna.gui.mosaic_scan import (
     ScanStatus,
     segments_from_scores,
 )
+from jasna.gui.mosaic_scan_process import IsolatedMosaicScanWorker
 from jasna.gui.segment_editor_state import SegmentEditorState
 from jasna.gui.segment_preview import (
     PreviewEnded,
@@ -59,6 +60,12 @@ from jasna.gui.segment_timeline import SegmentTimeline
 from jasna.gui.theme import Colors, Fonts, Sizing
 from jasna.media import VideoMetadata
 from jasna.segments import SegmentRange, format_timestamp, parse_timestamp
+
+
+def _segment_scan_worker_class():
+    from jasna.accelerator import is_amd_device
+
+    return IsolatedMosaicScanWorker if is_amd_device() else MosaicScanWorker
 
 
 class SegmentEditor(ctk.CTkToplevel):
@@ -936,7 +943,7 @@ class SegmentEditor(ctk.CTkToplevel):
         scan_worker = self._scan_worker
         if scan_worker is not None:
             try:
-                while True:
+                while scan_worker is self._scan_worker:
                     self._handle_scan_event(scan_worker.events.get_nowait())
             except queue.Empty:
                 pass
@@ -1545,12 +1552,11 @@ class SegmentEditor(ctk.CTkToplevel):
         stride_seconds = self._scan_interval_seconds_by_label[self._scan_interval.get()]
         settings = self._current_video_settings()
         try:
-            worker = MosaicScanWorker(
+            worker = _segment_scan_worker_class()(
                 self._job.path,
                 self._metadata,
                 settings,
                 stride_seconds=stride_seconds,
-                on_stopped=lambda: self._set_preview_gpu_busy(False),
             )
             worker.start()
         except Exception:
@@ -1652,6 +1658,7 @@ class SegmentEditor(ctk.CTkToplevel):
                 dot_color=Colors.STATUS_PAUSED,
             )
         elif isinstance(event, ScanFailed):
+            self._set_preview_gpu_busy(False)
             if self._scan_worker is not None:
                 self._scan_worker.close()
             self._scan_worker = None
@@ -1662,6 +1669,7 @@ class SegmentEditor(ctk.CTkToplevel):
             )
             self._set_scan_ui_state("message")
         elif isinstance(event, ScanCompleted):
+            self._set_preview_gpu_busy(False)
             self._scan_result = event.result
             self._scan_was_stopped = event.stopped
             self._set_scan_locked(False)
@@ -1712,7 +1720,12 @@ class SegmentEditor(ctk.CTkToplevel):
             state="normal" if count and not self._scan_active else "disabled",
         )
         total_seconds = sum(proposal.duration for proposal in proposals)
-        if not proposals:
+        if self._scan_was_stopped and not result.times:
+            self._set_scan_activity_status(
+                t("segments_scan_stopped"),
+                dot_color=Colors.STATUS_PAUSED,
+            )
+        elif not proposals:
             self._set_scan_activity_status(
                 t("segments_scan_none"),
                 dot_color=Colors.STATUS_PENDING,
@@ -1804,7 +1817,7 @@ class SegmentEditor(ctk.CTkToplevel):
 
     def _request_scan_mask(self, seconds: float) -> None:
         worker = self._scan_worker
-        if worker is None or self._scan_active:
+        if worker is None or self._scan_active or not worker.is_alive():
             return
         key = self._scan_mask_key(seconds)
         if self._scan_mask_requested_key == key:

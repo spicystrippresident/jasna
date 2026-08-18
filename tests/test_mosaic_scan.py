@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fractions import Fraction
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,7 @@ from jasna.gui.mosaic_scan import (
     MosaicScanResult,
     MosaicScanWorker,
     ScanCheckpoint,
+    ScanCompleted,
     ScanFailed,
     _ScanTensorCollector,
     _decode_adaptive_coarse_group,
@@ -306,6 +308,69 @@ def test_scan_worker_closes_reusable_rocdecoder_after_detector_setup_failure(mon
     assert created[0].closed is True
     assert worker._reusable_rocdecoder is None
     assert any(isinstance(event, ScanFailed) for event in worker.events.queue)
+
+
+def test_stop_during_detector_setup_skips_scan_after_delayed_return(monkeypatch):
+    import jasna.media.video_decoder as video_decoder
+
+    entered = threading.Event()
+    release = threading.Event()
+    stopped = threading.Event()
+
+    class FakeReusableRocDecoder:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    class FakeDetector:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    metadata = SimpleNamespace(video_fps=30.0, duration=60.0)
+    detector = FakeDetector()
+    worker = MosaicScanWorker(
+        "video.mp4",
+        metadata,
+        AppSettings(),
+        stride_seconds=0.5,
+        on_stopped=stopped.set,
+    )
+    scanned = []
+
+    def build_detector():
+        entered.set()
+        assert release.wait(2.0)
+        return detector
+
+    monkeypatch.setattr(video_decoder, "ReusableRocDecoder", FakeReusableRocDecoder)
+    monkeypatch.setattr(worker, "_build_detector", build_detector)
+    monkeypatch.setattr(worker, "_scan", lambda _detector: scanned.append(True))
+
+    worker.start()
+    assert entered.wait(2.0)
+    worker.stop()
+    release.set()
+
+    completed = None
+    while completed is None:
+        event = worker.events.get(timeout=2.0)
+        if isinstance(event, ScanCompleted):
+            completed = event
+    assert stopped.wait(2.0)
+    assert completed.stopped is True
+    assert completed.result.times == ()
+    assert completed.result.stride == pytest.approx(0.5)
+    assert scanned == []
+
+    worker.close()
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+    assert detector.closed is True
 
 
 def test_editor_scan_does_not_emit_checkpoint_events_by_default():

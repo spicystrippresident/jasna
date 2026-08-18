@@ -30,6 +30,11 @@ if len(sys.argv) >= 3 and sys.argv[1] == "--isolated-video-job":
 
     sys.exit(run_video_job_file(sys.argv[2]))
 
+if len(sys.argv) >= 3 and sys.argv[1] == "--isolated-mosaic-scan":
+    from jasna.gui.mosaic_scan_process import run_mosaic_scan_file
+
+    sys.exit(run_mosaic_scan_file(sys.argv[2]))
+
 _JASNA_MAIN_PID = os.environ.get("JASNA_MAIN_PID")
 if _JASNA_MAIN_PID and str(os.getpid()) != _JASNA_MAIN_PID:
     if len(sys.argv) < 2 or sys.argv[1] != "--multiprocessing-fork":

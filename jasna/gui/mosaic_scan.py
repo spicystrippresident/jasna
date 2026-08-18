@@ -859,6 +859,9 @@ class MosaicScanWorker:
     def join(self, timeout: float | None = None) -> None:
         self._thread.join(timeout=timeout)
 
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
+
     def request_mask(self, seconds: float) -> int:
         self._mask_generation += 1
         self._replace_command(_MaskRequest(max(0.0, float(seconds)), self._mask_generation))
@@ -891,7 +894,11 @@ class MosaicScanWorker:
         try:
             self.events.put(ScanStatus("loading_models"))
             detector = self._build_detector()
-            self._scan(detector)
+            if self._stop_scan.is_set():
+                if not self._closed.is_set():
+                    self.events.put(ScanCompleted(self._empty_stopped_result(), True))
+            else:
+                self._scan(detector)
             if self._on_stopped is not None:
                 self._on_stopped()
             self._serve_mask_requests(detector)
@@ -913,6 +920,25 @@ class MosaicScanWorker:
 
                 gc.collect()
                 torch.cuda.empty_cache()
+
+    def _empty_stopped_result(self) -> MosaicScanResult:
+        import torch
+
+        if self.adaptive_coarse_plan is not None:
+            stride = self.adaptive_coarse_plan.target_interval
+            duration = self.adaptive_coarse_plan.duration
+        else:
+            fps = float(self.metadata.video_fps)
+            stride = scan_sample_stride(fps, seconds=self.stride_seconds) / fps
+            duration = float(self.metadata.duration)
+        return MosaicScanResult(
+            times=(),
+            scores=(),
+            masks=torch.empty((0, *SCAN_MASK_HW), dtype=torch.uint8, device="cpu"),
+            stride=stride,
+            duration=duration,
+            completed_until=0.0,
+        )
 
     def _build_detector(self):
         from jasna._suppress_noise import install as _install_noise_filters
