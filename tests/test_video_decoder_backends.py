@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
@@ -53,6 +54,7 @@ def _fake_container(is_hwaccel: bool) -> MagicMock:
         width=16,
         height=16,
         color_range=0,
+        thread_count=0,
         thread_type=None,
         name="h264",
     )
@@ -139,6 +141,46 @@ def test_pyav_sw_backend_skips_hwaccel_and_amf(monkeypatch) -> None:
         nvdec_setup.assert_not_called()
         assert module.av.open.call_args.kwargs == {}
         assert container.streams.video[0].codec_context.thread_type == "AUTO"
+
+
+@pytest.mark.parametrize(
+    ("platform", "vendor", "codec_name", "is_10bit", "thread_count", "thread_type"),
+    [
+        ("win32", AcceleratorVendor.AMD, "hevc", True, 1, "SLICE"),
+        ("win32", AcceleratorVendor.AMD, "hevc", False, 0, "AUTO"),
+        ("win32", AcceleratorVendor.AMD, "av1", True, 0, "AUTO"),
+        ("win32", AcceleratorVendor.NVIDIA, "hevc", True, 0, "AUTO"),
+        ("linux", AcceleratorVendor.AMD, "hevc", True, 0, "AUTO"),
+    ],
+)
+def test_pyav_sw_backend_limits_windows_amd_hevc_main10_threads(
+    monkeypatch,
+    platform: str,
+    vendor: AcceleratorVendor,
+    codec_name: str,
+    is_10bit: bool,
+    thread_count: int,
+    thread_type: str,
+) -> None:
+    monkeypatch.setattr(module, "DECODE_BACKEND", "pyav-sw")
+    monkeypatch.setattr(module.sys, "platform", platform)
+    container = _fake_container(False)
+    monkeypatch.setattr(module.av, "open", MagicMock(return_value=container))
+    metadata = replace(_metadata(), codec_name=codec_name, is_10bit=is_10bit)
+    monkeypatch.setattr(module, "vendor_for_device", lambda _device: vendor)
+    monkeypatch.setattr(module, "current_stream", lambda _device: None)
+    reader = module.NvidiaVideoReader(
+        "input.mp4",
+        4,
+        torch.device("cuda:0"),
+        metadata,
+    )
+
+    reader.__enter__()
+
+    context = container.streams.video[0].codec_context
+    assert context.thread_count == thread_count
+    assert context.thread_type == thread_type
 
 
 def test_unknown_backend_raises(monkeypatch) -> None:
