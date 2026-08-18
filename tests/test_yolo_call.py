@@ -27,6 +27,7 @@ def _build_yolo_model(*, batch_size=2, imgsz=640):
     mock_runner.outputs = outs
 
     with (
+        patch("jasna.mosaic.yolo.is_nvidia_device", return_value=True),
         patch("jasna.mosaic.yolo.get_yolo_tensorrt_engine_path", return_value=_mock_engine_path()),
         patch("jasna.mosaic.yolo.TrtRunner", return_value=mock_runner),
     ):
@@ -54,6 +55,7 @@ class TestYoloInit:
         engine = _mock_engine_path()
 
         with (
+            patch("jasna.mosaic.yolo.is_nvidia_device", return_value=True),
             patch("jasna.mosaic.yolo.get_yolo_tensorrt_engine_path", return_value=engine),
             patch("jasna.mosaic.yolo.TrtRunner", mock_runner_cls),
         ):
