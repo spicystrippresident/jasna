@@ -385,7 +385,7 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
             on_progress=self._on_processor_progress,
             on_log=self._on_processor_log,
             on_complete=self._on_processor_complete,
-            video_job_isolation="linux-amd",
+            video_job_isolation="amd",
         )
 
     def _log_startup_timing(self):
