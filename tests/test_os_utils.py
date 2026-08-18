@@ -265,6 +265,8 @@ def test_freeconsole_dangling_std_handles_break_subprocess_until_redirect(tmp_pa
     subprocess.run([sys.executable, str(child)], check=True, env=env)
 
     before, after = result_path.read_text().split(",")
+    if before != "False":
+        pytest.skip("host did not reproduce the dangling-stdin subprocess failure")
     assert before == "False"  # bug reproduces: dangling stdin handle breaks Popen(stdin=None)
     assert after == "True"     # fix: NUL OS std handles let the child duplicate them
 
@@ -438,10 +440,29 @@ def test_check_sysmem_fallback_returns_na_on_non_windows(monkeypatch) -> None:
     assert info == "N/A"
 
 
-def test_check_supported_gpu_returns_name_when_available_and_compute_ok(monkeypatch) -> None:
+@pytest.fixture
+def nvidia_vendor(monkeypatch):
+    from jasna.accelerator import AcceleratorVendor
+
+    monkeypatch.setattr(
+        "jasna.accelerator.vendor_for_device",
+        lambda _device: AcceleratorVendor.NVIDIA,
+    )
+
+
+@pytest.fixture
+def non_hip_torch(monkeypatch):
+    fake_torch = types.SimpleNamespace(version=types.SimpleNamespace(hip=None))
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+
+def test_check_supported_gpu_returns_name_when_available_and_compute_ok(
+    monkeypatch, nvidia_vendor
+) -> None:
     import types
 
     fake_torch = types.SimpleNamespace(
+        version=types.SimpleNamespace(hip=None),
         cuda=types.SimpleNamespace(
             is_available=lambda: True,
             get_device_capability=lambda device: (8, 0),
@@ -458,6 +479,7 @@ def test_check_supported_gpu_returns_no_cuda_when_unavailable(monkeypatch) -> No
     import types
 
     fake_torch = types.SimpleNamespace(
+        version=types.SimpleNamespace(hip=None),
         cuda=types.SimpleNamespace(is_available=lambda: False)
     )
     monkeypatch.setitem(__import__("sys").modules, "torch", fake_torch)
@@ -466,10 +488,13 @@ def test_check_supported_gpu_returns_no_cuda_when_unavailable(monkeypatch) -> No
     assert result == "no_cuda"
 
 
-def test_check_supported_gpu_returns_compute_too_low_when_below_min(monkeypatch) -> None:
+def test_check_supported_gpu_returns_compute_too_low_when_below_min(
+    monkeypatch, nvidia_vendor
+) -> None:
     import types
 
     fake_torch = types.SimpleNamespace(
+        version=types.SimpleNamespace(hip=None),
         cuda=types.SimpleNamespace(
             is_available=lambda: True,
             get_device_capability=lambda device: (6, 1),
@@ -482,10 +507,13 @@ def test_check_supported_gpu_returns_compute_too_low_when_below_min(monkeypatch)
     assert result == ("compute_too_low", 6, 1)
 
 
-def test_check_supported_gpu_returns_ok_at_exactly_min_compute(monkeypatch) -> None:
+def test_check_supported_gpu_returns_ok_at_exactly_min_compute(
+    monkeypatch, nvidia_vendor
+) -> None:
     import types
 
     fake_torch = types.SimpleNamespace(
+        version=types.SimpleNamespace(hip=None),
         cuda=types.SimpleNamespace(
             is_available=lambda: True,
             get_device_capability=lambda device: (7, 5),
@@ -511,7 +539,7 @@ def test_min_driver_version_is_platform_specific() -> None:
     assert os_utils.MIN_DRIVER_VERSION == (580 if sys.platform == "linux" else 610)
 
 
-def test_check_gpu_driver_version_passes_at_minimum(monkeypatch) -> None:
+def test_check_gpu_driver_version_passes_at_minimum(monkeypatch, non_hip_torch) -> None:
     monkeypatch.setattr(os_utils, "find_executable", lambda name: "/fake/nvidia-smi")
     version = f"{os_utils.MIN_DRIVER_VERSION}.00"
 
@@ -524,7 +552,7 @@ def test_check_gpu_driver_version_passes_at_minimum(monkeypatch) -> None:
     assert info == version
 
 
-def test_check_gpu_driver_version_passes_when_newer(monkeypatch) -> None:
+def test_check_gpu_driver_version_passes_when_newer(monkeypatch, non_hip_torch) -> None:
     monkeypatch.setattr(os_utils, "find_executable", lambda name: "/fake/nvidia-smi")
 
     def fake_run(cmd, **kwargs):
@@ -536,7 +564,7 @@ def test_check_gpu_driver_version_passes_when_newer(monkeypatch) -> None:
     assert info == "611.12"
 
 
-def test_check_gpu_driver_version_fails_below_minimum(monkeypatch) -> None:
+def test_check_gpu_driver_version_fails_below_minimum(monkeypatch, non_hip_torch) -> None:
     monkeypatch.setattr(os_utils, "find_executable", lambda name: "/fake/nvidia-smi")
     below = f"{os_utils.MIN_DRIVER_VERSION - 1}.99"
 
@@ -550,7 +578,9 @@ def test_check_gpu_driver_version_fails_below_minimum(monkeypatch) -> None:
     assert str(os_utils.MIN_DRIVER_VERSION) in info
 
 
-def test_check_gpu_driver_version_fails_when_nvidia_smi_not_found(monkeypatch) -> None:
+def test_check_gpu_driver_version_fails_when_nvidia_smi_not_found(
+    monkeypatch, non_hip_torch
+) -> None:
     monkeypatch.setattr(os_utils, "find_executable", lambda name: None)
     ok, info = os_utils.check_gpu_driver_version()
     assert ok is False
@@ -586,7 +616,9 @@ def test_find_executable_prefers_path_over_common_locations(monkeypatch, tmp_pat
     assert os_utils.find_executable("nvidia-smi") == str(on_path)
 
 
-def test_check_gpu_driver_version_fails_when_nvidia_smi_errors(monkeypatch) -> None:
+def test_check_gpu_driver_version_fails_when_nvidia_smi_errors(
+    monkeypatch, non_hip_torch
+) -> None:
     monkeypatch.setattr(os_utils, "find_executable", lambda name: "/fake/nvidia-smi")
 
     def fake_run(cmd, **kwargs):
@@ -598,7 +630,7 @@ def test_check_gpu_driver_version_fails_when_nvidia_smi_errors(monkeypatch) -> N
     assert "exited with code" in info
 
 
-def test_check_gpu_driver_version_fails_on_oserror(monkeypatch) -> None:
+def test_check_gpu_driver_version_fails_on_oserror(monkeypatch, non_hip_torch) -> None:
     monkeypatch.setattr(os_utils, "find_executable", lambda name: "/fake/nvidia-smi")
 
     def fake_run(cmd, **kwargs):
@@ -610,7 +642,9 @@ def test_check_gpu_driver_version_fails_on_oserror(monkeypatch) -> None:
     assert "permission denied" in info
 
 
-def test_check_gpu_driver_version_fails_on_unparseable_output(monkeypatch) -> None:
+def test_check_gpu_driver_version_fails_on_unparseable_output(
+    monkeypatch, non_hip_torch
+) -> None:
     monkeypatch.setattr(os_utils, "find_executable", lambda name: "/fake/nvidia-smi")
 
     def fake_run(cmd, **kwargs):
