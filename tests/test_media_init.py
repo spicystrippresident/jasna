@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from av.video.reformatter import Colorspace as AvColorspace, ColorRange as AvColorRange
 
+from jasna.accelerator import AcceleratorVendor
 from jasna.media import (
     SUPPORTED_ENCODER_SETTINGS,
     SUPPORTED_ENCODER_SETTINGS_BY_CODEC,
@@ -122,21 +123,23 @@ class TestParseEncoderSettings:
 class TestValidateEncoderSettings:
     def test_valid_settings(self):
         settings = {"cq": 22, "rc-lookahead": 32, "preset": "p5"}
-        assert validate_encoder_settings(settings) == settings
+        assert validate_encoder_settings(settings, vendor=AcceleratorVendor.NVIDIA) == settings
 
     def test_empty_settings(self):
-        assert validate_encoder_settings({}) == {}
+        assert validate_encoder_settings({}, vendor=AcceleratorVendor.NVIDIA) == {}
 
     def test_invalid_key_raises(self):
         with pytest.raises(ValueError, match="Unsupported encoder setting"):
-            validate_encoder_settings({"cq": 22, "bad_key": 1})
+            validate_encoder_settings(
+                {"cq": 22, "bad_key": 1}, vendor=AcceleratorVendor.NVIDIA
+            )
 
     def test_all_supported_keys_accepted(self):
         # spatial_aq/spatial-aq are aliases and may not be combined.
         settings = {k: 0 for k in SUPPORTED_ENCODER_SETTINGS if k != "spatial-aq"}
-        assert validate_encoder_settings(settings) == settings
+        assert validate_encoder_settings(settings, vendor=AcceleratorVendor.NVIDIA) == settings
         settings = {k: 0 for k in SUPPORTED_ENCODER_SETTINGS if k != "spatial_aq"}
-        assert validate_encoder_settings(settings) == settings
+        assert validate_encoder_settings(settings, vendor=AcceleratorVendor.NVIDIA) == settings
 
 
 class TestValidateEncoderSettingsPerCodec:
@@ -147,50 +150,89 @@ class TestValidateEncoderSettingsPerCodec:
     @pytest.mark.parametrize("codec", ["hevc", "h264", "av1"])
     def test_common_settings_accepted_for_all_codecs(self, codec):
         settings = {"preset": "p5", "cq": 25, "rc-lookahead": 32, "bf": 4, "maxrate": "10M"}
-        assert validate_encoder_settings(settings, codec=codec) == settings
+        assert (
+            validate_encoder_settings(
+                settings, codec=codec, vendor=AcceleratorVendor.NVIDIA
+            )
+            == settings
+        )
 
     @pytest.mark.parametrize("codec", ["hevc", "h264"])
     def test_profile_accepted_for_hevc_and_h264(self, codec):
-        assert validate_encoder_settings({"profile": "x"}, codec=codec) == {"profile": "x"}
+        assert validate_encoder_settings(
+            {"profile": "x"}, codec=codec, vendor=AcceleratorVendor.NVIDIA
+        ) == {"profile": "x"}
 
     def test_profile_rejected_for_av1(self):
         with pytest.raises(ValueError, match="for codec av1.*profile"):
-            validate_encoder_settings({"profile": "main"}, codec="av1")
+            validate_encoder_settings(
+                {"profile": "main"}, codec="av1", vendor=AcceleratorVendor.NVIDIA
+            )
 
     @pytest.mark.parametrize("codec", ["hevc", "h264"])
     def test_underscore_aq_alias_accepted_for_hevc_and_h264(self, codec):
-        assert validate_encoder_settings({"spatial_aq": 1}, codec=codec)
-        assert validate_encoder_settings({"spatial-aq": 1}, codec=codec)
+        assert validate_encoder_settings(
+            {"spatial_aq": 1}, codec=codec, vendor=AcceleratorVendor.NVIDIA
+        )
+        assert validate_encoder_settings(
+            {"spatial-aq": 1}, codec=codec, vendor=AcceleratorVendor.NVIDIA
+        )
 
     def test_av1_requires_hyphen_aq_spelling(self):
-        assert validate_encoder_settings({"spatial-aq": 1}, codec="av1")
+        assert validate_encoder_settings(
+            {"spatial-aq": 1}, codec="av1", vendor=AcceleratorVendor.NVIDIA
+        )
         with pytest.raises(ValueError, match="for codec av1.*spatial_aq"):
-            validate_encoder_settings({"spatial_aq": 1}, codec="av1")
+            validate_encoder_settings(
+                {"spatial_aq": 1}, codec="av1", vendor=AcceleratorVendor.NVIDIA
+            )
 
     def test_av1_tile_options_accepted(self):
         settings = {"tile-rows": 2, "tile-columns": 2}
-        assert validate_encoder_settings(settings, codec="av1") == settings
+        assert (
+            validate_encoder_settings(
+                settings, codec="av1", vendor=AcceleratorVendor.NVIDIA
+            )
+            == settings
+        )
         with pytest.raises(ValueError, match="for codec hevc"):
-            validate_encoder_settings(settings, codec="hevc")
+            validate_encoder_settings(
+                settings, codec="hevc", vendor=AcceleratorVendor.NVIDIA
+            )
 
     def test_h264_coder_accepted_only_for_h264(self):
-        assert validate_encoder_settings({"coder": "cabac"}, codec="h264")
+        assert validate_encoder_settings(
+            {"coder": "cabac"}, codec="h264", vendor=AcceleratorVendor.NVIDIA
+        )
         with pytest.raises(ValueError, match="for codec hevc"):
-            validate_encoder_settings({"coder": "cabac"}, codec="hevc")
+            validate_encoder_settings(
+                {"coder": "cabac"}, codec="hevc", vendor=AcceleratorVendor.NVIDIA
+            )
 
     def test_error_message_names_selected_codec(self):
         with pytest.raises(ValueError, match=r"for codec h264.*tier.*Supported for h264"):
-            validate_encoder_settings({"tier": "high"}, codec="h264")
+            validate_encoder_settings(
+                {"tier": "high"}, codec="h264", vendor=AcceleratorVendor.NVIDIA
+            )
 
     def test_conflicting_aq_aliases_rejected(self):
         with pytest.raises(ValueError, match="Conflicting encoder settings.*spatial"):
-            validate_encoder_settings({"spatial_aq": 1, "spatial-aq": 1}, codec="hevc")
+            validate_encoder_settings(
+                {"spatial_aq": 1, "spatial-aq": 1},
+                codec="hevc",
+                vendor=AcceleratorVendor.NVIDIA,
+            )
         with pytest.raises(ValueError, match="Conflicting encoder settings.*spatial"):
-            validate_encoder_settings({"spatial_aq": 1, "spatial-aq": 1})
+            validate_encoder_settings(
+                {"spatial_aq": 1, "spatial-aq": 1},
+                vendor=AcceleratorVendor.NVIDIA,
+            )
 
     def test_unknown_codec_rejected(self):
         with pytest.raises(ValueError, match="Unsupported codec: vp9"):
-            validate_encoder_settings({}, codec="vp9")
+            validate_encoder_settings(
+                {}, codec="vp9", vendor=AcceleratorVendor.NVIDIA
+            )
 
 
 class TestIsStream10bit:
