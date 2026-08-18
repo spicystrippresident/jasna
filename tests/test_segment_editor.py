@@ -427,6 +427,49 @@ def test_scan_model_change_applies_recommended_threshold(monkeypatch) -> None:
         root.destroy()
 
 
+def test_segment_scan_isolates_only_amd_runtime(monkeypatch) -> None:
+    import jasna.accelerator as accelerator
+
+    monkeypatch.setattr(accelerator, "is_amd_device", lambda: True)
+    assert segment_editor._segment_scan_worker_class() is segment_editor.IsolatedMosaicScanWorker
+
+    monkeypatch.setattr(accelerator, "is_amd_device", lambda: False)
+    assert segment_editor._segment_scan_worker_class() is segment_editor.MosaicScanWorker
+
+
+def test_forced_empty_stop_uses_stopped_status_and_does_not_request_masks() -> None:
+    editor = object.__new__(SegmentEditor)
+    editor._state = SegmentEditorState(duration=60.0, fps=30.0)
+    editor._scan_result = segment_editor.MosaicScanResult(
+        times=(),
+        scores=(),
+        masks=torch.empty((0, 90, 160), dtype=torch.uint8),
+        stride=1.0,
+        duration=60.0,
+        completed_until=0.0,
+    )
+    editor._scan_threshold = 0.5
+    editor._scan_was_stopped = True
+    editor._scan_active = False
+    editor._scan_overlay = False
+    editor._timeline = MagicMock()
+    editor._scan_add_btn = MagicMock()
+    editor._set_scan_activity_status = MagicMock()
+    editor._set_scan_ui_state = MagicMock()
+    worker = MagicMock()
+    worker.is_alive.return_value = False
+    editor._scan_worker = worker
+
+    SegmentEditor._refresh_scan_view(editor)
+    SegmentEditor._request_scan_mask(editor, 1.0)
+
+    editor._set_scan_activity_status.assert_called_once_with(
+        t("segments_scan_stopped"),
+        dot_color=segment_editor.Colors.STATUS_PAUSED,
+    )
+    worker.request_mask.assert_not_called()
+
+
 def test_source_codec_notice_only_shows_for_selected_ranges(monkeypatch) -> None:
     try:
         root = ctk.CTk()
