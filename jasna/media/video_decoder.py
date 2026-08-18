@@ -115,6 +115,20 @@ def _decode_backend() -> str:
     return backend
 
 
+def _requires_single_slice_pyav_threads(
+    metadata: VideoMetadata,
+    vendor: AcceleratorVendor,
+) -> bool:
+    """Limit the problematic Windows AMD HEVC Main10 software decoder."""
+
+    return (
+        sys.platform == "win32"
+        and vendor is AcceleratorVendor.AMD
+        and str(metadata.codec_name).lower() == "hevc"
+        and bool(metadata.is_10bit)
+    )
+
+
 class ReusableRocDecoder:
     """Keep one rocDecode surface pool alive across sequential readers.
 
@@ -167,8 +181,6 @@ class ReusableRocDecoder:
             self._signature = None
         if decoder is not None:
             decoder.close()
-
-
 def _cuda_driver() -> ctypes.CDLL:
     global _libcuda
     if _libcuda is None:
@@ -729,7 +741,11 @@ class NvidiaVideoReader:
 
         ctx = self.video_stream.codec_context
         if software_only:
-            ctx.thread_type = "AUTO"
+            if _requires_single_slice_pyav_threads(self.metadata, self.vendor):
+                ctx.thread_count = 1
+                ctx.thread_type = "SLICE"
+            else:
+                ctx.thread_type = "AUTO"
         elif self.vendor is AcceleratorVendor.AMD:
             self._setup_amf_decoder(ctx)
         elif not ctx.is_hwaccel:
