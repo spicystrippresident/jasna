@@ -287,6 +287,54 @@ class TestEncodeStallDetection:
         assert offloader._last_stall_warn_time == 0.0
         diagnostics.assert_not_called()
 
+    def test_unarmed_heartbeat_resets_warning_cooldown(self):
+        offloader = VramOffloader(
+            device=torch.device("cpu"),
+            blend_buffer=BlendBuffer(device=torch.device("cpu")),
+            crop_buffers={},
+            crop_lock=threading.Lock(),
+            vram_limit=0.001,
+            safetynet=0,
+        )
+        offloader.set_encode_heartbeat([None])
+        offloader._last_stall_warn_time = 123.0
+
+        with patch.object(offloader, "_dump_stall_diagnostics") as diagnostics:
+            offloader._check_encode_stall()
+
+        assert offloader._last_stall_warn_time == 0.0
+        diagnostics.assert_not_called()
+
+    def test_reads_active_heartbeat_once_per_check(self):
+        import time
+
+        class ChangingHeartbeat(list):
+            def __init__(self):
+                super().__init__([time.monotonic()])
+                self.reads = 0
+
+            def __getitem__(self, index):
+                self.reads += 1
+                if self.reads > 1:
+                    raise AssertionError("heartbeat must be snapshotted")
+                return super().__getitem__(index)
+
+        offloader = VramOffloader(
+            device=torch.device("cpu"),
+            blend_buffer=BlendBuffer(device=torch.device("cpu")),
+            crop_buffers={},
+            crop_lock=threading.Lock(),
+            vram_limit=0.001,
+            safetynet=0,
+        )
+        heartbeat = ChangingHeartbeat()
+        offloader.set_encode_heartbeat(heartbeat)
+
+        offloader._check_encode_stall()
+
+        assert heartbeat.reads == 1
+        assert offloader._last_stall_warn_time == 0.0
+
     def test_no_warning_when_recent(self):
         import time
         offloader = VramOffloader(

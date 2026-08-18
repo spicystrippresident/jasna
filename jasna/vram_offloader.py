@@ -145,10 +145,14 @@ class VramOffloader:
 
     def _check_encode_stall(self) -> None:
         hb = self._last_encode_time
-        if hb is None or hb[0] is None or self._stall_check_paused:
+        if hb is None or self._stall_check_paused:
+            return
+        heartbeat = hb[0]
+        if heartbeat is None:
+            self._last_stall_warn_time = 0.0
             return
         now = time.monotonic()
-        elapsed = now - hb[0]
+        elapsed = now - heartbeat
         if elapsed > STALL_WARN_SECONDS:
             if now - self._last_stall_warn_time >= STALL_WARN_SECONDS:
                 _log.warning(
