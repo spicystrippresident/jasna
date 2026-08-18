@@ -550,11 +550,16 @@ class _ScanCheckpointStore:
         times: tuple[float, ...],
         scores: tuple[float, ...],
         sample_keys: tuple[int, ...] | None = None,
+        *,
+        durable: bool = False,
     ) -> None:
         values = self.samples(name, stride)
         self._add(values, times, scores, sample_keys=sample_keys)
         self._stage(name, stride)["samples"] = self._encode_samples(values)
-        self._maybe_flush()
+        if durable:
+            self.flush()
+        else:
+            self._maybe_flush()
 
     def _add(
         self,
@@ -987,6 +992,7 @@ class PreScanCoordinator:
                         event.times,
                         event.scores,
                         sample_keys=event.sample_keys,
+                        durable=True,
                     )
                 elif isinstance(event, ScanStatus):
                     self._log("INFO", str(event.message))

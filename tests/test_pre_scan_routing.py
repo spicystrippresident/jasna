@@ -491,6 +491,78 @@ def test_adaptive_coarse_checkpoint_keeps_exact_pts_and_reuses_completed_stage(t
     assert len(created) == 1
 
 
+def test_scan_checkpoint_batch_is_durable_before_stage_finishes(tmp_path):
+    path = tmp_path / "scan" / "manifest.json"
+    signature = {"source": "demo", "algorithm": "adaptive"}
+    checkpoint = _ScanCheckpointStore(
+        path,
+        signature,
+        fps=60.0,
+        time_base=0.01,
+    )
+    observed = {}
+
+    class InspectingEvents:
+        calls = 0
+
+        def get(self, *, timeout):
+            del timeout
+            self.calls += 1
+            if self.calls == 1:
+                return ScanCheckpoint((0, 401), (0.0, 4.01), (0.1, 0.8))
+            reopened = _ScanCheckpointStore(
+                path,
+                signature,
+                fps=60.0,
+                time_base=0.01,
+            )
+            observed["samples"] = reopened.samples("coarse", 4.0)
+            observed["complete"] = reopened.stage_complete("coarse", 4.0)
+            return ScanCompleted(
+                MosaicScanResult(
+                    times=(0.0, 4.01),
+                    scores=(0.1, 0.8),
+                    masks=(),
+                    stride=4.0,
+                    duration=8.0,
+                    completed_until=4.01,
+                ),
+                stopped=True,
+            )
+
+    class FakeWorker:
+        def __init__(self, *args, **kwargs):
+            self.events = InspectingEvents()
+
+        def start(self):
+            pass
+
+        def close(self):
+            pass
+
+        def join(self):
+            pass
+
+    coordinator = PreScanCoordinator.__new__(PreScanCoordinator)
+    coordinator.source = tmp_path / "video.mp4"
+    coordinator.output = tmp_path / "output.mp4"
+    coordinator.metadata = SimpleNamespace(video_fps=60.0, duration=8.0, time_base=0.01)
+    coordinator.settings = AppSettings()
+    coordinator._stopped = lambda: False
+    coordinator._log = lambda *_args: None
+    coordinator._progress = None
+    coordinator._worker_factory = FakeWorker
+    coordinator._active_worker = None
+    coordinator.checkpoint = checkpoint
+    coordinator._adaptive_coarse_plan = lambda _interval: object()
+
+    with pytest.raises(PreScanStopped):
+        coordinator._run_stage("coarse", 4.0, adaptive_coarse=True)
+
+    assert observed == {"samples": {0: (0.0, 0.1), 401: (4.01, 0.8)}, "complete": False}
+    assert checkpoint.completed_outcome() is None
+
+
 def test_adaptive_coarse_cancellation_persists_completed_batches(tmp_path):
     checkpoint = _ScanCheckpointStore(
         tmp_path / "scan" / "manifest.json",
