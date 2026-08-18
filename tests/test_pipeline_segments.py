@@ -10,7 +10,12 @@ import pytest
 import torch
 
 from jasna.accelerator import AcceleratorVendor
-from jasna.media.splice import KeyframeIndex, SplicePlan, SpliceSpan
+from jasna.media.splice import (
+    KeyframeIndex,
+    SmartRenderCompatibilityError,
+    SplicePlan,
+    SpliceSpan,
+)
 from jasna.pipeline import Pipeline
 from jasna.segments import SegmentRange
 
@@ -112,7 +117,102 @@ def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_pat
     mux.assert_called_once()
     assert mux.call_args.args[0][0][0].parent == workspace.path
     assert mux.call_args.kwargs["manifest"].parent == workspace.path
+    assert mux.call_args.kwargs["copy_validation_ranges"] == ()
+    assert mux.call_args.kwargs["cancelled"]() is False
+
     workspace.cleanup.assert_called_once()
+
+
+def test_hevc_smart_run_checks_parameter_sets_and_bounded_copy_gops(tmp_path) -> None:
+    pipeline = object.__new__(Pipeline)
+    pipeline.input_video = tmp_path / "input.mkv"
+    pipeline.output_video = tmp_path / "output.mkv"
+    pipeline.codec = "hevc"
+    pipeline.encoder_settings = {"cq": 22}
+    pipeline.device = torch.device("cuda:0")
+    pipeline.disable_progress = True
+    pipeline.progress_callback = None
+    pipeline.lut_path = None
+    pipeline.sharpen_strength = 0.0
+    pipeline.retarget_high_fps = False
+    pipeline.segments = (SegmentRange(2.5, 3.0),)
+    pipeline.working_dir = tmp_path
+    pipeline._cancel_event = threading.Event()
+    metadata = MagicMock(
+        video_fps=30.0,
+        video_fps_exact=Fraction(30, 1),
+        duration=6.0,
+        profile="Main 10",
+    )
+    plan = SplicePlan(
+        index=KeyframeIndex(
+            (0, 30, 60, 90, 120, 150),
+            Fraction(1, 30),
+            0,
+            180,
+        ),
+        spans=(
+            SpliceSpan("copy", 0, 60),
+            SpliceSpan("render", 60, 120, ((75, 90),)),
+            SpliceSpan("copy", 120, 180),
+        ),
+        segments=pipeline.segments,
+    )
+    pipeline.splice_plan = plan
+    workspace = MagicMock()
+    workspace.path = tmp_path / "workspace"
+    workspace.path.mkdir()
+    reusable = [workspace.path / f"{index:04d}.ts" for index in range(3)]
+    for path in reusable:
+        path.write_bytes(b"fragment")
+    workspace.reusable_fragment.side_effect = reusable
+
+    with (
+        patch("jasna.pipeline.validate_smart_render", return_value="hevc"),
+        patch("jasna.pipeline.resolve_smart_encoder_settings", return_value={}),
+        patch("jasna.pipeline.workspace_signature", return_value={}),
+        patch("jasna.pipeline.SmartRenderWorkspace.open", return_value=workspace),
+        patch("jasna.pipeline.validate_hevc_fragment_parameter_sets") as validate_sets,
+        patch("jasna.pipeline.mux_fragments_final_output") as mux,
+    ):
+        pipeline._run_smart(metadata)
+
+    validate_sets.assert_called_once_with(
+        [
+            (reusable[0], "copy"),
+            (reusable[1], "render"),
+            (reusable[2], "copy"),
+        ]
+    )
+    assert mux.call_args.kwargs["copy_validation_ranges"] == (
+        (1.0, 1.0),
+        (4.0, 1.0),
+    )
+    assert mux.call_args.kwargs["cancelled"]() is False
+
+    workspace.cleanup.reset_mock()
+    workspace.reusable_fragment.side_effect = reusable
+    rejection = SmartRenderCompatibilityError(
+        "incompatible HEVC headers",
+        reason="hevc_parameter_sets_incompatible",
+    )
+    with (
+        patch("jasna.pipeline.validate_smart_render", return_value="hevc"),
+        patch("jasna.pipeline.resolve_smart_encoder_settings", return_value={}),
+        patch("jasna.pipeline.workspace_signature", return_value={}),
+        patch("jasna.pipeline.SmartRenderWorkspace.open", return_value=workspace),
+        patch(
+            "jasna.pipeline.validate_hevc_fragment_parameter_sets",
+            side_effect=rejection,
+        ),
+        patch("jasna.pipeline.mux_fragments_final_output") as rejected_mux,
+        pytest.raises(SmartRenderCompatibilityError) as rejected,
+    ):
+        pipeline._run_smart(metadata)
+
+    assert rejected.value.reason == "hevc_parameter_sets_incompatible"
+    rejected_mux.assert_not_called()
+    workspace.cleanup.assert_called_once_with()
 
 
 def test_smart_run_uses_working_dir_for_temp_files(tmp_path) -> None:

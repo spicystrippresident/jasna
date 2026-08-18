@@ -3,6 +3,8 @@ from __future__ import annotations
 from fractions import Fraction
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import av
 import numpy as np
@@ -11,14 +13,20 @@ import pytest
 from jasna.accelerator import AcceleratorVendor
 from jasna.media import get_video_meta_data
 from jasna.media.splice import (
+    HevcParameterSet,
+    SmartRenderCompatibilityError,
     SpliceSpan,
     concatenate_fragments,
     create_copy_fragment,
     mux_fragments_final_output,
     mux_final_output,
     normalize_fragment,
+    probe_hevc_parameter_sets,
     probe_keyframes,
     resolve_smart_encoder_settings,
+    validate_hevc_copy_seams,
+    validate_hevc_fragment_parameter_sets,
+    _decoded_frame_hashes,
 )
 from jasna.os_utils import resolve_executable, subprocess_no_window_kwargs
 
@@ -103,6 +111,178 @@ def test_normalize_fragment_applies_decode_delay_to_unreordered_h264(
 
     assert packets
     assert any(packet.pts > packet.dts for packet in packets)
+
+
+def _make_hevc_source(path: Path, *, size: str = "160x96") -> None:
+    _ffmpeg(
+        "-f", "lavfi", "-i", f"testsrc2=size={size}:rate=12:duration=2",
+        "-an",
+        "-c:v", "libx265",
+        "-pix_fmt", "yuv420p10le",
+        "-x265-params", "keyint=12:min-keyint=12:scenecut=0:open-gop=0:repeat-headers=1",
+        str(path),
+    )
+
+
+def test_hevc_parameter_set_probe_reads_hvcc_and_annex_b(tmp_path: Path) -> None:
+    source = tmp_path / "source.mp4"
+    annex_b = tmp_path / "source.ts"
+    _make_hevc_source(source)
+
+    normalize_fragment(source, annex_b, codec="hevc")
+
+    hvcc_signature = probe_hevc_parameter_sets(source)
+    annex_b_signature = probe_hevc_parameter_sets(annex_b)
+    assert {item.nal_type for item in hvcc_signature} == {32, 33, 34}
+    assert hvcc_signature == annex_b_signature
+    assert {(item.parameter_set_id, item.referenced_id) for item in hvcc_signature} == {
+        (0, None),
+        (0, 0),
+    }
+
+
+def test_hevc_parameter_set_collision_fails_closed(tmp_path: Path) -> None:
+    source = tmp_path / "source.mp4"
+    rendered = tmp_path / "rendered.mp4"
+    source_fragment = tmp_path / "source.ts"
+    rendered_fragment = tmp_path / "rendered.ts"
+    _make_hevc_source(source, size="160x96")
+    _make_hevc_source(rendered, size="176x96")
+    normalize_fragment(source, source_fragment, codec="hevc")
+    normalize_fragment(rendered, rendered_fragment, codec="hevc")
+
+    with pytest.raises(SmartRenderCompatibilityError) as rejected:
+        validate_hevc_fragment_parameter_sets(
+            [(source_fragment, "copy"), (rendered_fragment, "render")]
+        )
+
+    assert rejected.value.reason == "hevc_parameter_sets_incompatible"
+
+
+def test_hevc_parameter_set_comparison_preserves_fragment_rap_order(
+    tmp_path: Path,
+) -> None:
+    def signature(prefix: str) -> tuple[HevcParameterSet, ...]:
+        return (
+            HevcParameterSet(32, 0, None, f"{prefix}-vps"),
+            HevcParameterSet(33, 0, 0, f"{prefix}-sps"),
+            HevcParameterSet(34, 0, 0, f"{prefix}-pps"),
+        )
+
+    config_a = signature("a")
+    config_b = signature("b")
+    fragments = [
+        (tmp_path / "copy-a.ts", "copy"),
+        (tmp_path / "render.ts", "render"),
+        (tmp_path / "copy-b.ts", "copy"),
+    ]
+    # Aggregating by role would make both roles contain {A, B} and miss this.
+    with (
+        patch(
+            "jasna.media.splice._probe_hevc_parameter_set_sequences",
+            side_effect=[(config_a,), (config_a, config_b), (config_b,)],
+        ),
+        pytest.raises(SmartRenderCompatibilityError) as rejected,
+    ):
+        validate_hevc_fragment_parameter_sets(fragments)
+
+    assert rejected.value.reason == "hevc_parameter_sets_incompatible"
+
+
+def test_hevc_copy_seam_gate_accepts_copy_and_rejects_reencode(tmp_path: Path) -> None:
+    source = tmp_path / "source.mp4"
+    reencoded = tmp_path / "reencoded.mp4"
+    _make_hevc_source(source)
+    _ffmpeg(
+        "-i", str(source),
+        "-an",
+        "-vf", "hue=s=0",
+        "-c:v", "libx265",
+        "-pix_fmt", "yuv420p10le",
+        str(reencoded),
+    )
+
+    validate_hevc_copy_seams(source, source, ((0.0, 1.0),))
+    with pytest.raises(SmartRenderCompatibilityError) as rejected:
+        validate_hevc_copy_seams(reencoded, source, ((0.0, 1.0),))
+
+    assert rejected.value.reason == "hevc_copy_seam_mismatch"
+
+
+def test_hevc_frame_hash_probe_preserves_absolute_timeline(tmp_path: Path) -> None:
+    path = tmp_path / "video.mkv"
+    container = MagicMock()
+    container.__enter__.return_value = container
+    container.streams.video = [SimpleNamespace(start_time=0, time_base=Fraction(1, 30))]
+
+    def framemd5(first_pts: int) -> str:
+        return (
+            "#format: frame checksums\n"
+            "#tb 0: 1/30\n"
+            f"0, {first_pts}, {first_pts}, 1, 128, same-a\n"
+            f"0, {first_pts + 1}, {first_pts + 1}, 1, 128, same-b\n"
+        )
+
+    with (
+        patch("jasna.media.splice.av.open", return_value=container),
+        patch(
+            "jasna.media.splice.subprocess.run",
+            side_effect=[
+                SimpleNamespace(returncode=0, stdout=framemd5(300), stderr=""),
+                SimpleNamespace(returncode=0, stdout=framemd5(330), stderr=""),
+            ],
+        ),
+    ):
+        first = _decoded_frame_hashes(path, start=10.0, duration=1.0)
+        shifted = _decoded_frame_hashes(path, start=10.0, duration=1.0)
+
+    assert first != shifted
+    assert first[0][0] == Fraction(10, 1)
+    assert shifted[0][0] == Fraction(11, 1)
+
+
+def test_hevc_fragment_mux_stop_during_seam_gate_keeps_destination(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.mkv"
+    fragment = tmp_path / "fragment.ts"
+    destination = tmp_path / "output.mkv"
+    manifest = tmp_path / "fragments.ffconcat"
+    source.write_bytes(b"source")
+    fragment.write_bytes(b"fragment")
+    destination.write_bytes(b"old output")
+    temporary = tmp_path / ".output.smart-render.mkv"
+    cancellation_checks: list[int] = []
+
+    def assemble(*_args, **_kwargs) -> None:
+        temporary.write_bytes(b"new output")
+
+    def cancelled() -> bool:
+        cancellation_checks.append(len(cancellation_checks) + 1)
+        return len(cancellation_checks) >= 4
+
+    with (
+        patch("jasna.media.splice._final_mux_args", return_value=[]),
+        patch("jasna.media.splice._run_ffmpeg", side_effect=assemble),
+        patch("jasna.media.splice.validate_hevc_copy_seams"),
+        patch("jasna.media.splice.validate_video_output"),
+        patch("jasna.media.splice._fsync_file"),
+        patch("jasna.media.splice.os.replace") as replace,
+    ):
+        mux_fragments_final_output(
+            [(fragment, 1.0)],
+            source,
+            destination,
+            manifest=manifest,
+            codec="hevc",
+            copy_validation_ranges=((0.0, 1.0),),
+            cancelled=cancelled,
+        )
+
+    assert cancellation_checks == [1, 2, 3, 4]
+    replace.assert_not_called()
+    assert destination.read_bytes() == b"old output"
+    assert not temporary.exists()
 
 
 @pytest.mark.parametrize(
