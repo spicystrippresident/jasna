@@ -66,7 +66,10 @@ class TestProcessorPullLoop:
         def fake_pipeline(job_id, inp, out):
             processed_ids.append(job_id)
 
-        with patch.object(p, "_run_pipeline", side_effect=fake_pipeline):
+        with (
+            patch.object(p, "_run_pipeline", side_effect=fake_pipeline),
+            patch("jasna.gui.processor._cleanup_torch"),
+        ):
             p.start(
                 jobs,
                 _settings(),
