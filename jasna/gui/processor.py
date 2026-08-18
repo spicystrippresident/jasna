@@ -61,14 +61,39 @@ def _cleanup_torch(torch_mod) -> None:
         torch_mod.cuda.reset_peak_memory_stats()
 
 
-def _is_linux_amd_runtime() -> bool:
-    if not sys.platform.startswith("linux"):
-        return False
+def _is_amd_runtime() -> bool:
     try:
         import torch
     except ImportError:
         return False
     return bool(getattr(torch.version, "hip", None))
+
+
+def _is_linux_amd_runtime() -> bool:
+    return sys.platform.startswith("linux") and _is_amd_runtime()
+
+
+def _terminate_windows_process_tree(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    from jasna.os_utils import subprocess_no_window_kwargs
+
+    try:
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=5.0,
+            **subprocess_no_window_kwargs(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        logger.debug("Could not terminate isolated video job tree", exc_info=True)
+    try:
+        process.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5.0)
 
 
 class Processor:
@@ -268,7 +293,9 @@ class Processor:
             if process is None or (expected is not None and process is not expected):
                 return
             try:
-                if os.name == "posix" and getattr(process, "pid", None) is not None:
+                if sys.platform == "win32":
+                    _terminate_windows_process_tree(process)
+                elif os.name == "posix" and getattr(process, "pid", None) is not None:
                     os.killpg(
                         process.pid,
                         signal.SIGKILL if force else signal.SIGTERM,
@@ -283,7 +310,14 @@ class Processor:
                 logger.debug("Could not terminate isolated video job", exc_info=True)
 
     def _should_isolate_video_job(self, job: JobItem) -> bool:
-        if self._video_job_isolation != "linux-amd" or not _is_linux_amd_runtime():
+        policy = self._video_job_isolation
+        if policy == "linux-amd":
+            enabled = _is_linux_amd_runtime()
+        elif policy == "amd":
+            enabled = _is_amd_runtime()
+        else:
+            return False
+        if not enabled:
             return False
         from jasna.media.image_io import IMAGE_EXTENSIONS
 

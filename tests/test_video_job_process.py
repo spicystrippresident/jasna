@@ -3,7 +3,7 @@ import json
 import os
 from pathlib import Path
 import stat
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -526,6 +526,58 @@ def test_linux_amd_isolation_never_routes_images(monkeypatch, tmp_path: Path) ->
 
     assert processor._should_isolate_video_job(JobItem(path=tmp_path / "clip.mp4"))
     assert not processor._should_isolate_video_job(JobItem(path=tmp_path / "still.png"))
+
+
+def test_amd_isolation_routes_hip_videos_but_not_images(monkeypatch, tmp_path: Path) -> None:
+    processor = Processor(video_job_isolation="amd")
+    monkeypatch.setattr(
+        "jasna.gui.processor._is_amd_runtime",
+        lambda: True,
+        raising=False,
+    )
+
+    assert processor._should_isolate_video_job(JobItem(path=tmp_path / "clip.mp4"))
+    assert not processor._should_isolate_video_job(JobItem(path=tmp_path / "still.png"))
+
+
+def test_amd_isolation_does_not_route_non_hip_video(monkeypatch, tmp_path: Path) -> None:
+    processor = Processor(video_job_isolation="amd")
+    monkeypatch.setattr("jasna.gui.processor._is_amd_runtime", lambda: False)
+
+    assert not processor._should_isolate_video_job(JobItem(path=tmp_path / "clip.mp4"))
+
+
+def test_gui_requests_all_amd_video_isolation() -> None:
+    from jasna.gui.app import JasnaApp
+
+    owner = type("AppOwner", (), {})()
+    owner._on_processor_progress = object()
+    owner._on_processor_log = object()
+    owner._on_processor_complete = object()
+
+    with patch("jasna.gui.app.Processor") as constructor:
+        JasnaApp._setup_processor(owner)
+
+    assert constructor.call_args.kwargs["video_job_isolation"] == "amd"
+
+
+def test_windows_isolated_termination_kills_tree_and_reaps(monkeypatch) -> None:
+    processor = Processor(video_job_isolation="amd")
+    process = MagicMock(pid=1234)
+    process.poll.return_value = None
+    run = MagicMock()
+    monkeypatch.setattr("jasna.gui.processor.sys.platform", "win32")
+    monkeypatch.setattr("jasna.gui.processor.os.name", "nt")
+    monkeypatch.setattr("jasna.gui.processor.subprocess.run", run)
+    processor._isolated_process = process
+
+    processor._terminate_isolated_process()
+
+    command = run.call_args.args[0]
+    assert command == ["taskkill", "/PID", "1234", "/T", "/F"]
+    process.wait.assert_called_once()
+    process.terminate.assert_not_called()
+    process.kill.assert_not_called()
 
 
 def test_isolation_policy_is_inert_when_not_requested(monkeypatch, tmp_path: Path) -> None:
