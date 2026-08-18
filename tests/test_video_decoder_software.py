@@ -23,6 +23,10 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUD
 DEVICE = torch.device("cuda:0")
 
 
+def _has_nvdec_runtime() -> bool:
+    return torch.cuda.is_available() and not getattr(torch.version, "hip", None)
+
+
 def _write_video(
     path: Path,
     codec: str,
@@ -224,6 +228,7 @@ def test_seek_into_software_video_lands_at_or_after_target(ffv1_video):
     assert pts[0] == expected_first
 
 
+@pytest.mark.skipif(not _has_nvdec_runtime(), reason="requires NVIDIA NVDEC runtime")
 def test_software_selection_logged_once(ffv1_video, caplog):
     path, metadata = ffv1_video
     with caplog.at_level(logging.WARNING, logger="jasna.media.video_decoder"):
@@ -234,6 +239,7 @@ def test_software_selection_logged_once(ffv1_video, caplog):
     assert len(fallback_logs) == 1
 
 
+@pytest.mark.skipif(not _has_nvdec_runtime(), reason="requires NVIDIA NVDEC runtime")
 def test_h264_444_with_b_frames_falls_back_and_keeps_all_frames(tmp_path):
     # NVDEC has no H.264 4:4:4 support; the codec advertises a CUDA config and
     # falls back after init. B-frames force delayed EOF frames through the
@@ -253,6 +259,7 @@ def test_h264_444_with_b_frames_falls_back_and_keeps_all_frames(tmp_path):
     assert all_pts == sorted(all_pts)
 
 
+@pytest.mark.skipif(not _has_nvdec_runtime(), reason="requires NVIDIA NVDEC runtime")
 def test_hardware_input_never_enters_software_path(tmp_path, monkeypatch):
     w, h, n = 128, 96, 24
     frames = [_solid_yuv420p_frame(w, h, 120, 90, 200) for _ in range(n)]
@@ -278,7 +285,7 @@ def _has_av1_software_encoder() -> bool:
 
 
 def _gpu_supports_av1_nvdec() -> bool:
-    if not torch.cuda.is_available() or getattr(torch.version, "hip", None):
+    if not _has_nvdec_runtime():
         return False
     major, minor = torch.cuda.get_device_capability(DEVICE)
     return major >= 10 or (major == 8 and minor in {6, 7, 9})
