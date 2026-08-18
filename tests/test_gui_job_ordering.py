@@ -4,6 +4,8 @@ import threading
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
+import pytest
+
 from jasna.gui.processor import Processor, ProgressUpdate
 from jasna.gui.models import JobItem, JobStatus, AppSettings
 from jasna.post_export_action import PostExportVideoCommandError
@@ -51,6 +53,11 @@ class TestNextPendingJob:
 
 
 class TestProcessorPullLoop:
+    @pytest.fixture(autouse=True)
+    def isolate_gpu_cleanup(self):
+        with patch("jasna.gui.processor._cleanup_torch"):
+            yield
+
     def test_processes_jobs_in_order_by_status(self):
         processed_ids: list[int] = []
         p = Processor()
@@ -59,10 +66,7 @@ class TestProcessorPullLoop:
         def fake_pipeline(job_id, inp, out):
             processed_ids.append(job_id)
 
-        with (
-            patch.object(p, "_run_pipeline", side_effect=fake_pipeline),
-            patch("jasna.gui.processor._cleanup_torch"),
-        ):
+        with patch.object(p, "_run_pipeline", side_effect=fake_pipeline):
             p.start(
                 jobs,
                 AppSettings(),
