@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import MagicMock
@@ -28,6 +30,16 @@ def nvidia_vendor(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         accelerator, "is_nvidia_device", lambda *_args, **_kwargs: True
     )
+
+
+@pytest.fixture
+def restore_logging_disable() -> Iterator[None]:
+    """Undo the child-process logging threshold after direct helper tests."""
+    previous = logging.root.manager.disable
+    try:
+        yield
+    finally:
+        logging.disable(previous)
 
 
 def _mock_proc(lines: list[str], returncode: int = 0) -> MagicMock:
@@ -197,7 +209,9 @@ def test_ensure_popen_stdin_is_devnull(
     assert popen_kwargs.get("stdin") == subprocess.DEVNULL
 
 
-def test_subprocess_compile_patches_frozen_torch(monkeypatch) -> None:
+def test_subprocess_compile_patches_frozen_torch(
+    monkeypatch, restore_logging_disable: None
+) -> None:
     # In the compiled binary the compile subprocess imports torch_tensorrt -> torch._inductor
     # directly; without patch_frozen_torch the source-introspection raises. An empty request
     # compiles nothing, so this only exercises the early import-torch + patch path.
