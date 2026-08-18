@@ -229,7 +229,7 @@ def _run_unaligned_pitch_probe(src: str, dst: str, codec: str, width: int) -> No
             encoder.encode(frame.clone(), index * 512)
 
 
-def _probe_first_frame_crop(path: Path) -> tuple[int, int, int, int]:
+def _probe_stream_crop(path: Path) -> tuple[int, int, int, int]:
     result = subprocess.run(
         [
             resolve_executable("ffprobe"),
@@ -237,11 +237,7 @@ def _probe_first_frame_crop(path: Path) -> tuple[int, int, int, int]:
             "error",
             "-select_streams",
             "v:0",
-            "-show_frames",
-            "-read_intervals",
-            "%+#1",
-            "-show_entries",
-            "frame=crop_left,crop_right,crop_top,crop_bottom",
+            "-show_streams",
             "-of",
             "json",
             str(path),
@@ -250,9 +246,17 @@ def _probe_first_frame_crop(path: Path) -> tuple[int, int, int, int]:
         text=True,
         check=True,
     )
-    frame = json.loads(result.stdout)["frames"][0]
+    stream = json.loads(result.stdout)["streams"][0]
+    crop = next(
+        (
+            side_data
+            for side_data in stream.get("side_data_list", [])
+            if side_data.get("side_data_type") == "Frame Cropping"
+        ),
+        {},
+    )
     return tuple(
-        int(frame.get(name, 0))
+        int(crop.get(name, 0))
         for name in ("crop_left", "crop_right", "crop_top", "crop_bottom")
     )
 
@@ -287,7 +291,7 @@ def test_unaligned_pitch_encodes_in_isolated_process(
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
-    crop_left, crop_right, crop_top, crop_bottom = _probe_first_frame_crop(dst)
+    crop_left, crop_right, crop_top, crop_bottom = _probe_stream_crop(dst)
     with av.open(str(dst)) as container:
         video = container.streams.video[0]
         assert video.width - crop_left - crop_right == width
