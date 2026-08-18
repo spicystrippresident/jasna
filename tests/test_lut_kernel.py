@@ -4,9 +4,13 @@ import numpy as np
 import pytest
 import torch
 
+from jasna.accelerator import is_nvidia_device
 from jasna.media.lut import GpuLutApplier, parse_cube_text
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+requires_nvidia_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available() or not is_nvidia_device(),
+    reason="needs NVIDIA CUDA",
+)
 
 
 def _cube_3d(size: int, transform, domain: tuple[float, float] | None = None) -> str:
@@ -101,6 +105,7 @@ def _codes(values: torch.Tensor) -> torch.Tensor:
     return (values * 255.0).round().clamp(0, 255).to(torch.int32)
 
 
+@requires_nvidia_cuda
 @pytest.mark.parametrize("name", sorted(CUBES))
 def test_kernel_is_at_least_as_accurate_as_the_torch_path(name):
     generator = torch.Generator(device="cuda").manual_seed(0)

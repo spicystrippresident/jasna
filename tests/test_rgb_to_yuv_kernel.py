@@ -1,9 +1,13 @@
 import pytest
 import torch
 
+from jasna.accelerator import is_nvidia_device
 from jasna.media.rgb_to_yuv import _TORCH_CONVERTERS, RgbToYuvConverter
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+requires_nvidia_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available() or not is_nvidia_device(),
+    reason="needs NVIDIA CUDA",
+)
 
 VARIANTS = sorted(_TORCH_CONVERTERS)
 
@@ -19,6 +23,7 @@ def _random_frame(height: int, width: int) -> torch.Tensor:
     )
 
 
+@requires_nvidia_cuda
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_matches_the_torch_reference_within_one_code(variant):
     frame = _random_frame(64, 96)
