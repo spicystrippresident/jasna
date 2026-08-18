@@ -60,14 +60,17 @@ class _OfflineFrameWriter:
         self._entered = False
 
     def write(self, frame: torch.Tensor, pts: int, *, apply_lut: bool = True) -> None:
-        if not self._entered:
-            # Slow detection/restoration before the first output frame is not an
-            # encoder stall. Arm the watchdog only when encoding is attempted.
-            self._encode_heartbeat[0] = time.monotonic()
-            self._encoder_ctx.__enter__()
-            self._entered = True
-        self._encoder_ctx.encode(frame, pts, apply_lut=apply_lut)
+        # The watchdog tracks an active encoder attempt, not time since the last
+        # completed write. Upstream restoration may legitimately produce no
+        # encodable frame for longer than the stall threshold.
         self._encode_heartbeat[0] = time.monotonic()
+        try:
+            if not self._entered:
+                self._encoder_ctx.__enter__()
+                self._entered = True
+            self._encoder_ctx.encode(frame, pts, apply_lut=apply_lut)
+        finally:
+            self._encode_heartbeat[0] = None
 
     def after_write(self, frames_written: int) -> None:
         pass

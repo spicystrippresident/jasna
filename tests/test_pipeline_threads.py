@@ -656,7 +656,11 @@ class TestOfflineFrameWriter:
             assert heartbeat[0] is not None
             return mock_enc
 
+        def encode_frame(*_args, **_kwargs):
+            assert heartbeat[0] is not None
+
         mock_enc.__enter__ = MagicMock(side_effect=enter_encoder)
+        mock_enc.encode = MagicMock(side_effect=encode_frame)
         mock_enc.__exit__ = MagicMock(return_value=False)
 
         writer = _OfflineFrameWriter(mock_enc, heartbeat)
@@ -667,7 +671,69 @@ class TestOfflineFrameWriter:
 
         mock_enc.__enter__.assert_called_once()
         assert mock_enc.encode.call_count == 2
-        assert heartbeat[0] > 0
+        assert heartbeat[0] is None
+
+    def test_write_clears_heartbeat_after_encode_error(self):
+        from jasna.pipeline import _OfflineFrameWriter
+
+        heartbeat: list[float | None] = [None]
+        mock_enc = MagicMock()
+        mock_enc.__enter__ = MagicMock(return_value=mock_enc)
+
+        def fail_encode(*_args, **_kwargs):
+            assert heartbeat[0] is not None
+            raise RuntimeError("encode failed")
+
+        mock_enc.encode = MagicMock(side_effect=fail_encode)
+        writer = _OfflineFrameWriter(mock_enc, heartbeat)
+
+        with pytest.raises(RuntimeError, match="encode failed"):
+            writer.write(torch.zeros(3, 8, 8), pts=0)
+
+        assert heartbeat[0] is None
+
+    def test_write_keeps_heartbeat_armed_while_encode_is_blocked(self):
+        from jasna.pipeline import _OfflineFrameWriter
+
+        heartbeat: list[float | None] = [None]
+        encode_started = threading.Event()
+        release_encode = threading.Event()
+        mock_enc = MagicMock()
+        mock_enc.__enter__ = MagicMock(return_value=mock_enc)
+
+        def block_encode(*_args, **_kwargs):
+            encode_started.set()
+            assert release_encode.wait(timeout=2.0)
+
+        mock_enc.encode = MagicMock(side_effect=block_encode)
+        writer = _OfflineFrameWriter(mock_enc, heartbeat)
+        worker = threading.Thread(
+            target=writer.write,
+            args=(torch.zeros(3, 8, 8), 0),
+        )
+
+        worker.start()
+        assert encode_started.wait(timeout=2.0)
+        assert heartbeat[0] is not None
+        release_encode.set()
+        worker.join(timeout=2.0)
+
+        assert not worker.is_alive()
+        assert heartbeat[0] is None
+
+    def test_write_clears_heartbeat_after_enter_error(self):
+        from jasna.pipeline import _OfflineFrameWriter
+
+        heartbeat: list[float | None] = [None]
+        mock_enc = MagicMock()
+        mock_enc.__enter__ = MagicMock(side_effect=RuntimeError("enter failed"))
+        writer = _OfflineFrameWriter(mock_enc, heartbeat)
+
+        with pytest.raises(RuntimeError, match="enter failed"):
+            writer.write(torch.zeros(3, 8, 8), pts=0)
+
+        assert heartbeat[0] is None
+        mock_enc.encode.assert_not_called()
 
     def test_after_write_is_noop(self):
         from jasna.pipeline import _OfflineFrameWriter
