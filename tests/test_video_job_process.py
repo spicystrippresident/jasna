@@ -437,6 +437,67 @@ def test_parent_rejects_invalid_isolated_media_before_post_export(tmp_path: Path
     command.assert_not_called()
 
 
+def test_stop_during_isolated_post_export_prevents_completion_markers(
+    tmp_path: Path,
+) -> None:
+    processor, job, snapshot, _source, output = _isolated_completion_context(
+        tmp_path,
+        post_export=True,
+    )
+    output.write_bytes(b"completed output")
+
+    with (
+        patch.object(processor, "_validate_completed_video_output"),
+        patch(
+            "jasna.post_export_action.run_post_export_video_command",
+            side_effect=lambda *_args: processor.stop(),
+        ),
+    ):
+        processor._complete_isolated_video_job(
+            job,
+            snapshot,
+            VideoJobResult(JobStatus.COMPLETED, output, "full"),
+            expected_output_path=output,
+            previous_output_fingerprint=None,
+            settings=processor._settings,
+        )
+
+    assert job.status is JobStatus.PENDING
+    assert job.output_path is None
+    assert processor.completed_processing_path(job.id) is None
+
+
+def test_stop_at_isolated_commit_prevents_completion_markers(tmp_path: Path) -> None:
+    processor, job, snapshot, _source, output = _isolated_completion_context(tmp_path)
+    output.write_bytes(b"completed output")
+    original_commit = processor._commit_isolated_completed_job
+
+    def stop_then_commit(*args, **kwargs):
+        processor.stop()
+        original_commit(*args, **kwargs)
+
+    with (
+        patch.object(processor, "_validate_completed_video_output"),
+        patch.object(
+            processor,
+            "_commit_isolated_completed_job",
+            side_effect=stop_then_commit,
+        ),
+    ):
+        processor._complete_isolated_video_job(
+            job,
+            snapshot,
+            VideoJobResult(JobStatus.COMPLETED, output, "full"),
+            expected_output_path=output,
+            previous_output_fingerprint=None,
+            settings=processor._settings,
+        )
+
+    assert job.status is JobStatus.PENDING
+    assert job.output_path is None
+    assert processor.completed_processing_path(job.id) is None
+
+
 def test_parent_does_not_complete_isolated_result_after_cancellation(
     tmp_path: Path,
 ) -> None:
