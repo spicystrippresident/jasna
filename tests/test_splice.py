@@ -16,8 +16,10 @@ from jasna.media.splice import (
     SmartRenderCompatibilityError,
     _analyze_packet_reordering,
     _commit_smart_output,
+    _decoded_frame_hashes,
     _fsync_directory,
     _fsync_file,
+    _hevc_copy_windows_match,
     _is_safe_random_access_packet,
     build_splice_plan,
     create_copy_fragment,
@@ -57,6 +59,71 @@ def _metadata(codec: str = "h264", **overrides) -> VideoMetadata:
 
 def _index(points=(0, 60, 120), end=180) -> KeyframeIndex:
     return KeyframeIndex(tuple(points), Fraction(1, 30), 0, end)
+
+
+def test_decoded_frame_hashes_seeks_from_nonzero_stream_start(tmp_path) -> None:
+    video = tmp_path / "offset.mkv"
+    video.write_bytes(b"fixture")
+    stream = MagicMock(start_time=21, time_base=Fraction(1, 1000))
+    container = MagicMock()
+    container.streams.video = [stream]
+    opened = MagicMock()
+    opened.__enter__.return_value = container
+    completed = MagicMock(
+        returncode=0,
+        stdout="#tb 0: 1/1000\n0, 0, 2023, 17, 123, framehash\n",
+        stderr="",
+    )
+
+    with (
+        patch("jasna.media.splice.av.open", return_value=opened),
+        patch("jasna.media.splice.resolve_executable", return_value="ffmpeg"),
+        patch("jasna.media.splice.subprocess.run", return_value=completed) as run,
+    ):
+        hashes = _decoded_frame_hashes(video, start=2.002, duration=1.0)
+
+    command = run.call_args.args[0]
+    assert command[command.index("-ss") + 1] == "2.023000000"
+    assert command[command.index("-to") + 1] == "3.023000000"
+    assert hashes == ((Fraction(2002, 1000), Fraction(17, 1000), 123, "framehash"),)
+
+
+def test_hevc_copy_windows_allow_only_boundary_and_constant_subframe_shift() -> None:
+    duration = Fraction(1001, 60_000)
+    source = tuple(
+        (Fraction(index, 60), duration, 100 + index, f"hash-{index}")
+        for index in range(4)
+    )
+    shift = Fraction(4, 1000)
+    output = tuple(
+        (frame[0] + shift, *frame[1:])
+        for frame in source[:-1]
+    )
+
+    assert _hevc_copy_windows_match(source, output)
+
+    equal_length_with_trailing_seek_frame = (
+        *output,
+        (source[-1][0] + shift, duration, 999, "seek-boundary"),
+    )
+    assert _hevc_copy_windows_match(source, equal_length_with_trailing_seek_frame)
+
+    changed_interior = (
+        output[0],
+        (*output[1][:-1], "changed"),
+        output[2],
+        (source[-1][0] + shift, duration, 999, "seek-boundary"),
+    )
+    assert not _hevc_copy_windows_match(source, changed_interior)
+
+    changed_hash = (*output[:-1], (*output[-1][:-1], "changed"))
+    assert not _hevc_copy_windows_match(source, changed_hash)
+
+    drifting_pts = tuple(
+        (frame[0] + shift + Fraction(index, 100), *frame[1:])
+        for index, frame in enumerate(source[:-1])
+    )
+    assert not _hevc_copy_windows_match(source, drifting_pts)
 
 
 class _Packet:
