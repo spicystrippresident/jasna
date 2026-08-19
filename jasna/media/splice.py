@@ -1254,14 +1254,15 @@ def _decoded_frame_hashes(
             if stream.start_time is not None and stream.time_base is not None
             else Fraction(0, 1)
         )
+    absolute_start = float(stream_start) + start
     command = [
         resolve_executable("ffmpeg"),
         "-hide_banner",
         "-loglevel", "error",
         "-copyts",
-        "-ss", _seconds(start),
+        "-ss", _seconds(absolute_start),
         "-i", str(path),
-        "-to", _seconds(float(stream_start) + start + duration),
+        "-to", _seconds(absolute_start + duration),
         "-map", "0:v:0",
         "-an",
         "-fps_mode", "passthrough",
@@ -1308,6 +1309,52 @@ def _decoded_frame_hashes(
     return tuple(frames)
 
 
+def _hevc_copy_windows_match(
+    source_frames: tuple[tuple[Fraction, Fraction, int, str], ...],
+    output_frames: tuple[tuple[Fraction, Fraction, int, str], ...],
+) -> bool:
+    """Match copied content while tolerating one seek-boundary frame and PTS origin."""
+
+    if (
+        not source_frames
+        or not output_frames
+        or abs(len(source_frames) - len(output_frames)) > 1
+    ):
+        return False
+    minimum_match = min(len(source_frames), len(output_frames)) - 1
+    for source_offset, output_offset in ((0, 0), (1, 0), (0, 1)):
+        maximum_match = min(
+            len(source_frames) - source_offset,
+            len(output_frames) - output_offset,
+        )
+        for count in dict.fromkeys((maximum_match, max(1, minimum_match))):
+            unmatched = len(source_frames) + len(output_frames) - (2 * count)
+            if count > maximum_match or unmatched > 2:
+                continue
+            source_window = source_frames[source_offset : source_offset + count]
+            output_window = output_frames[output_offset : output_offset + count]
+            if [frame[1:] for frame in source_window] != [
+                frame[1:] for frame in output_window
+            ]:
+                continue
+
+            pts_offsets = [
+                output_frame[0] - source_frame[0]
+                for source_frame, output_frame in zip(source_window, output_window)
+            ]
+            max_frame_duration = max(
+                max(frame[1] for frame in source_window),
+                max(frame[1] for frame in output_window),
+            )
+            jitter_tolerance = max(Fraction(1, 1000), max_frame_duration / 20)
+            if (
+                abs(pts_offsets[0]) <= max_frame_duration
+                and max(pts_offsets) - min(pts_offsets) <= jitter_tolerance
+            ):
+                return True
+    return False
+
+
 def validate_hevc_copy_seams(
     output: Path,
     source: Path,
@@ -1320,7 +1367,7 @@ def validate_hevc_copy_seams(
             continue
         source_frames = _decoded_frame_hashes(source, start=start, duration=duration)
         output_frames = _decoded_frame_hashes(output, start=start, duration=duration)
-        if source_frames != output_frames:
+        if not _hevc_copy_windows_match(source_frames, output_frames):
             raise SmartRenderCompatibilityError(
                 "HEVC decoded pixels or timestamps differ in an untouched copy "
                 f"span at {start:.6f}s",
