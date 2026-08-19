@@ -19,7 +19,7 @@ import torch
 
 from jasna.accelerator import AcceleratorVendor, is_amd_device, vendor_for_device
 from jasna.media import UnsupportedColorspaceError, get_video_meta_data
-from jasna.media.video_encoder import NvidiaVideoEncoder
+from jasna.media.video_encoder import NvidiaVideoEncoder, resolve_hevc_smart_render_vui
 from jasna.media.video_decoder import ReusableRocDecoder
 from jasna.media.frame_rate import resolve_frame_rate_retarget
 from jasna.media.splice import (
@@ -808,6 +808,8 @@ class Pipeline:
             output=self.output_video,
             signature=signature,
         )
+        render_metadata = None
+        render_output_fps = None
 
         try:
             fragments: list[tuple[Path, float]] = []
@@ -831,15 +833,22 @@ class Pipeline:
                 raw.unlink(missing_ok=True)
                 normalized.unlink(missing_ok=True)
                 if span.is_render:
+                    if render_metadata is None:
+                        render_metadata = metadata
+                        render_output_fps = metadata.video_fps_exact
+                        if codec == "hevc":
+                            render_metadata, render_output_fps = (
+                                resolve_hevc_smart_render_vui(metadata)
+                            )
                     encoder_ctx = NvidiaVideoEncoder(
                         str(raw),
                         device=self.device,
-                        metadata=metadata,
+                        metadata=render_metadata,
                         codec=codec,
                         encoder_settings=smart_encoder_settings,
                         lut_path=self.lut_path,
                         sharpen_strength=self.sharpen_strength,
-                        output_fps=metadata.video_fps_exact,
+                        output_fps=render_output_fps,
                         mux_audio=False,
                         pts_origin=span.start_pts,
                         match_input_bit_depth=True,

@@ -80,6 +80,7 @@ def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_pat
         patch("jasna.pipeline.validate_smart_render", return_value="h264"),
         patch("jasna.pipeline.workspace_signature", return_value={}),
         patch("jasna.pipeline.SmartRenderWorkspace.open", return_value=workspace),
+        patch("jasna.pipeline.resolve_hevc_smart_render_vui") as resolve_vui,
         patch("jasna.pipeline.probe_keyframes") as probe_keyframes,
         patch("jasna.pipeline.build_splice_plan") as build_splice_plan,
         patch("jasna.pipeline.NvidiaVideoEncoder") as encoder,
@@ -90,6 +91,7 @@ def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_pat
         pipeline._run_smart(metadata)
 
     probe_keyframes.assert_not_called()
+    resolve_vui.assert_not_called()
     build_splice_plan.assert_not_called()
     assert copy_fragment.call_count == 2
     encoder.assert_called_once()
@@ -138,6 +140,7 @@ def test_hevc_smart_run_checks_parameter_sets_and_bounded_copy_gops(tmp_path) ->
     pipeline.segments = (SegmentRange(2.5, 3.0),)
     pipeline.working_dir = tmp_path
     pipeline._cancel_event = threading.Event()
+    pipeline._run_pass = MagicMock()
     metadata = MagicMock(
         video_fps=30.0,
         video_fps_exact=Fraction(30, 1),
@@ -165,18 +168,32 @@ def test_hevc_smart_run_checks_parameter_sets_and_bounded_copy_gops(tmp_path) ->
     reusable = [workspace.path / f"{index:04d}.ts" for index in range(3)]
     for path in reusable:
         path.write_bytes(b"fragment")
-    workspace.reusable_fragment.side_effect = reusable
+    workspace.raw_path.side_effect = lambda index: workspace.path / f"{index:04d}-raw.nut"
+    workspace.fragment_path.side_effect = (
+        lambda index, suffix: workspace.path / f"{index:04d}{suffix}"
+    )
+    workspace.reusable_fragment.side_effect = [reusable[0], None, reusable[2]]
+    render_metadata = MagicMock(name="render_metadata")
 
     with (
         patch("jasna.pipeline.validate_smart_render", return_value="hevc"),
         patch("jasna.pipeline.resolve_smart_encoder_settings", return_value={}),
         patch("jasna.pipeline.workspace_signature", return_value={}),
         patch("jasna.pipeline.SmartRenderWorkspace.open", return_value=workspace),
+        patch(
+            "jasna.pipeline.resolve_hevc_smart_render_vui",
+            return_value=(render_metadata, Fraction(60_000, 1_001)),
+        ) as resolve_vui,
+        patch("jasna.pipeline.NvidiaVideoEncoder") as encoder,
+        patch("jasna.pipeline.normalize_fragment"),
         patch("jasna.pipeline.validate_hevc_fragment_parameter_sets") as validate_sets,
         patch("jasna.pipeline.mux_fragments_final_output") as mux,
     ):
         pipeline._run_smart(metadata)
 
+    resolve_vui.assert_called_once_with(metadata)
+    assert encoder.call_args.kwargs["metadata"] is render_metadata
+    assert encoder.call_args.kwargs["output_fps"] == Fraction(60_000, 1_001)
     validate_sets.assert_called_once_with(
         [
             (reusable[0], "copy"),
@@ -201,6 +218,7 @@ def test_hevc_smart_run_checks_parameter_sets_and_bounded_copy_gops(tmp_path) ->
         patch("jasna.pipeline.resolve_smart_encoder_settings", return_value={}),
         patch("jasna.pipeline.workspace_signature", return_value={}),
         patch("jasna.pipeline.SmartRenderWorkspace.open", return_value=workspace),
+        patch("jasna.pipeline.resolve_hevc_smart_render_vui") as rejected_resolve_vui,
         patch(
             "jasna.pipeline.validate_hevc_fragment_parameter_sets",
             side_effect=rejection,
@@ -211,6 +229,7 @@ def test_hevc_smart_run_checks_parameter_sets_and_bounded_copy_gops(tmp_path) ->
         pipeline._run_smart(metadata)
 
     assert rejected.value.reason == "hevc_parameter_sets_incompatible"
+    rejected_resolve_vui.assert_not_called()
     rejected_mux.assert_not_called()
     workspace.cleanup.assert_called_once_with()
 
