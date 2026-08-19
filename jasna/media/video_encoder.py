@@ -6,7 +6,7 @@ import queue
 import sys
 import threading
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
 from types import MappingProxyType
@@ -255,6 +255,8 @@ _COLOR_TRANSFERS = {
     "smpte2084": 16,
     "arib-std-b67": 18,
 }
+_COLOR_PRIMARIES_BY_CODE = {value: key for key, value in _COLOR_PRIMARIES.items()}
+_COLOR_TRANSFERS_BY_CODE = {value: key for key, value in _COLOR_TRANSFERS.items()}
 _COLOR_VARIANTS = {
     (AvColorspace.ITU709, AvColorRange.MPEG): "bt709_limited",
     (AvColorspace.ITU709, AvColorRange.JPEG): "bt709_full",
@@ -265,6 +267,56 @@ _COLOR_VARIANTS = {
 }
 
 _NVENC_PITCH_ALIGNMENT = 16
+
+
+def resolve_hevc_smart_render_vui(
+    metadata: VideoMetadata,
+) -> tuple[VideoMetadata, Fraction]:
+    """Return encoder-only metadata matching the source HEVC SPS VUI.
+
+    Container metadata can omit HDR colour tags or expose an average frame rate
+    whose reduced fraction differs from the timing stored in the SPS.  PyAV's
+    decoded frame and codec context expose those bitstream values.  Only values
+    already supported by the encoder are overlaid; otherwise the normal metadata
+    remains in force and the post-encode parameter-set guard still fails closed.
+    """
+
+    replacements: dict[str, object] = {}
+    output_fps = metadata.video_fps_exact
+    try:
+        with av.open(metadata.video_file) as source:
+            stream = source.streams.video[0]
+            context_rate = stream.codec_context.framerate or stream.codec_context.rate
+            if context_rate is not None and context_rate > 0:
+                output_fps = Fraction(context_rate)
+
+            frame = next(source.decode(stream), None)
+            if frame is not None:
+                try:
+                    color_range = AvColorRange(int(frame.color_range))
+                    colorspace = AvColorspace(int(frame.colorspace))
+                except ValueError:
+                    color_range = None
+                    colorspace = None
+                if (colorspace, color_range) in _COLOR_VARIANTS:
+                    replacements["color_range"] = color_range
+                    replacements["color_space"] = colorspace
+
+                primaries = _COLOR_PRIMARIES_BY_CODE.get(int(frame.color_primaries))
+                transfer = _COLOR_TRANSFERS_BY_CODE.get(int(frame.color_trc))
+                if primaries is not None:
+                    replacements["color_primaries"] = primaries
+                if transfer is not None:
+                    replacements["color_transfer"] = transfer
+    except (av.FFmpegError, IndexError, TypeError, ValueError, OSError) as exc:
+        logger.warning("Could not read HEVC source VUI from %s: %s", metadata.video_file, exc)
+
+    replacements.update(
+        video_fps=float(output_fps),
+        average_fps=float(output_fps),
+        video_fps_exact=output_fps,
+    )
+    return replace(metadata, **replacements), output_fps
 
 # `cq` alone targets a fixed quality and ignores how the source was stored, so a
 # cheaply encoded source is re-encoded far above its own quality point and grows

@@ -28,6 +28,7 @@ from jasna.media.video_encoder import (
     _mov_container_options,
     _normalized_audio_layout,
     NvidiaVideoEncoder,
+    resolve_hevc_smart_render_vui,
     source_bitrate_cap_options,
 )
 
@@ -61,6 +62,63 @@ def _make_encoder(tmp_path, encoder_settings=None, codec="hevc", **meta_override
         codec=codec,
         encoder_settings=encoder_settings or {},
     )
+
+
+def test_hevc_smart_render_vui_uses_decoded_source_values(monkeypatch):
+    original = _fake_metadata(
+        video_fps=19001 / 317,
+        average_fps=19001 / 317,
+        video_fps_exact=Fraction(19001, 317),
+        color_primaries="",
+        color_transfer="",
+    )
+    stream = SimpleNamespace(
+        codec_context=SimpleNamespace(
+            framerate=Fraction(60_000, 1_001),
+            rate=Fraction(60_000, 1_001),
+        )
+    )
+    frame = SimpleNamespace(
+        color_range=1,
+        colorspace=1,
+        color_primaries=9,
+        color_trc=16,
+    )
+    source = MagicMock()
+    source.streams.video = [stream]
+    source.decode.return_value = iter([frame])
+    opened = MagicMock()
+    opened.__enter__.return_value = source
+    monkeypatch.setattr(video_encoder_module.av, "open", MagicMock(return_value=opened))
+
+    resolved, output_fps = resolve_hevc_smart_render_vui(original)
+
+    assert output_fps == Fraction(60_000, 1_001)
+    assert resolved.video_fps_exact == output_fps
+    assert resolved.video_fps == float(output_fps)
+    assert resolved.average_fps == float(output_fps)
+    assert resolved.color_range == AvColorRange.MPEG
+    assert resolved.color_space == AvColorspace.ITU709
+    assert resolved.color_primaries == "bt2020"
+    assert resolved.color_transfer == "smpte2084"
+    assert original.video_fps_exact == Fraction(19001, 317)
+    assert original.color_primaries == ""
+    assert original.color_transfer == ""
+
+
+def test_hevc_smart_render_vui_falls_back_for_unreadable_source(monkeypatch):
+    original = _fake_metadata()
+    monkeypatch.setattr(
+        video_encoder_module.av,
+        "open",
+        MagicMock(side_effect=OSError("unreadable")),
+    )
+
+    resolved, output_fps = resolve_hevc_smart_render_vui(original)
+
+    assert output_fps == original.video_fps_exact
+    assert resolved == original
+    assert resolved is not original
 
 
 @pytest.fixture
