@@ -94,6 +94,113 @@ def test_amf_hevc_uses_compatible_defaults() -> None:
     assert "qvbr_quality_level" not in options
 
 
+def test_amf_av1_uses_codec_specific_adaptive_quantization() -> None:
+    from jasna.media.video_encoder import AMF_ENCODER_SPECS
+
+    options = AMF_ENCODER_SPECS["av1"].default_options
+    assert options["aq_mode"] == "caq"
+    assert "vbaq" not in options
+    assert validate_encoder_settings(
+        {"aq_mode": "caq"},
+        codec="av1",
+        vendor=AcceleratorVendor.AMD,
+    ) == {"aq_mode": "caq"}
+    with pytest.raises(ValueError, match="vbaq"):
+        validate_encoder_settings(
+            {"vbaq": 1},
+            codec="av1",
+            vendor=AcceleratorVendor.AMD,
+        )
+
+
+def test_amf_av1_main10_uses_peak_vbr_without_preanalysis(
+    monkeypatch, tmp_path
+) -> None:
+    import jasna.media.video_encoder as module
+
+    monkeypatch.setattr(
+        module,
+        "vendor_for_device",
+        lambda _device: AcceleratorVendor.AMD,
+    )
+    encoder = module.NvidiaVideoEncoder(
+        str(tmp_path / "out.mp4"),
+        torch.device("cuda:0"),
+        replace(_metadata(), is_10bit=True, video_bitrate=20_000_000),
+        codec="av1",
+        encoder_settings={},
+    )
+
+    assert encoder.encoder_name == "av1_amf"
+    assert encoder.spec.frame_format == "p010le"
+    assert encoder.encoder_options["rc"] == "vbr_peak"
+    assert encoder.encoder_options["preanalysis"] == "0"
+    assert "qvbr_quality_level" not in encoder.encoder_options
+    assert encoder._target_bit_rate == 20_000_000
+
+
+def test_amf_av1_main10_derives_bounded_rate_without_source_bitrate(
+    monkeypatch, tmp_path
+) -> None:
+    import jasna.media.video_encoder as module
+
+    monkeypatch.setattr(
+        module,
+        "vendor_for_device",
+        lambda _device: AcceleratorVendor.AMD,
+    )
+    encoder = module.NvidiaVideoEncoder(
+        str(tmp_path / "out.mp4"),
+        torch.device("cuda:0"),
+        replace(_metadata(), is_10bit=True, video_bitrate=0),
+        codec="av1",
+        encoder_settings={},
+    )
+
+    assert encoder._target_bit_rate == 2_000_000
+
+
+def test_amf_av1_main10_policy_does_not_affect_eight_bit(monkeypatch, tmp_path) -> None:
+    import jasna.media.video_encoder as module
+
+    monkeypatch.setattr(
+        module,
+        "vendor_for_device",
+        lambda _device: AcceleratorVendor.AMD,
+    )
+    encoder = module.NvidiaVideoEncoder(
+        str(tmp_path / "out.mp4"),
+        torch.device("cuda:0"),
+        replace(_metadata(), is_10bit=False, video_bitrate=20_000_000),
+        codec="av1",
+        encoder_settings={},
+        match_input_bit_depth=True,
+    )
+
+    assert encoder.spec.frame_format == "nv12"
+    assert encoder.encoder_options["rc"] == "qvbr"
+    assert encoder.encoder_options["preanalysis"] == "1"
+    assert encoder._target_bit_rate is None
+
+
+def test_source_bitrate_ceiling_omits_out_of_range_ffmpeg_values(caplog) -> None:
+    from jasna.media.video_encoder import source_bitrate_cap_options
+
+    with caplog.at_level("WARNING"):
+        options = source_bitrate_cap_options(
+            replace(
+                _metadata(),
+                codec_name="hevc",
+                video_bitrate=2_000_000_000,
+            ),
+            output_codec="hevc",
+            vendor=AcceleratorVendor.AMD,
+        )
+
+    assert options == {}
+    assert "exceeds the encoder option range" in caplog.text
+
+
 def test_video_encoder_selects_amf_and_normalizes_cq(monkeypatch, tmp_path) -> None:
     import jasna.media.video_encoder as module
 
