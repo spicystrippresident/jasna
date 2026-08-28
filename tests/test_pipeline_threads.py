@@ -22,9 +22,11 @@ from jasna.pipeline_threads import (
     FrameWriter,
     decode_detect_loop,
     primary_restore_loop,
+    record_worker_error,
     secondary_restore_loop,
     blend_encode_loop,
     _estimate_start_frame,
+    wait_for_worker_threads,
 )
 from jasna.tracking.clip_tracker import TrackedClip
 
@@ -84,6 +86,119 @@ class TestEstimateStartFrame:
     def test_zero(self):
         meta = _fake_metadata(fps=24.0)
         assert _estimate_start_frame(meta, 0.0) == 0
+
+
+# ---------------------------------------------------------------------------
+# Worker failure shutdown
+# ---------------------------------------------------------------------------
+
+class TestWorkerFailureShutdown:
+    def test_record_worker_error_keeps_first_failure_and_cancels_peers(self):
+        cancel_event = threading.Event()
+        error_holder: list[BaseException] = []
+        first_error = RuntimeError("first worker failure")
+        try:
+            raise first_error
+        except RuntimeError as error:
+            record_worker_error("primary", error, error_holder, cancel_event)
+        try:
+            raise RuntimeError("second worker failure")
+        except RuntimeError as error:
+            record_worker_error("secondary", error, error_holder, cancel_event)
+        assert error_holder == [first_error]
+        assert cancel_event.is_set()
+
+    def test_record_worker_error_ignores_user_initiated_cancellation(self):
+        cancel_event = threading.Event()
+        cancel_event.set()
+        error_holder: list[BaseException] = []
+        try:
+            raise RuntimeError("cancelled worker")
+        except RuntimeError as error:
+            record_worker_error("decode", error, error_holder, cancel_event)
+        assert not error_holder
+
+    def test_wait_for_worker_threads_drains_queue_and_joins_cancelled_workers(self):
+        class TrackingFrameQueue:
+            def __init__(self):
+                self._queue = FrameQueue(max_frames=1)
+                self.drain_calls = 0
+
+            def put(self, item, frame_count=0):
+                self._queue.put(item, frame_count=frame_count)
+
+            def get_nowait(self):
+                self.drain_calls += 1
+                return self._queue.get_nowait()
+
+        cancel_event = threading.Event()
+        pipeline_queue = TrackingFrameQueue()
+        pipeline_queue.put("occupied", frame_count=1)
+        producer_entered = threading.Event()
+        producer_released = threading.Event()
+        peer_entered = threading.Event()
+        peer_released = threading.Event()
+
+        def blocked_producer():
+            producer_entered.set()
+            pipeline_queue.put("released", frame_count=1)
+            producer_released.set()
+
+        def peer_worker():
+            peer_entered.set()
+            cancel_event.wait(timeout=2)
+            peer_released.set()
+
+        threads = [
+            threading.Thread(target=blocked_producer),
+            threading.Thread(target=peer_worker),
+        ]
+        for thread in threads:
+            thread.start()
+        assert producer_entered.wait(timeout=1)
+        assert peer_entered.wait(timeout=1)
+        cancel_event.set()
+        wait_for_worker_threads(
+            threads,
+            (pipeline_queue,),
+            cancel_event,
+            poll_interval=0.001,
+        )
+        assert pipeline_queue.drain_calls >= 1
+        assert producer_released.is_set()
+        assert peer_released.is_set()
+        assert all(not thread.is_alive() for thread in threads)
+
+    def test_wait_for_worker_threads_does_not_drain_healthy_workers(self):
+        class NoDrainQueue:
+            def __init__(self):
+                self.drain_calls = 0
+
+            def get_nowait(self):
+                self.drain_calls += 1
+                raise AssertionError("healthy queues must not be drained")
+
+        worker_started = threading.Event()
+        worker_finished = threading.Event()
+
+        def healthy_worker():
+            worker_started.set()
+            time.sleep(0.03)
+            worker_finished.set()
+
+        thread = threading.Thread(target=healthy_worker)
+        thread.start()
+        assert worker_started.wait(timeout=1)
+        pipeline_queue = NoDrainQueue()
+        wait_for_worker_threads(
+            [thread],
+            (pipeline_queue,),
+            threading.Event(),
+            poll_interval=0.001,
+        )
+        assert worker_finished.is_set()
+        assert pipeline_queue.drain_calls == 0
+        assert not thread.is_alive()
 
 
 # ---------------------------------------------------------------------------

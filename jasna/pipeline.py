@@ -34,7 +34,14 @@ from jasna.media.splice import (
 from jasna.mosaic.detection_registry import build_detection_model
 from jasna.pipeline_debug_logging import PipelineDebugMemoryLogger
 from jasna.pipeline_items import FrameMeta, PrimaryRestoreResult, SecondaryLoopStats, _SENTINEL
-from jasna.pipeline_threads import decode_detect_loop, primary_restore_loop, secondary_restore_loop, blend_encode_loop
+from jasna.pipeline_threads import (
+    blend_encode_loop,
+    decode_detect_loop,
+    primary_restore_loop,
+    record_worker_error,
+    secondary_restore_loop,
+    wait_for_worker_threads,
+)
 from jasna.progressbar import Progressbar
 from jasna.restorer import RestorationPipeline
 from jasna.restorer.secondary_restorer import AsyncSecondaryRestorer
@@ -205,6 +212,7 @@ class Pipeline:
         debug_memory: PipelineDebugMemoryLogger | None = None,
         clip_queue: FrameQueue | None = None,
         primary_idle_event: threading.Event | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> SecondaryLoopStats:
         restorer: AsyncSecondaryRestorer = self.restoration_pipeline.secondary_restorer  # type: ignore[assignment]
         pending_prs: dict[int, PrimaryRestoreResult] = {}
@@ -220,7 +228,12 @@ class Pipeline:
             nonlocal last_push_time, flushed_since_last_push, pusher_stall_seconds, clips_pushed
             try:
                 while True:
-                    item = secondary_queue.get()
+                    if cancel_event is not None and cancel_event.is_set():
+                        break
+                    try:
+                        item = secondary_queue.get(timeout=self._ASYNC_POLL_TIMEOUT)
+                    except Empty:
+                        continue
                     if item is _SENTINEL:
                         break
                     pr: PrimaryRestoreResult = item  # type: ignore[assignment]
@@ -279,6 +292,8 @@ class Pipeline:
         starvation_start: float | None = None
 
         while not push_done.is_set():
+            if cancel_event is not None and cancel_event.is_set():
+                break
             if pusher_error:
                 raise pusher_error[0]
 
@@ -323,6 +338,14 @@ class Pipeline:
         pusher_thread.join()
         if pusher_error:
             raise pusher_error[0]
+        if cancel_event is not None and cancel_event.is_set():
+            return SecondaryLoopStats(
+                starvation_flushes=starvation_count,
+                starvation_seconds=starvation_seconds,
+                pusher_stall_seconds=pusher_stall_seconds,
+                clips_pushed=clips_pushed,
+                clips_popped=clips_popped,
+            )
         restorer.flush_all()
         for _ in range(100):
             if not pending_prs:
@@ -396,10 +419,21 @@ class Pipeline:
             nonlocal starvation_stats
             try:
                 torch.cuda.set_device(device)
-                starvation_stats = self._run_secondary_loop(secondary_queue, encode_queue, debug_memory, clip_queue, primary_idle_event)
+                starvation_stats = self._run_secondary_loop(
+                    secondary_queue,
+                    encode_queue,
+                    debug_memory,
+                    clip_queue,
+                    primary_idle_event,
+                    self._cancel_event,
+                )
             except BaseException as e:
-                log.exception("[secondary-async] thread crashed")
-                error_holder.append(e)
+                record_worker_error(
+                    "secondary-async",
+                    e,
+                    error_holder,
+                    self._cancel_event,
+                )
             finally:
                 encode_queue.put(_SENTINEL)
 
@@ -489,8 +523,11 @@ class Pipeline:
         vram_offloader.start()
         for t in threads:
             t.start()
-        for t in threads:
-            t.join()
+        wait_for_worker_threads(
+            threads,
+            (clip_queue, secondary_queue, encode_queue, metadata_queue),
+            self._cancel_event,
+        )
         vram_offloader.stop()
         frame_writer.close()
 

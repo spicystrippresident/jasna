@@ -525,6 +525,7 @@ class TestPipelineRun:
         ):
             with pytest.raises(RuntimeError, match="secondary boom"):
                 p.run()
+        assert p.cancel_requested
 
     def test_run_secondary_loop(self):
         """Cover _run_secondary_loop: push_clip → flush → pop_completed → build_secondary_result."""
