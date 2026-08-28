@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 _PURPOSE = "jasna-rfdetr-v6-medium-segmentation"
 _PLATFORM = "linux"
 _DEVICE_ARCH = "gfx1100"
+PRODUCT_MANIFEST_FILENAME = f"rfdetr-v6.migraphx-{_DEVICE_ARCH}.json"
 _SUPPORTED_STATIC_BATCHES = frozenset({1, 2})
 _SUPPORTED_INTERNAL_PRECISIONS = frozenset(
     {
@@ -42,6 +43,41 @@ _OUTPUT_CONTRACTS = {
         "strides": (4147200, 20736, 144, 1),
     },
 }
+
+
+def discover_product_rfdetr_migraphx_manifest(
+    *,
+    detection_model_name: str,
+    weights_path: Path,
+    device: torch.device,
+    fp16: bool,
+) -> Path | None:
+    """Return the installed product artifact only for its proven host scope.
+
+    Ineligibility or absence is a selection decision and preserves the existing
+    PyTorch RF-DETR route. Once a path is returned, the strict runner owns every
+    file/hash/runtime/ABI check and failures must propagate without fallback.
+    """
+
+    resolved_device = torch.device(device)
+    if (
+        sys.platform != _PLATFORM
+        or not bool(fp16)
+        or str(detection_model_name).strip().casefold() != "rfdetr-v6"
+        or not is_amd_device(resolved_device)
+        or resolved_device.type != "cuda"
+        or getattr(torch.version, "hip", None) is None
+        or not torch.cuda.is_available()
+    ):
+        return None
+
+    candidate = Path(weights_path).parent / PRODUCT_MANIFEST_FILENAME
+    if not candidate.is_file():
+        return None
+    properties = torch.cuda.get_device_properties(resolved_device)
+    if getattr(properties, "gcnArchName", None) != _DEVICE_ARCH:
+        return None
+    return candidate
 
 
 class RfDetrMigraphxRunner:
