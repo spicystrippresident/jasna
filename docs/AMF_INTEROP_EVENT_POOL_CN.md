@@ -13,8 +13,9 @@ JASNA_DECODE_BACKEND=amf-interop
 JASNA_AMF_INTEROP_DECODE_COPY_STREAM=private-deferred
 ```
 
-未设置第二个变量或显式设为 `null` 时，仍使用已有的
-`null-stream-source-release` 路径。`private-deferred` 不是 `auto` 的候选项；bridge
+显式 `amf-interop` 未设置第二个变量或设为 `null` 时，仍使用已有的
+`null-stream-source-release` 路径。后续产品路由只对 Linux AMD 合格的 H.264/HEVC
+在 `auto` 下固定选择 `private-deferred`；AV1 和其他格式不在这项自动迁移内。bridge
 缺少 dependency probe、session 方法、非空 Torch HIP stream handle 或任何必需 HIP
 entry point 时，都会 fail closed，不切到 CPU、host map、D2H、staging 或软件回退。
 
@@ -78,8 +79,8 @@ transport、B8 handoff 以及 teardown 不覆盖原始 copy 异常。
 
 目标 3,600 帧会话的正常闭环计数是：stream create/destroy `1/1`，event
 create/destroy `6/6`，event record `7200`，device wait `3600`，source acquire/release
-`3600/3600`，max/final in-flight `3/0`。当前仓库没有把该实验提升为产品路由；将来若要
-接入默认策略，必须另行完成真实 RX 7900 XTX 短片验证，并保持此显式 mode 作为可回退接口。
+`3600/3600`，max/final in-flight `3/0`。显式 mode 继续保留为诊断接口；产品 `auto`
+迁移的范围和失败边界见 `docs/LINUX_AMD_AUTO_DECODE_CN.md`。
 
 当前工作树已用 accepted unified runtime 重新在源码树外构建 bridge，SHA-256 为
 `821cdde7f048e699c7911a28e875a712f7538b6aef10b4f2aa7c8368f7471773`。RX 7900 XTX

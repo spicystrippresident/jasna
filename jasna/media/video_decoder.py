@@ -43,9 +43,10 @@ _libcuda: ctypes.CDLL | None = None
 # - "rocdecode": diagnostic Linux AMD-only backend; any failure raises.
 # - "pyav-hw": skip VALI, use the PyAV hwaccel path with its software fallback.
 # - "pyav-sw": force FFmpeg software decoding with GPU upload on every vendor.
-# - "amf-interop": explicit Linux AMD research backend.  It accepts only the
+# - "amf-interop": explicit Linux AMD diagnostic backend.  It accepts only the
 #                  documented H.264/HEVC/AV1 AMF Vulkan surface scope and copies
-#                  directly to HIP, or raises; it is never selected by auto.
+#                  directly to HIP, or raises. Linux AMD auto selects the proven
+#                  private-deferred route only for eligible H.264/HEVC sources.
 DECODE_BACKEND = "auto"
 DECODE_BACKEND_ENV = "JASNA_DECODE_BACKEND"
 _DECODE_BACKENDS = (
@@ -280,6 +281,20 @@ def _amf_interop_format_supported(metadata: VideoMetadata) -> bool:
     if not profile and is_10bit and pixel_format == "p010le":
         return True
     return False
+
+
+def _should_auto_amf_interop(
+    metadata: VideoMetadata,
+    vendor: AcceleratorVendor,
+) -> bool:
+    """Select the proven native route without disturbing general auto order."""
+
+    return (
+        sys.platform == "linux"
+        and vendor is AcceleratorVendor.AMD
+        and str(metadata.codec_name).casefold() in {"h264", "hevc"}
+        and _amf_interop_format_supported(metadata)
+    )
 
 
 def _load_amf_interop_bridge():
@@ -1540,6 +1555,12 @@ class NvidiaVideoReader:
                     return self
             elif backend == "vali":
                 raise VideoDecodeError("The VALI decode backend requires an NVIDIA device")
+        if backend == "auto" and _should_auto_amf_interop(self.metadata, self.vendor):
+            # This is a narrow Linux AMD backend substitution, not a change to
+            # the shared auto ordering. Native failures are terminal so a
+            # bridge/lifetime regression cannot silently become CPU transport.
+            self._open_amf_interop_backend(decode_copy_stream="private-deferred")
+            return self
         windows_amd_software_decode = (
             backend == "auto"
             and _requires_windows_amd_software_decode(
@@ -1627,7 +1648,11 @@ class NvidiaVideoReader:
             or self.metadata.color_range == AvColorRange.JPEG
         )
 
-    def _open_amf_interop_backend(self) -> None:
+    def _open_amf_interop_backend(
+        self,
+        *,
+        decode_copy_stream: str | None = None,
+    ) -> None:
         """Open the explicit, fail-closed AMF Vulkan -> HIP reader only."""
 
         self._validate_amf_interop_scope()
@@ -1637,7 +1662,12 @@ class NvidiaVideoReader:
                 f"{AMF_INTEROP_RESOURCE_CACHE_ENV}=1 is not implemented by this "
                 "amf-interop core; per-frame balanced external-memory ownership is required"
             )
-        decode_copy_stream = _amf_interop_decode_copy_stream()
+        if decode_copy_stream is None:
+            decode_copy_stream = _amf_interop_decode_copy_stream()
+        elif decode_copy_stream not in _AMF_INTEROP_DECODE_COPY_STREAMS:
+            raise VideoDecodeError(
+                f"invalid AMF interop decode-copy mode: {decode_copy_stream!r}"
+            )
         bridge = _load_amf_interop_bridge()
         try:
             identity_session = bridge.AmfVulkanHipInteropSession("decode")
