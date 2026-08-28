@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import bisect
+import hashlib
 import logging
 import os
 import subprocess
@@ -45,6 +46,16 @@ class SmartRenderCompatibilityError(ValueError):
 
 
 @dataclass(frozen=True)
+class HevcParameterSet:
+    """Canonical identity for one HEVC VPS, SPS, or PPS NAL unit."""
+
+    nal_type: int
+    parameter_set_id: int
+    referenced_id: int | None
+    sha256: str
+
+
+@dataclass(frozen=True)
 class KeyframeIndex:
     pts: tuple[int, ...]
     time_base: Fraction
@@ -52,6 +63,7 @@ class KeyframeIndex:
     end_pts: int
     max_b_frames: int = 0
     uses_b_references: bool = False
+    decode_delay_pts: int = 0
 
     def seconds_for_pts(self, pts: int) -> float:
         return float((int(pts) - self.start_pts) * self.time_base)
@@ -86,7 +98,7 @@ def _canonical_codec(name: str) -> str:
         return "hevc"
     if value in {"avc", "h.264"}:
         return "h264"
-    if value == "av01":
+    if value in {"av01", "libdav1d"}:
         return "av1"
     return value
 
@@ -246,9 +258,23 @@ def resolve_smart_encoder_settings(
     return resolved
 
 
+def _nominal_frame_duration_pts(metadata: VideoMetadata, time_base: Fraction) -> int:
+    """Return one frame duration in stream timestamp units when packets omit it."""
+
+    try:
+        return max(
+            1,
+            round(1 / (float(metadata.video_fps) * float(time_base))),
+        )
+    except (TypeError, ValueError, ZeroDivisionError, OverflowError):
+        return 1
+
+
 def probe_keyframes(path: str | Path, metadata: VideoMetadata) -> KeyframeIndex:
     keyframes: list[int] = []
     packet_pts: list[int] = []
+    packet_end_pts: int | None = None
+    decode_delay_pts = 0
     with av.open(str(path)) as container:
         stream = container.streams.video[0]
         codec = _canonical_codec(metadata.codec_name)
@@ -262,10 +288,18 @@ def probe_keyframes(path: str | Path, metadata: VideoMetadata) -> KeyframeIndex:
             length_size = (extradata[21] & 0x03) + 1
         time_base = Fraction(stream.time_base)
         start_pts = resolve_video_start_pts(stream.start_time, metadata.start_pts)
+        nominal_frame_duration = _nominal_frame_duration_pts(metadata, time_base)
         for packet in container.demux(stream):
             if packet.pts is not None:
-                packet_pts.append(int(packet.pts))
-            if (
+                pts = int(packet.pts)
+                packet_pts.append(pts)
+                packet_duration = int(packet.duration or 0)
+                packet_end = pts + (
+                    packet_duration if packet_duration > 0 else nominal_frame_duration
+                )
+                if packet_end_pts is None or packet_end > packet_end_pts:
+                    packet_end_pts = packet_end
+            is_safe_keyframe = (
                 packet.pts is not None
                 and packet.is_keyframe
                 and _is_safe_random_access_packet(
@@ -274,8 +308,14 @@ def probe_keyframes(path: str | Path, metadata: VideoMetadata) -> KeyframeIndex:
                     length_size,
                     length_prefixed=length_prefixed,
                 )
-            ):
+            )
+            if is_safe_keyframe:
                 keyframes.append(int(packet.pts))
+                if packet.dts is not None:
+                    decode_delay_pts = max(
+                        decode_delay_pts,
+                        int(packet.pts) - int(packet.dts),
+                    )
         stream_duration = stream.duration
 
     if not keyframes:
@@ -285,8 +325,10 @@ def probe_keyframes(path: str | Path, metadata: VideoMetadata) -> KeyframeIndex:
         end_pts = start_pts + int(stream_duration)
     else:
         end_pts = start_pts + round(float(metadata.duration) / time_base)
+    if packet_end_pts is not None:
+        end_pts = max(end_pts, packet_end_pts)
     if end_pts <= keyframes[-1]:
-        end_pts = keyframes[-1] + max(1, round(1 / (metadata.video_fps * time_base)))
+        end_pts = keyframes[-1] + nominal_frame_duration
     max_b_frames, uses_b_references = _analyze_packet_reordering(packet_pts)
     return KeyframeIndex(
         tuple(keyframes),
@@ -295,16 +337,16 @@ def probe_keyframes(path: str | Path, metadata: VideoMetadata) -> KeyframeIndex:
         int(end_pts),
         max_b_frames=max_b_frames,
         uses_b_references=uses_b_references,
+        decode_delay_pts=decode_delay_pts,
     )
 
 
-def _nal_unit_types(
+def _split_nal_units(
     data: bytes,
     *,
-    codec: str,
     length_size: int,
     length_prefixed: bool,
-) -> tuple[int, ...]:
+) -> tuple[bytes, ...]:
     units: list[bytes] = []
     if not length_prefixed:
         starts: list[tuple[int, int]] = []
@@ -331,9 +373,278 @@ def _nal_unit_types(
                 break
             units.append(data[offset:offset + size])
             offset += size
+    return tuple(units)
+
+
+def _nal_unit_types(
+    data: bytes,
+    *,
+    codec: str,
+    length_size: int,
+    length_prefixed: bool,
+) -> tuple[int, ...]:
+    units = _split_nal_units(
+        data,
+        length_size=length_size,
+        length_prefixed=length_prefixed,
+    )
     if codec == "h264":
         return tuple(unit[0] & 0x1F for unit in units if unit)
     return tuple((unit[0] >> 1) & 0x3F for unit in units if unit)
+
+
+class _BitReader:
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self._offset = 0
+
+    def read_bits(self, count: int) -> int:
+        if count < 0 or self._offset + count > len(self._data) * 8:
+            raise ValueError("truncated HEVC parameter set")
+        value = 0
+        for _ in range(count):
+            byte = self._data[self._offset // 8]
+            value = (value << 1) | ((byte >> (7 - self._offset % 8)) & 1)
+            self._offset += 1
+        return value
+
+    def read_ue(self) -> int:
+        leading_zeroes = 0
+        while self.read_bits(1) == 0:
+            leading_zeroes += 1
+            if leading_zeroes > 31:
+                raise ValueError("invalid HEVC Exp-Golomb value")
+        if not leading_zeroes:
+            return 0
+        return (1 << leading_zeroes) - 1 + self.read_bits(leading_zeroes)
+
+
+def _hevc_rbsp(nal: bytes) -> bytes:
+    payload = nal[2:]
+    rbsp = bytearray()
+    zeroes = 0
+    for value in payload:
+        if zeroes >= 2 and value == 0x03:
+            zeroes = 0
+            continue
+        rbsp.append(value)
+        zeroes = zeroes + 1 if value == 0 else 0
+    return bytes(rbsp)
+
+
+def _skip_hevc_profile_tier_level(reader: _BitReader, max_sub_layers: int) -> None:
+    # general_profile_tier_level (88 bits) + general_level_idc (8 bits)
+    reader.read_bits(96)
+    sub_layer_profile_present = [reader.read_bits(1) for _ in range(max_sub_layers)]
+    sub_layer_level_present = [reader.read_bits(1) for _ in range(max_sub_layers)]
+    if max_sub_layers:
+        reader.read_bits(2 * (8 - max_sub_layers))
+    for profile_present, level_present in zip(
+        sub_layer_profile_present,
+        sub_layer_level_present,
+    ):
+        if profile_present:
+            reader.read_bits(88)
+        if level_present:
+            reader.read_bits(8)
+
+
+def _parse_hevc_parameter_set(nal: bytes) -> HevcParameterSet | None:
+    if len(nal) < 3:
+        return None
+    nal_type = (nal[0] >> 1) & 0x3F
+    if nal_type not in {32, 33, 34}:
+        return None
+    reader = _BitReader(_hevc_rbsp(nal))
+    if nal_type == 32:
+        parameter_set_id = reader.read_bits(4)
+        referenced_id = None
+    elif nal_type == 33:
+        referenced_id = reader.read_bits(4)
+        max_sub_layers = reader.read_bits(3)
+        reader.read_bits(1)
+        _skip_hevc_profile_tier_level(reader, max_sub_layers)
+        parameter_set_id = reader.read_ue()
+    else:
+        parameter_set_id = reader.read_ue()
+        referenced_id = reader.read_ue()
+    canonical_nal = nal.rstrip(b"\x00")[:2] + _hevc_rbsp(nal.rstrip(b"\x00"))
+    return HevcParameterSet(
+        nal_type=nal_type,
+        parameter_set_id=parameter_set_id,
+        referenced_id=referenced_id,
+        sha256=hashlib.sha256(canonical_nal).hexdigest(),
+    )
+
+
+def _hevc_configuration_nals(extradata: bytes) -> tuple[bytes, ...]:
+    if len(extradata) <= 22 or extradata[0] != 1:
+        return _split_nal_units(
+            extradata,
+            length_size=4,
+            length_prefixed=False,
+        )
+    units: list[bytes] = []
+    offset = 23
+    for _ in range(extradata[22]):
+        if offset + 3 > len(extradata):
+            raise ValueError("truncated hvcC parameter-set array")
+        offset += 1
+        count = int.from_bytes(extradata[offset:offset + 2], "big")
+        offset += 2
+        for _ in range(count):
+            if offset + 2 > len(extradata):
+                raise ValueError("truncated hvcC NAL length")
+            size = int.from_bytes(extradata[offset:offset + 2], "big")
+            offset += 2
+            if size <= 0 or offset + size > len(extradata):
+                raise ValueError("truncated hvcC NAL payload")
+            units.append(extradata[offset:offset + size])
+            offset += size
+    return tuple(units)
+
+
+def _parameter_sets_from_nals(units: tuple[bytes, ...]) -> tuple[HevcParameterSet, ...]:
+    parameter_sets: list[HevcParameterSet] = []
+    seen: set[HevcParameterSet] = set()
+    for nal in units:
+        try:
+            parameter_set = _parse_hevc_parameter_set(nal)
+        except ValueError:
+            continue
+        if parameter_set is not None and parameter_set not in seen:
+            seen.add(parameter_set)
+            parameter_sets.append(parameter_set)
+    return tuple(parameter_sets)
+
+
+def _probe_hevc_parameter_set_sequences(
+    path: str | Path,
+) -> tuple[tuple[HevcParameterSet, ...], ...]:
+    """Preserve the VPS/SPS/PPS sequence at every random-access packet."""
+
+    sequences: list[tuple[HevcParameterSet, ...]] = []
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0]
+        extradata = bytes(stream.codec_context.extradata or b"")
+        configuration = _parameter_sets_from_nals(_hevc_configuration_nals(extradata))
+        length_prefixed = len(extradata) > 21 and extradata[0] == 1
+        length_size = (extradata[21] & 0x03) + 1 if length_prefixed else 4
+        pending: list[HevcParameterSet] = []
+        for packet in container.demux(stream):
+            if packet.size <= 0:
+                continue
+            packet_parameter_sets = _parameter_sets_from_nals(
+                _split_nal_units(
+                    bytes(packet),
+                    length_size=length_size,
+                    length_prefixed=length_prefixed,
+                )
+            )
+            if not packet.is_keyframe:
+                pending.extend(packet_parameter_sets)
+                continue
+            combined = tuple(dict.fromkeys([*pending, *packet_parameter_sets]))
+            pending.clear()
+            sequences.append(combined or configuration)
+    if not sequences and configuration:
+        sequences.append(configuration)
+    return tuple(sequences)
+
+
+def probe_hevc_parameter_sets(path: str | Path) -> tuple[HevcParameterSet, ...]:
+    """Read unique hvcC/CodecPrivate and in-band VPS/SPS/PPS identities."""
+
+    return tuple(
+        dict.fromkeys(
+            parameter_set
+            for sequence in _probe_hevc_parameter_set_sequences(path)
+            for parameter_set in sequence
+        )
+    )
+
+
+def _hevc_parameter_set_map(
+    parameter_sets: tuple[HevcParameterSet, ...],
+) -> dict[tuple[int, int], set[str]]:
+    signature: dict[tuple[int, int], set[str]] = {}
+    for parameter_set in parameter_sets:
+        key = (parameter_set.nal_type, parameter_set.parameter_set_id)
+        signature.setdefault(key, set()).add(parameter_set.sha256)
+    return signature
+
+
+def validate_hevc_fragment_parameter_sets(
+    fragments: list[tuple[Path, str]],
+) -> None:
+    """Reject shared HEVC IDs that change across or inside a rendered seam."""
+
+    fragment_roles: set[str] = set()
+    sequences: list[tuple[tuple[HevcParameterSet, ...], ...]] = []
+    for path, role in fragments:
+        if role not in {"copy", "render"}:
+            raise ValueError(f"unknown smart-render fragment role: {role}")
+        fragment_roles.add(role)
+        try:
+            fragment_sequences = _probe_hevc_parameter_set_sequences(path)
+        except (OSError, ValueError, av.FFmpegError) as exc:
+            raise SmartRenderCompatibilityError(
+                f"Could not inspect HEVC parameter sets in {path.name}: {exc}",
+                reason="hevc_parameter_sets_unavailable",
+            ) from exc
+        sequences.append(fragment_sequences)
+    if fragment_roles != {"copy", "render"}:
+        return
+    for fragment_index, fragment_sequences in enumerate(sequences):
+        for sequence in fragment_sequences:
+            nal_types = {parameter_set.nal_type for parameter_set in sequence}
+            if {32, 33, 34}.issubset(nal_types):
+                continue
+            raise SmartRenderCompatibilityError(
+                "Could not identify complete HEVC VPS/SPS/PPS headers in "
+                f"fragment {fragment_index}",
+                reason="hevc_parameter_sets_unavailable",
+            )
+        if not fragment_sequences:
+            raise SmartRenderCompatibilityError(
+                f"Could not identify HEVC random-access headers in fragment {fragment_index}",
+                reason="hevc_parameter_sets_unavailable",
+            )
+
+    for fragment_index, ((_path, role), render_sequences) in enumerate(
+        zip(fragments, sequences)
+    ):
+        if role != "render":
+            continue
+        references: list[tuple[HevcParameterSet, ...]] = []
+        if fragment_index > 0 and fragments[fragment_index - 1][1] == "copy":
+            references.append(sequences[fragment_index - 1][-1])
+        if (
+            fragment_index + 1 < len(fragments)
+            and fragments[fragment_index + 1][1] == "copy"
+        ):
+            references.append(sequences[fragment_index + 1][0])
+        for render_sequence_index, render_sequence in enumerate(render_sequences):
+            render_map = _hevc_parameter_set_map(render_sequence)
+            for reference in references:
+                reference_map = _hevc_parameter_set_map(reference)
+                collisions = sorted(
+                    key
+                    for key in reference_map.keys() & render_map.keys()
+                    if reference_map[key] != render_map[key]
+                )
+                if not collisions:
+                    continue
+                details = ", ".join(
+                    f"NAL {nal_type} ID {parameter_set_id}"
+                    for nal_type, parameter_set_id in collisions
+                )
+                raise SmartRenderCompatibilityError(
+                    "HEVC copied and rendered spans redefine shared parameter-set "
+                    f"IDs in fragment {fragment_index} RAP {render_sequence_index} "
+                    f"({details})",
+                    reason="hevc_parameter_sets_incompatible",
+                )
 
 
 def _is_safe_random_access_packet(
@@ -483,14 +794,52 @@ def _codec_name(path: Path) -> str:
         return container.streams.video[0].codec_context.codec.canonical_name
 
 
-def normalize_fragment(source: Path, destination: Path, *, codec: str) -> None:
+def _fragment_pts_are_reordered(path: Path) -> bool:
+    packet_pts: list[int] = []
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0]
+        for packet in container.demux(stream):
+            if packet.pts is not None:
+                packet_pts.append(int(packet.pts))
+    max_b_frames, _ = _analyze_packet_reordering(packet_pts)
+    return max_b_frames > 0
+
+
+def _normalization_parameters(codec: str) -> tuple[str, str, list[str]]:
     bitstream_filter = {
         "h264": "h264_mp4toannexb,dump_extra=freq=keyframe",
         "hevc": "hevc_mp4toannexb,dump_extra=freq=keyframe",
         "av1": "av1_metadata=td=insert,dump_extra=freq=keyframe",
     }[codec]
     muxer = "mpegts" if codec in {"h264", "hevc"} else "matroska"
-    container_args = ["-muxdelay", "0"] if muxer == "mpegts" else ["-avoid_negative_ts", "make_zero"]
+    container_args = (
+        ["-muxdelay", "0"]
+        if muxer == "mpegts"
+        else ["-avoid_negative_ts", "make_zero"]
+    )
+    return bitstream_filter, muxer, container_args
+
+
+def normalize_fragment(
+    source: Path,
+    destination: Path,
+    *,
+    codec: str,
+    decode_delay: Fraction = Fraction(0, 1),
+) -> None:
+    bitstream_filter, muxer, container_args = _normalization_parameters(codec)
+    timestamp_args: list[str] = []
+    if decode_delay > 0 and not _fragment_pts_are_reordered(source):
+        with av.open(str(source)) as container:
+            time_base = Fraction(container.streams.video[0].time_base)
+        delay_ticks = round(Fraction(decode_delay) / time_base)
+        bitstream_filter += f",setts=pts=PTS:dts=PTS-{delay_ticks}"
+        timestamp_args = [
+            "-output_ts_offset", _seconds(float(decode_delay)),
+            "-avoid_negative_ts", "disabled",
+        ]
+        if muxer == "matroska":
+            container_args = []
     _run_ffmpeg(
         [
             "-i", str(source),
@@ -499,6 +848,7 @@ def normalize_fragment(source: Path, destination: Path, *, codec: str) -> None:
             "-c:v", "copy",
             "-bsf:v", bitstream_filter,
             *container_args,
+            *timestamp_args,
             "-f", muxer,
             str(destination),
         ],
@@ -510,6 +860,17 @@ def _quote_concat_path(path: Path) -> str:
     return str(path.resolve()).replace("'", "'\\''")
 
 
+def _write_concat_manifest(
+    fragments: list[tuple[Path, float]],
+    manifest: Path,
+) -> None:
+    lines = ["ffconcat version 1.0"]
+    for path, duration in fragments:
+        lines.append(f"file '{_quote_concat_path(path)}'")
+        lines.append(f"duration {_seconds(duration)}")
+    manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def concatenate_fragments(
     fragments: list[tuple[Path, float]],
     *,
@@ -517,11 +878,7 @@ def concatenate_fragments(
     destination: Path,
     codec: str,
 ) -> None:
-    lines = ["ffconcat version 1.0"]
-    for path, duration in fragments:
-        lines.append(f"file '{_quote_concat_path(path)}'")
-        lines.append(f"duration {_seconds(duration)}")
-    manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _write_concat_manifest(fragments, manifest)
     muxer = "mpegts" if codec in {"h264", "hevc"} else "matroska"
     muxer_args = ["-muxdelay", "0"] if muxer == "mpegts" else []
     _run_ffmpeg(
@@ -540,6 +897,18 @@ def concatenate_fragments(
     )
 
 
+def _ffmpeg_disposition(disposition) -> str:
+    """Serialize PyAV disposition flags for FFmpeg's stream option."""
+
+    value = int(disposition)
+    flags = [
+        name
+        for name, member in av.stream.Disposition.__members__.items()
+        if value & int(member)
+    ]
+    return "+".join(flags) if flags else "0"
+
+
 def mux_final_output(
     video: Path,
     source: Path,
@@ -548,6 +917,207 @@ def mux_final_output(
     codec: str,
 ) -> None:
     temporary = destination.with_name(f".{destination.stem}.smart-render{destination.suffix}")
+    args = _final_mux_args(
+        ["-i", str(video), "-i", str(source)],
+        source,
+        destination,
+        codec=codec,
+        source_input_index=1,
+    )
+    args.append(str(temporary))
+    try:
+        _run_ffmpeg(args, purpose=f"mux smart-render output {destination.name}")
+        os.replace(temporary, destination)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            log.warning("Could not remove temporary output %s", temporary)
+
+
+def mux_fragments_final_output(
+    fragments: list[tuple[Path, float]],
+    source: Path,
+    destination: Path,
+    *,
+    manifest: Path,
+    codec: str,
+    copy_validation_ranges: tuple[tuple[float, float], ...] = (),
+) -> None:
+    """Concatenate video fragments while preserving compatible source streams."""
+    _write_concat_manifest(fragments, manifest)
+    temporary = destination.with_name(f".{destination.stem}.smart-render{destination.suffix}")
+    args = _final_mux_args(
+        [
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(manifest),
+            "-i", str(source),
+        ],
+        source,
+        destination,
+        codec=codec,
+        source_input_index=1,
+    )
+    args.append(str(temporary))
+    try:
+        _run_ffmpeg(args, purpose=f"assemble smart-render output {destination.name}")
+        if _canonical_codec(codec) == "hevc" and copy_validation_ranges:
+            validate_hevc_copy_seams(
+                temporary,
+                source,
+                copy_validation_ranges,
+            )
+        os.replace(temporary, destination)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            log.warning("Could not remove temporary output %s", temporary)
+
+
+def _decoded_frame_hashes(
+    path: Path,
+    *,
+    start: float,
+    duration: float,
+) -> tuple[tuple[Fraction, Fraction, int, str], ...]:
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0]
+        stream_start = (
+            Fraction(int(stream.start_time)) * Fraction(stream.time_base)
+            if stream.start_time is not None and stream.time_base is not None
+            else Fraction(0, 1)
+        )
+    absolute_start = float(stream_start) + start
+    command = [
+        resolve_executable("ffmpeg"),
+        "-hide_banner",
+        "-loglevel", "error",
+        "-copyts",
+        "-ss", _seconds(absolute_start),
+        "-i", str(path),
+        "-to", _seconds(absolute_start + duration),
+        "-map", "0:v:0",
+        "-an",
+        "-fps_mode", "passthrough",
+        "-f", "framemd5",
+        "-",
+    ]
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+        **subprocess_no_window_kwargs(),
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "unknown ffmpeg error").strip()
+        raise SmartRenderCompatibilityError(
+            f"Could not decode an HEVC copy seam: {detail}",
+            reason="hevc_copy_seam_decode_failed",
+        )
+    time_base = Fraction(1, 1)
+    frames: list[tuple[Fraction, Fraction, int, str]] = []
+    for line in completed.stdout.splitlines():
+        if line.startswith("#tb 0:"):
+            time_base = Fraction(line.split(":", 1)[1].strip())
+            continue
+        if not line or line.startswith("#"):
+            continue
+        fields = [field.strip() for field in line.split(",")]
+        if len(fields) < 6:
+            continue
+        frames.append(
+            (
+                int(fields[2]) * time_base - stream_start,
+                int(fields[3]) * time_base,
+                int(fields[4]),
+                fields[5],
+            )
+        )
+    if not frames:
+        raise SmartRenderCompatibilityError(
+            "HEVC copy seam produced no decoded frames",
+            reason="hevc_copy_seam_decode_failed",
+        )
+    return tuple(frames)
+
+
+def _hevc_copy_windows_match(
+    source_frames: tuple[tuple[Fraction, Fraction, int, str], ...],
+    output_frames: tuple[tuple[Fraction, Fraction, int, str], ...],
+) -> bool:
+    """Match copied content while tolerating one seek-boundary frame and PTS origin."""
+
+    if (
+        not source_frames
+        or not output_frames
+        or abs(len(source_frames) - len(output_frames)) > 1
+    ):
+        return False
+    minimum_match = min(len(source_frames), len(output_frames)) - 1
+    for source_offset, output_offset in ((0, 0), (1, 0), (0, 1)):
+        maximum_match = min(
+            len(source_frames) - source_offset,
+            len(output_frames) - output_offset,
+        )
+        for count in dict.fromkeys((maximum_match, max(1, minimum_match))):
+            unmatched = len(source_frames) + len(output_frames) - (2 * count)
+            if count > maximum_match or unmatched > 2:
+                continue
+            source_window = source_frames[source_offset : source_offset + count]
+            output_window = output_frames[output_offset : output_offset + count]
+            if [frame[1:] for frame in source_window] != [
+                frame[1:] for frame in output_window
+            ]:
+                continue
+            pts_offsets = [
+                output_frame[0] - source_frame[0]
+                for source_frame, output_frame in zip(source_window, output_window)
+            ]
+            max_frame_duration = max(
+                max(frame[1] for frame in source_window),
+                max(frame[1] for frame in output_window),
+            )
+            jitter_tolerance = max(Fraction(1, 1000), max_frame_duration / 20)
+            if (
+                abs(pts_offsets[0]) <= max_frame_duration
+                and max(pts_offsets) - min(pts_offsets) <= jitter_tolerance
+            ):
+                return True
+    return False
+
+
+def validate_hevc_copy_seams(
+    output: Path,
+    source: Path,
+    ranges: tuple[tuple[float, float], ...],
+) -> None:
+    """Compare bounded, timestamp-aligned decoded windows on untouched seams."""
+
+    for start, duration in ranges:
+        if duration <= 0:
+            continue
+        source_frames = _decoded_frame_hashes(source, start=start, duration=duration)
+        output_frames = _decoded_frame_hashes(output, start=start, duration=duration)
+        if not _hevc_copy_windows_match(source_frames, output_frames):
+            raise SmartRenderCompatibilityError(
+                "HEVC decoded pixels or timestamps differ in an untouched copy "
+                f"span at {start:.6f}s",
+                reason="hevc_copy_seam_mismatch",
+            )
+
+
+def _final_mux_args(
+    video_input_args: list[str],
+    source: Path,
+    destination: Path,
+    *,
+    codec: str,
+    source_input_index: int,
+) -> list[str]:
+    """Build final Smart Render mux arguments without losing side streams."""
     output_format = {
         ".mkv": "matroska",
         ".mov": "mov",
@@ -556,13 +1126,11 @@ def mux_final_output(
     with av.open(BytesIO(), "w", format=output_format) as probe:
         supported_codecs = probe.supported_codecs
 
-    args = [
-        "-i", str(video),
-        "-i", str(source),
-        "-map", "0:v:0",
-    ]
+    args = [*video_input_args, "-map", "0:v:0"]
     with av.open(str(source)) as container:
-        primary_video_index = container.streams.video[0].index
+        primary_video = container.streams.video[0]
+        primary_video_index = primary_video.index
+        primary_video_disposition = _ffmpeg_disposition(primary_video.disposition)
         copied_streams = []
         transcoded_subtitles = {}
         source_formats = set(container.format.name.split(","))
@@ -624,18 +1192,19 @@ def mux_final_output(
             )
 
         for stream in copied_streams:
-            args += ["-map", f"1:{stream.index}"]
+            args += ["-map", f"{source_input_index}:{stream.index}"]
 
         args += [
-            "-map_metadata", "1",
-            "-map_metadata:s:v:0", "1:s:v:0",
-            "-map_chapters", "1",
+            "-map_metadata", str(source_input_index),
+            "-map_metadata:s:v:0", f"{source_input_index}:s:v:0",
+            "-map_chapters", str(source_input_index),
             "-c", "copy",
+            "-disposition:v:0", primary_video_disposition,
         ]
         for output_index, stream in enumerate(copied_streams, start=1):
             args += [
                 f"-map_metadata:s:{output_index}",
-                f"1:s:{stream.index}",
+                f"{source_input_index}:s:{stream.index}",
             ]
         audio_streams = [
             stream for stream in copied_streams if stream.type == "audio"
@@ -656,12 +1225,4 @@ def mux_final_output(
     if destination.suffix.lower() in {".mp4", ".mov"}:
         tag = {"h264": "avc3", "hevc": "hev1", "av1": "av01"}[codec]
         args += ["-tag:v:0", tag, "-movflags", "+faststart"]
-    args.append(str(temporary))
-    try:
-        _run_ffmpeg(args, purpose=f"mux smart-render output {destination.name}")
-        os.replace(temporary, destination)
-    finally:
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            log.warning("Could not remove temporary output %s", temporary)
+    return args

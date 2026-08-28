@@ -1477,6 +1477,7 @@ class NvidiaVideoReader:
         metadata: VideoMetadata,
         *,
         frame_stride: int = 1,
+        decode_backend: str | None = None,
         reusable_rocdecoder: ReusableRocDecoder | None = None,
     ):
         frame_stride = int(frame_stride)
@@ -1487,6 +1488,7 @@ class NvidiaVideoReader:
         self.batch_size = batch_size
         self.metadata = metadata
         self.frame_stride = frame_stride
+        self.decode_backend = decode_backend
         self.vendor = vendor_for_device(device)
         self._decoder_ctx = None
         self._amd_hardware_decode = False
@@ -1521,7 +1523,11 @@ class NvidiaVideoReader:
         self.container = None
         self.video_stream = None
         current_stream(self.device)
-        backend = _decode_backend()
+        backend = self.decode_backend if self.decode_backend is not None else _decode_backend()
+        if backend not in _DECODE_BACKENDS:
+            raise ValueError(
+                f"Unknown decode backend {backend!r}, expected {_DECODE_BACKENDS}"
+            )
         self._decode_backend = backend
         if backend == "amf-interop":
             self._open_amf_interop_backend()

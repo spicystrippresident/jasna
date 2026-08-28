@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import gc
 import logging
 import os
@@ -23,12 +24,12 @@ from jasna.media.frame_rate import resolve_frame_rate_retarget
 from jasna.media.splice import (
     SplicePlan,
     build_splice_plan,
-    concatenate_fragments,
     create_copy_fragment,
-    mux_final_output,
+    mux_fragments_final_output,
     normalize_fragment,
     probe_keyframes,
     resolve_smart_encoder_settings,
+    validate_hevc_fragment_parameter_sets,
     validate_smart_render,
 )
 from jasna.mosaic.detection_registry import build_detection_model
@@ -588,6 +589,7 @@ class Pipeline:
             lut_path=self.lut_path,
             sharpen_strength=self.sharpen_strength,
             output_fps=frame_rate.output_fps,
+            match_input_bit_depth=True,
             fmp4=self.fmp4,
         )
         try:
@@ -688,26 +690,73 @@ class Pipeline:
                         )
                     else:
                         create_copy_fragment(self.input_video, span, index, raw, codec=codec)
-                    normalize_fragment(raw, normalized, codec=codec)
+                    if span.is_render:
+                        normalize_fragment(
+                            raw,
+                            normalized,
+                            codec=codec,
+                            decode_delay=index.decode_delay_pts * index.time_base,
+                        )
+                    else:
+                        normalize_fragment(raw, normalized, codec=codec)
                     fragments.append((normalized, duration))
 
                 if self._cancel_event.is_set():
                     return
-                assembled = temp_dir / f"assembled{fragment_suffix}"
-                concatenate_fragments(
+                if codec == "hevc":
+                    validate_hevc_fragment_parameter_sets(
+                        [
+                            (fragment, span.kind)
+                            for (fragment, _duration), span in zip(
+                                fragments,
+                                plan.spans,
+                            )
+                        ]
+                    )
+                mux_fragments_final_output(
                     fragments,
-                    manifest=temp_dir / "fragments.ffconcat",
-                    destination=assembled,
-                    codec=codec,
-                )
-                mux_final_output(
-                    assembled,
                     self.input_video,
                     self.output_video,
+                    manifest=temp_dir / "fragments.ffconcat",
                     codec=codec,
+                    copy_validation_ranges=(
+                        self._hevc_copy_validation_ranges(plan)
+                        if codec == "hevc"
+                        else ()
+                    ),
                 )
         finally:
             progress.close(ensure_completed_bar=True)
+
+    @staticmethod
+    def _hevc_copy_validation_ranges(
+        plan: SplicePlan,
+    ) -> tuple[tuple[float, float], ...]:
+        """Return one bounded GOP on every untouched side of a render seam."""
+
+        keyframes = plan.index.pts
+        ranges: set[tuple[int, int]] = set()
+        for span_index, span in enumerate(plan.spans):
+            if span.is_render:
+                continue
+            if span_index > 0 and plan.spans[span_index - 1].is_render:
+                next_keyframe = next(
+                    (pts for pts in keyframes if pts > span.start_pts),
+                    span.end_pts,
+                )
+                ranges.add((span.start_pts, min(span.end_pts, next_keyframe)))
+            if span_index + 1 < len(plan.spans) and plan.spans[span_index + 1].is_render:
+                previous_index = bisect.bisect_left(keyframes, span.end_pts) - 1
+                start_pts = keyframes[max(0, previous_index)]
+                ranges.add((max(span.start_pts, start_pts), span.end_pts))
+        return tuple(
+            (
+                plan.index.seconds_for_pts(start_pts),
+                float((end_pts - start_pts) * plan.index.time_base),
+            )
+            for start_pts, end_pts in sorted(ranges)
+            if end_pts > start_pts
+        )
 
     def run(self) -> None:
         metadata = get_video_meta_data(str(self.input_video))
