@@ -15,6 +15,10 @@ from jasna.gui.components import (
     Tooltip,
 )
 from jasna.gui.icons import NativeIconButton
+from jasna.gui.hardware_policy import (
+    DEFAULT_DETECTION_BATCH_SIZE,
+    gui_batch_size_from_custom_args,
+)
 from jasna.gui.locales import t
 from jasna.gui.settings_sections.advanced import (
     TEMPORAL_FILTER_SLIDER_MAX,
@@ -358,8 +362,16 @@ class SettingsPanel(ctk.CTkFrame):
         values: dict = {}
         for section in self._sections:
             values.update(section.collect())
+        try:
+            batch_size = gui_batch_size_from_custom_args(
+                values.get("encoder_custom_args", "")
+            )
+        except ValueError:
+            # Settings collection stays side-effect free while an entry is
+            # incomplete; validate_gui_start reports the actionable error.
+            batch_size = DEFAULT_DETECTION_BATCH_SIZE
         return AppSettings(
-            batch_size=4,  # Fixed default value
+            batch_size=batch_size,
             **values,
         )
 

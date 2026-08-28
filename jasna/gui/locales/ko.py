@@ -432,7 +432,7 @@ KO = {
         "tip_detection_score_threshold": "AI가 복원 대상으로 표시하기 위해 필요한 기본 확신도.\n낮은 값 = 더 많은 영역 감지 (오탐 가능성 있음).\n높은 값 = 더 적은 영역 감지 (놓칠 가능성 있음).\n\n구간 편집기에서 비디오마다 따로 재정의하고 기억할 수 있습니다.\n\n기본값: 각 모델의 권장값 (rfdetr-v6: 0.35, rfdetr-v6-large: 0.40)",
         "tip_codec": "출력 동영상 형식.\nH.264 (AVC): 어디서나 재생 가능, 파일이 큼.\nHEVC (H.265): 작은 파일 크기로 우수한 화질.\nAV1: 최고 압축률, 최신 플레이어 필요. 인코딩에는 최신 세대 NVIDIA GPU가 필요합니다.",
         "tip_encoder_cq": "비디오 목표 품질(CQ)입니다. 표시된 숫자는 변경 없이 인코더로 전달됩니다. 숫자가 낮을수록 화질이 좋아지지만 파일이 커집니다. Jasna는 출력 크기도 제한하므로 한도에 도달하면 가까운 값이 같은 결과를 낼 수 있습니다.\nNVIDIA 기본값: H.264 25, HEVC 28, AV1 35. 범위: H.264/HEVC 1–51, AV1 1–63.\nAMD 기본값: H.264 24, HEVC 25, AV1 32. 범위: 0–51.",
-        "tip_encoder_custom_args": "고급 인코더 매개변수 (쉼표로 구분된 key=value 형식).\n잘 모르겠으면 비워두세요.\n\n예: rc-lookahead=32",
+        "tip_encoder_custom_args": "처리 배치 크기는 --batch-size 4 또는 --batch-size 8로 설정할 수 있습니다.\n비워 두면 기본값은 B4입니다. 인코더 key=value 매개변수와 함께 사용할 때는 쉼표로 구분하세요.\n\n예: --batch-size 8,rc-lookahead=32",
         "tip_post_export_action": "전체 대기열이 완료된 뒤 실행할 선택 작업입니다.\n\n없음: 아무 작업도 하지 않습니다.\nPC 종료: 컴퓨터 전원을 끕니다.\n사용자 정의 명령: 아래 명령을 시스템 셸에서 실행합니다.",
         "tip_post_export_video_command": "각 비디오 내보내기가 성공한 뒤 시스템 셸에서 실행하고 완료될 때까지 기다립니다. 비워 두면 사용하지 않습니다. 경로는 이미 따옴표로 보호됩니다.\n\n자리표시자: {input}, {output}, {output_dir}, {output_stem}, {output_suffix}",
         "tip_output_location": "처리된 동영상을 저장할 폴더.\n비워두면 원본 파일 옆에 저장됩니다.",
@@ -469,6 +469,7 @@ KO = {
         "error_cannot_start": "처리를 시작할 수 없습니다:",
         "error_invalid_tvai": "잘못된 TVAI 구성",
         "error_post_export_command_required": "내보내기 후 사용자 정의 명령이 필요합니다",
+        "error_batch_size_custom_args": "배치 크기는 --batch-size 4 또는 --batch-size 8로 입력하고 다른 인코더 매개변수와는 쉼표로 구분하세요.",
 
         # Settings panel
         "dialog_select_tvai_ffmpeg": "Topaz Video ffmpeg.exe 선택",

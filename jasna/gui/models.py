@@ -210,10 +210,12 @@ _OLD_TUNING_INFO_VALUES = {
 
 
 def _migrate_encoder_custom_args(value: str) -> str:
+    from jasna.gui.hardware_policy import split_batch_size_custom_arg
     from jasna.media import parse_encoder_settings
 
     try:
-        settings = parse_encoder_settings(value)
+        batch_size, encoder_args = split_batch_size_custom_arg(value)
+        settings = parse_encoder_settings(encoder_args)
     except (ValueError, json.JSONDecodeError):
         return value
 
@@ -236,7 +238,11 @@ def _migrate_encoder_custom_args(value: str) -> str:
             migrated[_OLD_ENCODER_ARG_RENAMES[key]] = v
         else:
             migrated[key] = v
-    return ",".join(f"{k}={v}" for k, v in migrated.items())
+    parts = []
+    if batch_size is not None:
+        parts.append(f"--batch-size {batch_size}")
+    parts.extend(f"{k}={v}" for k, v in migrated.items())
+    return ",".join(parts)
 
 
 _LEGACY_CODEC_SPELLINGS = {
@@ -264,11 +270,13 @@ def _migrate_preset_dict(preset_dict: dict) -> dict:
     migrated = {k: v for k, v in preset_dict.items() if k in known_fields}
     custom_args = migrated.get("encoder_custom_args")
     if custom_args:
+        from jasna.gui.hardware_policy import split_batch_size_custom_arg
         from jasna.media import parse_encoder_settings
 
         migrated_args = _migrate_encoder_custom_args(custom_args)
         try:
-            parsed_args = parse_encoder_settings(migrated_args)
+            batch_size, encoder_args = split_batch_size_custom_arg(migrated_args)
+            parsed_args = parse_encoder_settings(encoder_args)
         except (ValueError, json.JSONDecodeError):
             migrated["encoder_custom_args"] = migrated_args
         else:
@@ -285,9 +293,11 @@ def _migrate_preset_dict(preset_dict: dict) -> dict:
                 if isinstance(cq, int) and not isinstance(cq, bool):
                     migrated["encoder_cq"] = cq
                     del parsed_args[cq_key]
-            migrated["encoder_custom_args"] = ",".join(
-                f"{key}={value}" for key, value in parsed_args.items()
-            )
+            parts = []
+            if batch_size is not None:
+                parts.append(f"--batch-size {batch_size}")
+            parts.extend(f"{key}={value}" for key, value in parsed_args.items())
+            migrated["encoder_custom_args"] = ",".join(parts)
     if "codec" in migrated:
         migrated["codec"] = _normalize_preset_codec(migrated["codec"])
     return migrated

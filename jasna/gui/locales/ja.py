@@ -452,7 +452,7 @@ JA = {
         "tip_detection_score_threshold": "AI が修復対象としてマークするための既定の確信度。\n低い値 = より多くの領域を検出（誤検出の可能性あり）。\n高い値 = より少ない領域を検出（見逃す可能性あり）。\n\n区間エディターでは動画ごとに上書きして記憶できます。\n\nデフォルト：各モデルの推奨値（rfdetr-v6：0.35、rfdetr-v6-large：0.40）",
         "tip_codec": "出力動画のフォーマット。\nH.264 (AVC)：どこでも再生可能、ファイルは大きめ。\nHEVC (H.265)：小さなファイルサイズで優れた画質。\nAV1：最高の圧縮率、新しいプレーヤーが必要。エンコードには新しい世代の NVIDIA GPU が必要です。",
         "tip_encoder_cq": "動画の目標品質（CQ）。表示された数値は変更せずエンコーダーへ渡されます。低いほど高品質ですが、ファイルは大きくなります。Jasna は出力サイズも制限するため、上限に達すると近い値で同じ結果になることがあります。\nNVIDIA のデフォルト：H.264 は 25、HEVC は 28、AV1 は 35。範囲：H.264/HEVC は 1–51、AV1 は 1–63。\nAMD のデフォルト：H.264 は 24、HEVC は 25、AV1 は 32。範囲：0–51。",
-        "tip_encoder_custom_args": "上級者向けのエンコーダーパラメータ（カンマ区切りの key=value 形式）。\nよくわからない場合は空欄のままにしてください。\n\n例：rc-lookahead=32",
+        "tip_encoder_custom_args": "処理バッチサイズは --batch-size 4 または --batch-size 8 で指定できます。\n空欄の場合は B4 が既定値です。エンコーダーの key=value パラメータと併用する場合はカンマで区切ってください。\n\n例：--batch-size 8,rc-lookahead=32",
         "tip_post_export_action": "キュー全体が完了した後に実行する任意のアクションです。\n\nなし：何もしません。\nPC をシャットダウン：コンピューターの電源を切ります。\nカスタムコマンド：下のコマンドをシステムシェルで実行します。",
         "tip_post_export_video_command": "各動画の書き出しが正常に完了した後、システムシェルで実行し、終了するまで待機します。空欄にすると無効です。パスは引用符で保護されています。\n\nプレースホルダー：{input}, {output}, {output_dir}, {output_stem}, {output_suffix}",
         "tip_output_location": "処理済み動画の保存先フォルダ。\n空欄の場合、元のファイルと同じ場所に保存されます。",
@@ -489,6 +489,7 @@ JA = {
         "error_cannot_start": "処理を開始できません:",
         "error_invalid_tvai": "無効な TVAI 設定",
         "error_post_export_command_required": "エクスポート後のカスタムコマンドが必要です",
+        "error_batch_size_custom_args": "バッチサイズは --batch-size 4 または --batch-size 8 と入力し、他のエンコーダーパラメータとはカンマで区切ってください。",
 
         # Settings panel
         "dialog_select_tvai_ffmpeg": "Topaz Video の ffmpeg.exe を選択",
