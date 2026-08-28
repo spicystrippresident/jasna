@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from av.video.reformatter import Colorspace as AvColorspace, ColorRange as AvColorRange
 
+from jasna.accelerator import AcceleratorVendor
 from jasna.media import (
     SUPPORTED_ENCODER_SETTINGS,
     SUPPORTED_ENCODER_SETTINGS_BY_CODEC,
@@ -18,6 +19,16 @@ from jasna.media import (
     resolve_video_start_pts,
     VideoMetadata,
 )
+
+
+@pytest.fixture(autouse=True)
+def _use_nvidia_encoder_contracts_by_default(monkeypatch) -> None:
+    """Keep legacy NVENC assertions independent of the test host GPU vendor."""
+
+    monkeypatch.setattr(
+        "jasna.media.vendor_for_device",
+        lambda: AcceleratorVendor.NVIDIA,
+    )
 
 
 @pytest.mark.parametrize(
