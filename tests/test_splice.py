@@ -15,6 +15,7 @@ from jasna.media.splice import (
     SpliceSpan,
     SmartRenderCompatibilityError,
     _analyze_packet_reordering,
+    _commit_smart_output,
     _decoded_frame_hashes,
     _hevc_copy_windows_match,
     _is_safe_random_access_packet,
@@ -146,6 +147,55 @@ def test_hevc_parameter_set_comparison_preserves_fragment_rap_order(tmp_path) ->
     ):
         validate_hevc_fragment_parameter_sets(fragments)
     assert rejected.value.reason == "hevc_parameter_sets_incompatible"
+
+
+def test_smart_output_is_validated_and_synced_around_atomic_replace(
+    tmp_path: Path,
+) -> None:
+    temporary = tmp_path / ".output.smart-render.mp4"
+    destination = tmp_path / "output.mp4"
+    source = tmp_path / "source.mp4"
+    temporary.write_bytes(b"new")
+    destination.write_bytes(b"old")
+    source.write_bytes(b"source")
+    events = []
+
+    def replace(old, new):
+        events.append(("replace", Path(old), Path(new)))
+        Path(new).write_bytes(Path(old).read_bytes())
+        Path(old).unlink()
+
+    with (
+        patch(
+            "jasna.media.splice.validate_video_output",
+            side_effect=lambda path, **_kwargs: events.append(("validate", Path(path))),
+        ),
+        patch(
+            "jasna.media.splice._fsync_file",
+            side_effect=lambda path: events.append(("fsync", Path(path))),
+        ),
+        patch(
+            "jasna.media.splice._fsync_directory",
+            side_effect=lambda path: events.append(("fsync-dir", Path(path))),
+        ),
+        patch("jasna.media.splice.os.replace", side_effect=replace),
+    ):
+        _commit_smart_output(
+            temporary,
+            destination,
+            source=source,
+            codec="h264",
+        )
+
+    assert events == [
+        ("validate", temporary),
+        ("fsync", temporary),
+        ("replace", temporary, destination),
+        ("fsync", destination),
+        ("fsync-dir", tmp_path),
+        ("validate", destination),
+    ]
+    assert destination.read_bytes() == b"new"
 
 
 def test_plan_expands_to_keyframes_but_keeps_exact_effect_range() -> None:

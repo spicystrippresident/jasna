@@ -14,6 +14,18 @@ from jasna.pipeline import Pipeline
 from jasna.segments import SegmentRange
 
 
+def _mock_workspace(tmp_path: Path, name: str = "workspace") -> MagicMock:
+    workspace = MagicMock()
+    workspace.path = tmp_path / name
+    workspace.path.mkdir(parents=True, exist_ok=True)
+    workspace.raw_path.side_effect = lambda index: workspace.path / f"{index:04d}-raw.nut"
+    workspace.fragment_path.side_effect = (
+        lambda index, suffix: workspace.path / f"{index:04d}{suffix}"
+    )
+    workspace.reusable_fragment.return_value = None
+    return workspace
+
+
 def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_path) -> None:
     pipeline = object.__new__(Pipeline)
     pipeline.input_video = tmp_path / "input.mp4"
@@ -56,6 +68,7 @@ def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_pat
         segments=pipeline.segments,
     )
     pipeline.splice_plan = plan
+    workspace = _mock_workspace(tmp_path)
 
     with (
         patch(
@@ -63,6 +76,8 @@ def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_pat
             return_value=AcceleratorVendor.NVIDIA,
         ),
         patch("jasna.pipeline.validate_smart_render", return_value="h264"),
+        patch("jasna.pipeline.workspace_signature", return_value={}),
+        patch("jasna.pipeline.SmartRenderWorkspace.open", return_value=workspace),
         patch("jasna.pipeline.probe_keyframes") as probe_keyframes,
         patch("jasna.pipeline.build_splice_plan") as build_splice_plan,
         patch("jasna.pipeline.NvidiaVideoEncoder") as encoder,
@@ -99,6 +114,7 @@ def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_pat
     ]
     mux.assert_called_once()
     assert mux.call_args.args[0][0][0].parent == mux.call_args.kwargs["manifest"].parent
+    workspace.cleanup.assert_called_once_with()
 
 
 def test_hevc_smart_run_checks_parameter_sets_and_bounded_copy_gops(tmp_path) -> None:
@@ -139,10 +155,13 @@ def test_hevc_smart_run_checks_parameter_sets_and_bounded_copy_gops(tmp_path) ->
     )
     pipeline.splice_plan = plan
     render_metadata = MagicMock(name="render_metadata")
+    workspace = _mock_workspace(tmp_path)
 
     with (
         patch("jasna.pipeline.validate_smart_render", return_value="hevc"),
         patch("jasna.pipeline.resolve_smart_encoder_settings", return_value={}),
+        patch("jasna.pipeline.workspace_signature", return_value={}),
+        patch("jasna.pipeline.SmartRenderWorkspace.open", return_value=workspace),
         patch(
             "jasna.pipeline.resolve_hevc_smart_render_vui",
             return_value=(render_metadata, Fraction(60_000, 1_001)),
@@ -201,9 +220,12 @@ def test_smart_run_uses_working_dir_for_temp_files(tmp_path) -> None:
         spans=(SpliceSpan("copy", 0, 60), SpliceSpan("render", 60, 120, ((75, 90),)), SpliceSpan("copy", 120, 180)),
         segments=pipeline.segments,
     )
+    workspace = _mock_workspace(tmp_path)
 
     with (
         patch("jasna.pipeline.validate_smart_render", return_value="h264"),
+        patch("jasna.pipeline.workspace_signature", return_value={}),
+        patch("jasna.pipeline.SmartRenderWorkspace.open", return_value=workspace) as workspace_open,
         patch("jasna.pipeline.NvidiaVideoEncoder"),
         patch("jasna.pipeline.create_copy_fragment"),
         patch("jasna.pipeline.normalize_fragment"),
@@ -211,9 +233,14 @@ def test_smart_run_uses_working_dir_for_temp_files(tmp_path) -> None:
     ):
         pipeline._run_smart(metadata)
 
+    workspace_open.assert_called_once_with(
+        pipeline.working_dir,
+        output=pipeline.output_video,
+        signature={},
+    )
     fragments = mux.call_args.args[0]
-    assert all(fragment.parent.parent == pipeline.working_dir for fragment, _ in fragments)
-    assert mux.call_args.kwargs["manifest"].parent.parent == pipeline.working_dir
+    assert all(fragment.parent == workspace.path for fragment, _ in fragments)
+    assert mux.call_args.kwargs["manifest"].parent == workspace.path
     assert pipeline.working_dir.is_dir()
     assert pipeline.output_video.parent.is_dir()
 
