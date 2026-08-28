@@ -1,4 +1,5 @@
 import ctypes
+import importlib
 import logging
 import os
 import sys
@@ -31,9 +32,16 @@ _libcuda: ctypes.CDLL | None = None
 # - "vali":    VALI only; any failure raises (NVIDIA only).
 # - "pyav-hw": skip VALI, use the PyAV hwaccel path with its software fallback.
 # - "pyav-sw": force FFmpeg software decoding with GPU upload on every vendor.
+# - "amf-interop": explicit Linux AMD research backend. It accepts only the
+#                  documented H.264/HEVC AMF Vulkan surface scope and copies
+#                  directly to HIP, or raises; it is never selected by auto.
 DECODE_BACKEND = "auto"
 DECODE_BACKEND_ENV = "JASNA_DECODE_BACKEND"
-_DECODE_BACKENDS = ("auto", "vali", "pyav-hw", "pyav-sw")
+_DECODE_BACKENDS = ("auto", "vali", "pyav-hw", "pyav-sw", "amf-interop")
+
+_AMF_INTEROP_MODULE = "_jasna_amf_surface_probe"
+AMF_INTEROP_RESOURCE_CACHE_ENV = "JASNA_AMF_INTEROP_RESOURCE_CACHE"
+_AMF_INTEROP_READER_BATCH_SIZES = frozenset({1, 2, 4, 8})
 
 # PyAV's avcodec_find_decoder returns libdav1d for AV1, which carries no NVDEC
 # hwaccel config, so av.open silently decodes AV1 in software. Force the native
@@ -55,6 +63,80 @@ def _decode_backend() -> str:
             f"expected {_DECODE_BACKENDS}"
         )
     return backend
+
+
+def _amf_interop_resource_cache_enabled(*, default: bool = False) -> bool:
+    """Parse the experimental cache switch without enabling it by default.
+
+    The core deliberately implements only per-frame import/map/release. A
+    true value is rejected by the reader rather than silently changing lifetime
+    semantics or leaking into another route.
+    """
+
+    raw_value = os.environ.get(AMF_INTEROP_RESOURCE_CACHE_ENV)
+    if raw_value is None:
+        return bool(default)
+    value = raw_value.strip().casefold()
+    if value in {"", "0", "false", "no", "off"}:
+        return False
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    raise ValueError(
+        f"Invalid {AMF_INTEROP_RESOURCE_CACHE_ENV} value {value!r}; "
+        "expected 0/1, false/true, no/yes, or off/on"
+    )
+
+
+def _amf_interop_format_supported(metadata: VideoMetadata) -> bool:
+    """Return whether metadata is inside the explicit native core scope."""
+
+    codec = str(metadata.codec_name).casefold()
+    profile = str(getattr(metadata, "profile", "") or "").casefold()
+    pixel_format = str(getattr(metadata, "pixel_format", "") or "").casefold()
+    is_10bit = bool(metadata.is_10bit)
+    if codec == "h264":
+        # ffprobe reports the source decoder's common yuv420p label; native
+        # AMF output is checked separately at the first returned frame.
+        return profile in {"main", "high"} and not is_10bit
+    if codec != "hevc":
+        return False
+    if not is_10bit and profile == "main":
+        return True
+    if is_10bit and profile in {"main 10", "main10"}:
+        return True
+    # Bundled ffprobe metadata from older source runs may omit an HEVC profile.
+    # Infer only when its pixel label itself is sufficiently specific.
+    if not profile and not is_10bit and pixel_format == "nv12":
+        return True
+    if not profile and is_10bit and pixel_format == "p010le":
+        return True
+    return False
+
+
+def _load_amf_interop_bridge():
+    """Load only an ABI-matched native AMF/Vulkan/HIP extension."""
+
+    try:
+        bridge = importlib.import_module(_AMF_INTEROP_MODULE)
+    except (ImportError, OSError, ValueError) as exc:
+        raise VideoDecodeError(
+            "The explicit amf-interop backend requires the ABI-matched "
+            f"{_AMF_INTEROP_MODULE} extension from the unified PyAV/FFmpeg runtime: {exc}"
+        ) from exc
+    required = (
+        "inspect_amf_surface",
+        "copy_amf_surface_to_hip",
+        "get_transport_stats",
+        "reset_transport_stats",
+        "AmfVulkanHipInteropSession",
+    )
+    missing = [name for name in required if not callable(getattr(bridge, name, None))]
+    if missing:
+        raise VideoDecodeError(
+            "The explicit amf-interop bridge is missing required entry points: "
+            + ", ".join(missing)
+        )
+    return bridge
 
 
 def _cuda_driver() -> ctypes.CDLL:
@@ -230,6 +312,427 @@ class _ValiFrameSource:
             raise RuntimeError(f"cuStreamDestroy failed (CUDA error {result})")
 
 
+class _AmfInteropTransportAudit:
+    """Per-reader proof that explicit AMF interop stayed GPU-only.
+
+    The bridge's process counters are useful diagnostics but may include other
+    readers. This object records the exact calls owned by one reader and
+    rejects any result that reports a host transfer, CPU mapping, staging copy,
+    D2H copy, failed native operation, or context identity change.
+    """
+
+    _FORBIDDEN_TRANSPORT_COUNTERS = (
+        "hip_non_d2d_copy_calls",
+        "host_frame_transfers",
+        "cpu_map_calls",
+        "staging_copy_calls",
+        "d2h_copy_calls",
+        "av_hwframe_transfer_data_calls",
+        "failed_bridge_copies",
+        "vulkan_export_fd_close_failures",
+    )
+
+    def __init__(
+        self,
+        *,
+        inspect_amf_surface,
+        copy_amf_surface_to_hip,
+        get_transport_stats,
+        identity_session,
+        device: torch.device,
+    ) -> None:
+        self._inspect_amf_surface = inspect_amf_surface
+        self._copy_amf_surface_to_hip = copy_amf_surface_to_hip
+        self._get_transport_stats = get_transport_stats
+        self._identity_session = identity_session
+        self._device = int(device.index or 0)
+        self._identity: tuple[int, int, int, int] | None = None
+        self._closed = False
+        self._stats = {
+            "copy_to_hip_calls": 0,
+            "copy_to_hip_successes": 0,
+            "copy_to_hip_failures": 0,
+            "vulkan_memory_exports": 0,
+            "vulkan_export_fd_close_calls": 0,
+            "vulkan_export_fd_close_failures": 0,
+            "last_vulkan_export_fd_close_errno": 0,
+            "hip_external_memory_imports": 0,
+            "hip_mapped_buffer_acquires": 0,
+            "hip_mapped_buffer_releases": 0,
+            "hip_external_memory_destroys": 0,
+            "hip_d2d_plane_copies": 0,
+            "decode_source_release_hip_stream_synchronize_calls": 0,
+            "fixed_context_session_create_calls": 1,
+            "fixed_context_session_close_calls": 0,
+            "fixed_context_session_close_failures": 0,
+            "resource_cache_session_create_calls": 0,
+            "resource_cache_session_close_calls": 0,
+            "resource_cache_session_close_failures": 0,
+            "resource_cache_hits": 0,
+            "resource_cache_misses": 0,
+        }
+
+    @classmethod
+    def _reject_forbidden_transport(cls, values, *, source: str) -> None:
+        if not isinstance(values, dict):
+            raise VideoDecodeError(
+                f"amf-interop {source} telemetry is not a dictionary: {values!r}"
+            )
+        nonzero = []
+        for name in cls._FORBIDDEN_TRANSPORT_COUNTERS:
+            try:
+                value = int(values.get(name, 0))
+            except (OverflowError, TypeError, ValueError) as exc:
+                raise VideoDecodeError(
+                    f"amf-interop {source} telemetry has invalid {name}: {values!r}"
+                ) from exc
+            if value != 0:
+                nonzero.append(f"{name}={value}")
+        if nonzero:
+            raise VideoDecodeError(
+                "amf-interop rejected a non-native transport operation from "
+                f"{source}: " + ", ".join(nonzero)
+            )
+
+    @staticmethod
+    def _integer(values: dict, name: str, *, default: int | None = None) -> int:
+        value = values.get(name, default)
+        try:
+            return int(value)
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise VideoDecodeError(
+                f"amf-interop bridge returned invalid {name}: {values!r}"
+            ) from exc
+
+    def inspect_frame(self, frame) -> dict:
+        try:
+            info = self._inspect_amf_surface(frame)
+        except BaseException as exc:
+            raise VideoDecodeError(
+                f"amf-interop rejected a non-native AMF frame: {exc}"
+            ) from exc
+        if not isinstance(info, dict):
+            raise VideoDecodeError(
+                f"amf-interop surface inspection returned invalid metadata: {info!r}"
+            )
+        memory_type = str(info.get("memory_type", "")).casefold()
+        vulkan = info.get("vulkan")
+        if memory_type != "vulkan" or not isinstance(vulkan, dict):
+            raise VideoDecodeError(
+                "amf-interop requires an AMF Vulkan external-memory surface; "
+                f"inspection returned {info!r}"
+            )
+        fixed_context = info.get("fixed_context")
+        if not isinstance(fixed_context, dict):
+            fixed_context = {}
+        frames_context = self._integer(
+            fixed_context,
+            "frames_context",
+            default=0,
+        )
+        amf_context = self._integer(fixed_context, "amf_context", default=0)
+        vulkan_device = self._integer(
+            fixed_context,
+            "vulkan_device",
+            default=vulkan.get("device", 0),
+        )
+        memory = self._integer(vulkan, "memory", default=0)
+        if (
+            frames_context <= 0
+            or amf_context <= 0
+            or vulkan_device <= 0
+            or memory <= 0
+        ):
+            raise VideoDecodeError(
+                "amf-interop requires a non-null AMF context, Vulkan device, and "
+                f"external memory handle; inspection returned {info!r}"
+            )
+        identity = (frames_context, amf_context, vulkan_device, self._device)
+        if self._identity is None:
+            self._identity = identity
+        elif self._identity != identity:
+            raise VideoDecodeError(
+                "amf-interop fixed identity changed (AMF/Vulkan/HIP device or context) within "
+                f"one reader: expected {self._identity}, got {identity}"
+            )
+        return info
+
+    def copy_to_hip(self, frame, destination: int, destination_size: int) -> dict:
+        self._stats["copy_to_hip_calls"] += 1
+        self.inspect_frame(frame)
+        try:
+            result = self._copy_amf_surface_to_hip(
+                frame,
+                int(destination),
+                int(destination_size),
+                self._device,
+            )
+        except BaseException:
+            self._stats["copy_to_hip_failures"] += 1
+            raise
+        if not isinstance(result, dict):
+            self._stats["copy_to_hip_failures"] += 1
+            raise VideoDecodeError(
+                f"amf-interop bridge returned invalid copy telemetry: {result!r}"
+            )
+        try:
+            self._reject_forbidden_transport(result, source="copy result")
+            process_stats = self._get_transport_stats()
+            self._reject_forbidden_transport(process_stats, source="bridge counters")
+            fd_close_calls = self._integer(
+                result, "vulkan_export_fd_close_calls"
+            )
+            fd_close_result = self._integer(
+                result, "vulkan_export_fd_close_result"
+            )
+            fd_close_errno = self._integer(
+                result, "vulkan_export_fd_close_errno"
+            )
+            self._stats["vulkan_export_fd_close_calls"] += fd_close_calls
+            if fd_close_result != 0:
+                self._stats["vulkan_export_fd_close_failures"] += 1
+                self._stats["last_vulkan_export_fd_close_errno"] = fd_close_errno
+            valid = (
+                self._integer(result, "hip_result") == 0
+                and self._integer(result, "hip_free_result") == 0
+                and self._integer(result, "hip_destroy_result") == 0
+                and self._integer(result, "d2d_plane_copies", default=2) == 2
+                and self._integer(
+                    result,
+                    "decode_source_release_hip_stream_synchronize_calls",
+                )
+                == 1
+                and self._integer(
+                    result,
+                    "decode_source_release_hip_stream_synchronize_result",
+                )
+                == 0
+                and result.get("copy_synchronization") == "null-stream-source-release"
+                and result.get("fixed_context_bound") is True
+                and fd_close_calls == 1
+                and fd_close_result == 0
+                and fd_close_errno == 0
+            )
+        except VideoDecodeError:
+            self._stats["copy_to_hip_failures"] += 1
+            raise
+        if not valid:
+            self._stats["copy_to_hip_failures"] += 1
+            raise VideoDecodeError(
+                "amf-interop bridge did not prove its AMF-source-release D2D "
+                f"contract: {result}"
+            )
+        self._stats["copy_to_hip_successes"] += 1
+        self._stats["vulkan_memory_exports"] += 1
+        self._stats["hip_external_memory_imports"] += 1
+        self._stats["hip_mapped_buffer_acquires"] += 1
+        self._stats["hip_mapped_buffer_releases"] += 1
+        self._stats["hip_external_memory_destroys"] += 1
+        self._stats["hip_d2d_plane_copies"] += 2
+        self._stats["decode_source_release_hip_stream_synchronize_calls"] += 1
+        return result
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        try:
+            self._identity_session.close()
+        except BaseException:
+            self._stats["fixed_context_session_close_calls"] += 1
+            self._stats["fixed_context_session_close_failures"] += 1
+            raise
+        self._stats["fixed_context_session_close_calls"] += 1
+        self._closed = True
+
+    def snapshot(self) -> dict[str, object]:
+        stats = dict(self._stats)
+        try:
+            session_stats = dict(self._identity_session.stats())
+        except BaseException as exc:
+            raise VideoDecodeError(
+                f"amf-interop fixed-context session telemetry failed: {exc}"
+            ) from exc
+        if int(session_stats.get("cache_entries", 0)) != 0:
+            raise VideoDecodeError(
+                "amf-interop resource cache was unexpectedly populated: "
+                f"{session_stats}"
+            )
+        stats.update(
+            {
+                "schema": "jasna.amf.vulkan-hip-transport.v1",
+                "telemetry_source": "instrumented-per-reader",
+                "non_hardcoded": True,
+                "failed_bridge_copies": stats["copy_to_hip_failures"],
+                "hip_non_d2d_copy_calls": 0,
+                "host_frame_transfers": 0,
+                "cpu_map_calls": 0,
+                "staging_copy_calls": 0,
+                "d2h_copy_calls": 0,
+                "av_hwframe_transfer_data_calls": 0,
+                "transport_reconfigures": 0,
+                "transport_restarts": 0,
+                "resource_strategy": (
+                    "per-frame Vulkan external-memory import/map with balanced release"
+                ),
+                "copy_synchronization": "null-stream-source-release",
+                "fixed_context_identity": self._identity,
+                "fixed_context_session_closed": bool(session_stats.get("closed", False)),
+            }
+        )
+        return stats
+
+    def validate_closed(self) -> dict[str, object]:
+        stats = self.snapshot()
+        calls = int(stats["copy_to_hip_calls"])
+        resource_counts = {
+            calls,
+            int(stats["vulkan_memory_exports"]),
+            int(stats["vulkan_export_fd_close_calls"]),
+            int(stats["hip_external_memory_imports"]),
+            int(stats["hip_mapped_buffer_acquires"]),
+            int(stats["hip_mapped_buffer_releases"]),
+            int(stats["hip_external_memory_destroys"]),
+        }
+        valid = (
+            stats["copy_to_hip_successes"] == calls
+            and stats["copy_to_hip_failures"] == 0
+            and stats["hip_d2d_plane_copies"] == calls * 2
+            and stats["decode_source_release_hip_stream_synchronize_calls"] == calls
+            and stats["vulkan_export_fd_close_failures"] == 0
+            and stats["last_vulkan_export_fd_close_errno"] == 0
+            and len(resource_counts) == 1
+            and stats["fixed_context_session_create_calls"] == 1
+            and stats["fixed_context_session_close_calls"] == 1
+            and stats["fixed_context_session_close_failures"] == 0
+            and stats["fixed_context_session_closed"]
+            and stats["resource_cache_session_create_calls"] == 0
+            and stats["resource_cache_session_close_calls"] == 0
+            and stats["resource_cache_hits"] == 0
+            and stats["resource_cache_misses"] == 0
+        )
+        if not valid:
+            raise VideoDecodeError(
+                "amf-interop violated its GPU-only resource/lifetime contract: "
+                f"{stats}"
+            )
+        return stats
+
+
+class AmfInteropUploader:
+    """Convert native AMF Vulkan NV12/P010 surfaces without host staging."""
+
+    def __init__(
+        self,
+        *,
+        file: str,
+        batch_size: int,
+        device: torch.device,
+        metadata: VideoMetadata,
+        height: int,
+        width: int,
+        full_range: bool,
+        audit: _AmfInteropTransportAudit,
+    ) -> None:
+        self.file = file
+        self.batch_size = int(batch_size)
+        self.device = device
+        self.metadata = metadata
+        self.height = int(height)
+        self.width = int(width)
+        self.full_range = bool(full_range)
+        self.audit = audit
+        self.is_10bit = bool(metadata.is_10bit)
+        self.software_format = "p010le" if self.is_10bit else "nv12"
+        self.bytes_per_sample = 2 if self.is_10bit else 1
+
+    def frames(self, decoded, group: list) -> Iterator[tuple[torch.Tensor, list[int]]]:
+        H, W = self.height, self.width
+        converter = YuvToRgbConverter(
+            H,
+            W,
+            self.metadata.color_space,
+            self.full_range,
+            self.is_10bit,
+            self.device,
+        )
+        while group:
+            packed = torch.empty(
+                (len(group), H + H // 2, W),
+                dtype=torch.uint16 if self.is_10bit else torch.uint8,
+                device=self.device,
+            )
+            batch = torch.empty(
+                (len(group), 3, H, W),
+                dtype=torch.uint8,
+                device=self.device,
+            )
+            pts: list[int] = []
+            for index, frame in enumerate(group):
+                frame_format = getattr(getattr(frame, "format", None), "name", None)
+                software_format = getattr(
+                    getattr(frame, "sw_format", None), "name", None
+                )
+                if (
+                    frame_format != "amf"
+                    or software_format != self.software_format
+                    or int(frame.width) != W
+                    or int(frame.height) != H
+                ):
+                    raise VideoDecodeError(
+                        "amf-interop requires a native AMF Vulkan "
+                        f"{self.software_format.upper()} frame; got "
+                        f"format={frame_format}, sw_format={software_format}, "
+                        f"size={getattr(frame, 'width', None)}x"
+                        f"{getattr(frame, 'height', None)} for {self.file}. "
+                        "Host fallback is forbidden."
+                    )
+                copied = self.audit.copy_to_hip(
+                    frame,
+                    packed[index].data_ptr(),
+                    packed[index].numel() * packed[index].element_size(),
+                )
+                if (
+                    int(copied.get("width", -1)) != W
+                    or int(copied.get("height", -1)) != H
+                    or int(copied.get("bytes_per_sample", -1))
+                    != self.bytes_per_sample
+                ):
+                    raise VideoDecodeError(
+                        "amf-interop bridge returned an invalid native copy result: "
+                        f"{copied}"
+                    )
+                converter.convert_into(
+                    packed[index, :H],
+                    packed[index, H:].view(H // 2, W // 2, 2),
+                    batch[index],
+                )
+                pts.append(frame.pts)
+            # Source lifetime was synchronized by the bridge before each frame
+            # reference can be released; this only completes the RGB conversion
+            # before the batch crosses the reader boundary.
+            current_stream(self.device).synchronize()
+            # A Python ``for`` target retains its final value after the loop.
+            # Drop it and clear the previous AMF surface list before asking the
+            # decoder for another group, otherwise native surfaces span two
+            # decode batches despite the bridge source-release synchronization.
+            del frame
+            group.clear()
+            yield batch, pts
+            # Do not prefetch native AMF surfaces across the consumer boundary.
+            # In particular, closing the generator after this yield must leave
+            # no unconsumed decode group alive while the AMF decoder is torn down.
+            group = self._read_group(decoded)
+
+    def _read_group(self, decoded) -> list:
+        group = []
+        while len(group) < self.batch_size:
+            frame = next(decoded, None)
+            if frame is None:
+                break
+            group.append(frame)
+        return group
+
+
 class NvidiaVideoReader:
     def __init__(
         self,
@@ -253,13 +756,36 @@ class NvidiaVideoReader:
         self._amd_hardware_decode = False
         self._vali_source: _ValiFrameSource | None = None
         self._software_only = False
+        self._amf_interop_enabled = False
+        self._amf_interop_bridge = None
+        self._amf_interop_audit: _AmfInteropTransportAudit | None = None
+        self._amf_interop_resource_cache = False
+        self.amf_interop_stats: dict[str, object] | None = None
+        self._decode_backend = DECODE_BACKEND
+        self._raw_stream: int | None = None
+        self.container = None
+        self.video_stream = None
 
     def __enter__(self):
         self._decoder_ctx = None
         self._amd_hardware_decode = False
         self._vali_source = None
+        self._amf_interop_enabled = False
+        self._amf_interop_bridge = None
+        self._amf_interop_audit = None
+        self._amf_interop_resource_cache = False
+        self.amf_interop_stats = None
+        self.container = None
+        self.video_stream = None
+        # Preserve the established per-context lifetime for the CUDA conversion
+        # stream on regular PyAV/NVDEC readers.
+        self._raw_stream = None
         current_stream(self.device)
         backend = _decode_backend()
+        self._decode_backend = backend
+        if backend == "amf-interop":
+            self._open_amf_interop_backend()
+            return self
         if backend in ("auto", "vali"):
             if self.vendor is AcceleratorVendor.NVIDIA:
                 try:
@@ -287,6 +813,12 @@ class NvidiaVideoReader:
             elif backend == "vali":
                 raise VideoDecodeError("The VALI decode backend requires an NVIDIA device")
         software_only = backend == "pyav-sw"
+        self._open_pyav(software_only=software_only)
+        return self
+
+    def _open_pyav(self, *, software_only: bool, amf_interop: bool = False) -> None:
+        """Open the established PyAV route without changing its policy."""
+
         self._software_only = software_only
         try:
             if not software_only and self.vendor is AcceleratorVendor.NVIDIA:
@@ -311,7 +843,7 @@ class NvidiaVideoReader:
         if software_only:
             ctx.thread_type = "AUTO"
         elif self.vendor is AcceleratorVendor.AMD:
-            self._setup_amf_decoder(ctx)
+            self._setup_amf_decoder(ctx, fail_closed=amf_interop)
         elif not ctx.is_hwaccel:
             if self.vendor is AcceleratorVendor.NVIDIA:
                 self._setup_nvdec_decoder(ctx)
@@ -325,8 +857,127 @@ class NvidiaVideoReader:
             ctx.color_range == int(AvColorRange.JPEG)
             or self.metadata.color_range == AvColorRange.JPEG
         )
-        self._raw_stream: int | None = None
-        return self
+
+    def _open_amf_interop_backend(self) -> None:
+        """Open the explicit, fail-closed AMF Vulkan -> HIP reader only."""
+
+        self._validate_amf_interop_scope()
+        self._amf_interop_resource_cache = _amf_interop_resource_cache_enabled()
+        if self._amf_interop_resource_cache:
+            raise VideoDecodeError(
+                f"{AMF_INTEROP_RESOURCE_CACHE_ENV}=1 is not implemented by this "
+                "amf-interop core; per-frame balanced external-memory ownership is required"
+            )
+        bridge = _load_amf_interop_bridge()
+        try:
+            identity_session = bridge.AmfVulkanHipInteropSession("decode")
+        except BaseException as exc:
+            raise VideoDecodeError(
+                "The explicit amf-interop backend could not create its fixed-context "
+                f"bridge session: {exc}"
+            ) from exc
+        session_copy = getattr(identity_session, "copy_amf_surface_to_hip", None)
+        session_close = getattr(identity_session, "close", None)
+        session_stats = getattr(identity_session, "stats", None)
+        missing_methods = [
+            name
+            for name, method in (
+                ("copy_amf_surface_to_hip()", session_copy),
+                ("close()", session_close),
+                ("stats()", session_stats),
+            )
+            if not callable(method)
+        ]
+        if missing_methods:
+            if callable(session_close):
+                try:
+                    session_close()
+                except BaseException as close_error:
+                    raise VideoDecodeError(
+                        "The explicit amf-interop bridge session is incomplete and its "
+                        f"cleanup also failed: {close_error}"
+                    ) from close_error
+            raise VideoDecodeError(
+                "The explicit amf-interop bridge session is missing required methods: "
+                + ", ".join(missing_methods)
+            )
+        audit = _AmfInteropTransportAudit(
+            inspect_amf_surface=bridge.inspect_amf_surface,
+            copy_amf_surface_to_hip=session_copy,
+            get_transport_stats=bridge.get_transport_stats,
+            identity_session=identity_session,
+            device=self.device,
+        )
+        self._amf_interop_bridge = bridge
+        self._amf_interop_audit = audit
+        self._amf_interop_enabled = True
+        try:
+            self._open_pyav(software_only=False, amf_interop=True)
+        except BaseException as error:
+            cleanup_errors = []
+            try:
+                self._close_pyav()
+            except BaseException as close_error:
+                cleanup_errors.append(f"PyAV close: {close_error}")
+            try:
+                audit.close()
+            except BaseException as close_error:
+                cleanup_errors.append(f"interop session close: {close_error}")
+            self._amf_interop_enabled = False
+            self._amf_interop_audit = None
+            self._amf_interop_bridge = None
+            if cleanup_errors:
+                raise VideoDecodeError(
+                    "amf-interop failed while opening and could not complete cleanup: "
+                    + "; ".join(cleanup_errors)
+                ) from error
+            raise
+        log.info("Using explicit AMF Vulkan -> HIP D2D decoder for %s", self.file)
+
+    def _validate_amf_interop_scope(self) -> None:
+        failures = []
+        if sys.platform != "linux":
+            failures.append("Linux is required")
+        if self.vendor is not AcceleratorVendor.AMD:
+            failures.append("an AMD device is required")
+        if not _amf_interop_format_supported(self.metadata):
+            failures.append(
+                "only fixed-format H.264 Main/High 8-bit NV12, HEVC Main 8-bit "
+                "NV12, or HEVC Main10 10-bit P010 is accepted"
+            )
+        if int(self.batch_size) not in _AMF_INTEROP_READER_BATCH_SIZES:
+            failures.append(
+                "batch_size must be one of "
+                f"{sorted(_AMF_INTEROP_READER_BATCH_SIZES)}"
+            )
+        if failures:
+            raise VideoDecodeError(
+                "The explicit amf-interop backend cannot satisfy this reader: "
+                + "; ".join(failures)
+            )
+
+    def _close_amf_interop_backend(self, *, validate: bool = True) -> None:
+        audit = self._amf_interop_audit
+        if audit is None:
+            return
+        # Do not clear the audit before both close and validation complete: a
+        # native teardown error must remain observable rather than becoming a
+        # silent best-effort cleanup.
+        audit.close()
+        # Preserve a concrete native copy/decode exception from the with-body.
+        # Normal close still applies full lifecycle validation; exceptional
+        # close records the audit without replacing the original native cause.
+        self.amf_interop_stats = audit.validate_closed() if validate else audit.snapshot()
+        self._amf_interop_enabled = False
+        self._amf_interop_audit = None
+        self._amf_interop_bridge = None
+
+    def _close_pyav(self) -> None:
+        self._decoder_ctx = None
+        if self.container is None:
+            return
+        container, self.container = self.container, None
+        container.close()
 
     @property
     def start_pts(self) -> int:
@@ -337,13 +988,25 @@ class NvidiaVideoReader:
             self.metadata.start_pts,
         )
 
-    def _setup_amf_decoder(self, source_ctx) -> None:
+    def _setup_amf_decoder(self, source_ctx, *, fail_closed: bool = False) -> None:
+        source_name = str(source_ctx.name).lower()
+        # The unified runtime can expose the selected AMF decoder as the
+        # stream context name already. Only the explicit fail-closed path
+        # normalizes that implementation detail; existing auto behavior keeps
+        # its established source-context handling unchanged.
+        if fail_closed and source_name.endswith("_amf"):
+            source_name = source_name[: -len("_amf")]
         decoder_name = {
             "h264": "h264_amf",
             "hevc": "hevc_amf",
             "av1": "av1_amf",
-        }.get(str(source_ctx.name).lower())
+        }.get(source_name)
         if decoder_name is None:
+            if fail_closed:
+                raise VideoDecodeError(
+                    "amf-interop cannot create a native AMF decoder for "
+                    f"codec {source_ctx.name!r}"
+                )
             source_ctx.thread_type = "AUTO"
             return
         try:
@@ -351,7 +1014,10 @@ class NvidiaVideoReader:
                 "amf",
                 device=str(self.device.index or 0),
                 allow_software_fallback=False,
-                is_hw_owned=False,
+                # Native AMF surfaces must be owned by this explicit decoder;
+                # otherwise PyAV can materialize NV12 host frames even though
+                # AMF itself opened successfully.
+                is_hw_owned=bool(fail_closed),
             )
             decoder = av.CodecContext.create(
                 decoder_name,
@@ -363,13 +1029,28 @@ class NvidiaVideoReader:
             decoder.height = source_ctx.height
             # PyAV 18 rejects assigning time_base on a decoder ("Cannot access
             # 'time_base' as a decoder"); decoders take timing from packets.
-            decoder.framerate = source_ctx.framerate
-            decoder.sample_aspect_ratio = source_ctx.sample_aspect_ratio
+            if fail_closed:
+                # The AMF-selected source context in the accepted runtime can
+                # legitimately omit container framerate/SAR. Packets carry
+                # timing; assigning None makes PyAV reject an otherwise native
+                # decoder before it opens.
+                if source_ctx.framerate is not None:
+                    decoder.framerate = source_ctx.framerate
+                if source_ctx.sample_aspect_ratio is not None:
+                    decoder.sample_aspect_ratio = source_ctx.sample_aspect_ratio
+            else:
+                decoder.framerate = source_ctx.framerate
+                decoder.sample_aspect_ratio = source_ctx.sample_aspect_ratio
             decoder.open(strict=False)
             self._decoder_ctx = decoder
             self._amd_hardware_decode = True
             log.info("Using AMF hardware decoder %s for %s", decoder_name, self.file)
         except (ValueError, av.FFmpegError, RuntimeError) as exc:
+            if fail_closed:
+                raise VideoDecodeError(
+                    "amf-interop cannot configure a native AMF decoder for "
+                    f"{self.file} (codec {self.metadata.codec_name}): {exc}"
+                ) from exc
             source_ctx.thread_type = "AUTO"
             log.warning(
                 "AMF cannot decode %s (codec %s): %s; using FFmpeg software "
@@ -436,8 +1117,11 @@ class NvidiaVideoReader:
             source, self._vali_source = self._vali_source, None
             source.close()
             return
-        self.container.close()
-        self._decoder_ctx = None
+        try:
+            self._close_pyav()
+        finally:
+            if self._amf_interop_audit is not None:
+                self._close_amf_interop_backend(validate=exc_type is None)
         if self._raw_stream is None:
             return
         result = _cuda_driver().cuStreamDestroy(ctypes.c_void_p(self._raw_stream))
@@ -523,7 +1207,9 @@ class NvidiaVideoReader:
         if not group:
             return
         vendor = getattr(self, "vendor", AcceleratorVendor.NVIDIA)
-        if (
+        if getattr(self, "_amf_interop_enabled", False):
+            backend = self._frames_amf_interop(decoded, group)
+        elif (
             vendor is AcceleratorVendor.NVIDIA
             and group[0].format.name == "cuda"
         ):
@@ -544,6 +1230,26 @@ class NvidiaVideoReader:
         # for the reader's lifetime costs about 96 MiB of avoidable VRAM.
         del group
         yield from backend
+
+    def _frames_amf_interop(
+        self,
+        decoded,
+        group: list,
+    ) -> Iterator[tuple[torch.Tensor, list[int]]]:
+        audit = self._amf_interop_audit
+        if audit is None:
+            raise VideoDecodeError("amf-interop bridge audit is unavailable")
+        uploader = AmfInteropUploader(
+            file=self.file,
+            batch_size=self.batch_size,
+            device=self.device,
+            metadata=self.metadata,
+            height=self.height,
+            width=self.width,
+            full_range=self._full_range,
+            audit=audit,
+        )
+        yield from uploader.frames(decoded, group)
 
     def _frames_hardware(self, decoded, group: list) -> Iterator[tuple[torch.Tensor, list[int]]]:
         # FFmpeg 8 maps NVDEC output on CUDA stream 0. Conversion runs in a

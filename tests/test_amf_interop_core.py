@@ -1,0 +1,554 @@
+"""Focused contracts for the explicit Linux AMD AMF interop core."""
+
+from __future__ import annotations
+
+import gc
+import weakref
+from fractions import Fraction
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+import torch
+from av.video.reformatter import Colorspace as AvColorspace, ColorRange as AvColorRange
+
+import jasna.media.video_decoder as module
+from jasna.accelerator import AcceleratorVendor
+from jasna.media import VideoMetadata
+
+
+def _metadata(
+    *,
+    codec: str = "h264",
+    profile: str = "high",
+    pixel_format: str = "nv12",
+    is_10bit: bool = False,
+) -> VideoMetadata:
+    return VideoMetadata(
+        video_file="input.mp4",
+        video_height=16,
+        video_width=16,
+        video_fps=30.0,
+        average_fps=30.0,
+        video_fps_exact=Fraction(30, 1),
+        codec_name=codec,
+        duration=1.0,
+        time_base=Fraction(1, 30),
+        start_pts=0,
+        color_range=AvColorRange.MPEG,
+        color_space=AvColorspace.ITU709,
+        num_frames=30,
+        is_10bit=is_10bit,
+        profile=profile,
+        pixel_format=pixel_format,
+    )
+
+
+def _reader(
+    metadata: VideoMetadata,
+    batch_size: int,
+    vendor: AcceleratorVendor = AcceleratorVendor.AMD,
+) -> module.NvidiaVideoReader:
+    reader = module.NvidiaVideoReader(
+        "input.mp4",
+        batch_size,
+        torch.device("cpu"),
+        metadata,
+    )
+    reader.vendor = vendor
+    return reader
+
+
+@pytest.fixture(autouse=True)
+def _clear_interop_env(monkeypatch):
+    monkeypatch.delenv(module.DECODE_BACKEND_ENV, raising=False)
+    monkeypatch.delenv(module.AMF_INTEROP_RESOURCE_CACHE_ENV, raising=False)
+
+
+def test_backend_enumeration_and_environment_override(monkeypatch) -> None:
+    assert "amf-interop" in module._DECODE_BACKENDS
+    monkeypatch.setenv(module.DECODE_BACKEND_ENV, "amf-interop")
+    assert module._decode_backend() == "amf-interop"
+
+
+@pytest.mark.parametrize(
+    ("codec", "profile", "pixel_format", "is_10bit"),
+    [
+        ("h264", "main", "nv12", False),
+        ("h264", "high", "nv12", False),
+        ("hevc", "main", "yuv420p", False),
+        ("hevc", "main 10", "p010le", True),
+    ],
+)
+@pytest.mark.parametrize("batch_size", [1, 2, 4, 8])
+def test_linux_amd_scope_accepts_only_supported_format_and_batch_matrix(
+    monkeypatch,
+    codec: str,
+    profile: str,
+    pixel_format: str,
+    is_10bit: bool,
+    batch_size: int,
+) -> None:
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    reader = _reader(
+        _metadata(
+            codec=codec,
+            profile=profile,
+            pixel_format=pixel_format,
+            is_10bit=is_10bit,
+        ),
+        batch_size,
+    )
+    reader._validate_amf_interop_scope()
+
+
+@pytest.mark.parametrize(
+    ("platform", "vendor", "metadata"),
+    [
+        ("win32", AcceleratorVendor.AMD, _metadata()),
+        ("linux", AcceleratorVendor.NVIDIA, _metadata()),
+        (
+            "linux",
+            AcceleratorVendor.AMD,
+            _metadata(codec="av1", profile="main", pixel_format="yuv420p"),
+        ),
+    ],
+)
+def test_windows_nvidia_and_av1_are_rejected(
+    monkeypatch,
+    platform: str,
+    vendor: AcceleratorVendor,
+    metadata: VideoMetadata,
+) -> None:
+    monkeypatch.setattr(module.sys, "platform", platform)
+    reader = _reader(metadata, 4, vendor)
+    with pytest.raises(module.VideoDecodeError, match="cannot satisfy"):
+        reader._validate_amf_interop_scope()
+
+
+@pytest.mark.parametrize("batch_size", [0, 3, 5, 16])
+def test_unapproved_batch_sizes_are_rejected(monkeypatch, batch_size: int) -> None:
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    reader = _reader(_metadata(), batch_size)
+    with pytest.raises(module.VideoDecodeError, match="batch_size"):
+        reader._validate_amf_interop_scope()
+
+
+def test_auto_never_selects_or_loads_amf_interop(monkeypatch) -> None:
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    monkeypatch.setattr(module, "current_stream", lambda _device: None)
+    monkeypatch.setattr(module, "vendor_for_device", lambda _device: AcceleratorVendor.AMD)
+    loader = MagicMock(side_effect=AssertionError("auto must not load bridge"))
+    monkeypatch.setattr(module, "_load_amf_interop_bridge", loader)
+    reader = module.NvidiaVideoReader("input.mp4", 4, torch.device("cpu"), _metadata())
+    pyav_open = MagicMock()
+    monkeypatch.setattr(reader, "_open_pyav", pyav_open)
+
+    reader.__enter__()
+
+    assert reader._decode_backend == "auto"
+    loader.assert_not_called()
+    pyav_open.assert_called_once_with(software_only=False)
+
+
+def test_missing_bridge_fails_closed(monkeypatch) -> None:
+    def missing(_name):
+        raise ImportError("no ABI-matched extension")
+
+    monkeypatch.setattr(module.importlib, "import_module", missing)
+    with pytest.raises(module.VideoDecodeError, match="ABI-matched"):
+        module._load_amf_interop_bridge()
+
+
+def test_bridge_missing_entrypoint_fails_closed(monkeypatch) -> None:
+    incomplete = SimpleNamespace(
+        inspect_amf_surface=lambda _frame: {},
+        copy_amf_surface_to_hip=lambda *_args: {},
+        get_transport_stats=lambda: {},
+        reset_transport_stats=lambda: None,
+    )
+    monkeypatch.setattr(module.importlib, "import_module", lambda _name: incomplete)
+    with pytest.raises(module.VideoDecodeError, match="AmfVulkanHipInteropSession"):
+        module._load_amf_interop_bridge()
+
+
+def test_resource_cache_defaults_off_and_true_is_explicit(monkeypatch) -> None:
+    assert module._amf_interop_resource_cache_enabled() is False
+    monkeypatch.setenv(module.AMF_INTEROP_RESOURCE_CACHE_ENV, "0")
+    assert module._amf_interop_resource_cache_enabled() is False
+    monkeypatch.setenv(module.AMF_INTEROP_RESOURCE_CACHE_ENV, "true")
+    assert module._amf_interop_resource_cache_enabled() is True
+
+
+def test_explicit_decoder_owns_amf_surfaces_and_tolerates_missing_timing(monkeypatch) -> None:
+    reader = _reader(
+        _metadata(codec="hevc", profile="main", pixel_format="yuv420p"),
+        1,
+    )
+    decoder = SimpleNamespace(options={}, open=MagicMock())
+    hwaccel = MagicMock()
+    monkeypatch.setattr(module, "HWAccel", hwaccel)
+    monkeypatch.setattr(
+        module.av,
+        "CodecContext",
+        SimpleNamespace(create=MagicMock(return_value=decoder)),
+    )
+    source = SimpleNamespace(
+        name="hevc_amf",
+        extradata=b"header",
+        width=16,
+        height=16,
+        framerate=None,
+        sample_aspect_ratio=None,
+        thread_type=None,
+    )
+
+    reader._setup_amf_decoder(source, fail_closed=True)
+
+    assert hwaccel.call_args.kwargs["is_hw_owned"] is True
+    assert module.av.CodecContext.create.call_args.args[:2] == ("hevc_amf", "r")
+    # Keep FFmpeg's -1 default so the fixed runtime derives its 36-surface AMF
+    # decode pool.  Overriding this with zero deadlocks when a B8 reader holds
+    # all eight AVHWFrames surfaces while requesting the next decoded frame.
+    assert "surface_pool_size" not in decoder.options
+    decoder.open.assert_called_once_with(strict=False)
+
+
+def test_explicit_cache_enable_fails_closed_before_loading_bridge(monkeypatch) -> None:
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    monkeypatch.setenv(module.AMF_INTEROP_RESOURCE_CACHE_ENV, "1")
+    loader = MagicMock(side_effect=AssertionError("cache must fail before load"))
+    monkeypatch.setattr(module, "_load_amf_interop_bridge", loader)
+    reader = _reader(_metadata(), 1)
+
+    with pytest.raises(module.VideoDecodeError, match="not implemented"):
+        reader._open_amf_interop_backend()
+    loader.assert_not_called()
+
+
+def test_uploader_rejects_non_native_amf_frame_before_copy(monkeypatch) -> None:
+    metadata = _metadata()
+    copy = MagicMock()
+    uploader = module.AmfInteropUploader(
+        file="input.mp4",
+        batch_size=1,
+        device=torch.device("cpu"),
+        metadata=metadata,
+        height=16,
+        width=16,
+        full_range=False,
+        audit=SimpleNamespace(copy_to_hip=copy),
+    )
+    monkeypatch.setattr(module, "YuvToRgbConverter", MagicMock())
+    frame = SimpleNamespace(
+        format=SimpleNamespace(name="cuda"),
+        sw_format=SimpleNamespace(name="nv12"),
+        width=16,
+        height=16,
+        pts=0,
+    )
+
+    with pytest.raises(module.VideoDecodeError, match="native AMF Vulkan"):
+        list(uploader.frames(iter(()), [frame]))
+    copy.assert_not_called()
+
+
+def test_uploader_releases_old_amf_surfaces_before_reading_next_group(monkeypatch) -> None:
+    class _TrackedAmfFrame:
+        format = SimpleNamespace(name="amf")
+        sw_format = SimpleNamespace(name="nv12")
+        width = 16
+        height = 16
+
+        def __init__(self, pts: int, released: list[int]) -> None:
+            self.pts = pts
+            self._released = released
+
+        def __del__(self) -> None:
+            self._released.append(self.pts)
+
+    class _Stream:
+        def __init__(self) -> None:
+            self.synchronize_calls = 0
+
+        def synchronize(self) -> None:
+            self.synchronize_calls += 1
+
+    class _NextGroup:
+        def __init__(self, prior_frame, stream: _Stream, released: list[int]) -> None:
+            self._prior_frame = prior_frame
+            self._stream = stream
+            self._released = released
+            self._calls = 0
+
+        @property
+        def calls(self) -> int:
+            return self._calls
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self._calls += 1
+            if self._calls == 1:
+                assert self._stream.synchronize_calls == 1
+                gc.collect()
+                assert self._prior_frame() is None
+                assert self._released == [0]
+                return _TrackedAmfFrame(1, self._released)
+            raise StopIteration
+
+    def _initial_group(released: list[int]):
+        frame = _TrackedAmfFrame(0, released)
+        return [frame], weakref.ref(frame)
+
+    released: list[int] = []
+    group, first_frame = _initial_group(released)
+    stream = _Stream()
+    decoded = _NextGroup(first_frame, stream, released)
+    uploader = module.AmfInteropUploader(
+        file="input.mp4",
+        batch_size=1,
+        device=torch.device("cpu"),
+        metadata=_metadata(),
+        height=16,
+        width=16,
+        full_range=False,
+        audit=SimpleNamespace(copy_to_hip=lambda *_args: _safe_copy_result()),
+    )
+    monkeypatch.setattr(module, "current_stream", lambda _device: stream)
+    monkeypatch.setattr(module, "YuvToRgbConverter", MagicMock())
+
+    batches = uploader.frames(iter(decoded), group)
+    del group
+    batch, pts = next(batches)
+    assert batch.shape == (1, 3, 16, 16)
+    assert pts == [0]
+    assert first_frame() is None
+    assert released == [0]
+    assert decoded.calls == 0
+    del batch
+    batch, pts = next(batches)
+    assert batch.shape == (1, 3, 16, 16)
+    assert pts == [1]
+    assert decoded.calls == 1
+    batches.close()
+
+
+class _IdentitySession:
+    def __init__(self, *, close_error: BaseException | None = None) -> None:
+        self.closed = False
+        self.close_error = close_error
+
+    def close(self) -> None:
+        if self.close_error is not None:
+            raise self.close_error
+        self.closed = True
+
+    def stats(self) -> dict[str, object]:
+        return {
+            "cache_entries": 0,
+            "closed": self.closed,
+        }
+
+
+def _safe_inspection(*, device: int = 41, frames_context: int = 11) -> dict[str, object]:
+    return {
+        "memory_type": "vulkan",
+        "vulkan": {"memory": 31, "device": device},
+        "fixed_context": {
+            "frames_context": frames_context,
+            "amf_context": 21,
+            "vulkan_device": device,
+        },
+    }
+
+
+def _safe_copy_result(**overrides) -> dict[str, object]:
+    result: dict[str, object] = {
+        "width": 16,
+        "height": 16,
+        "bytes_per_sample": 1,
+        "vulkan_export_fd_close_calls": 1,
+        "vulkan_export_fd_close_result": 0,
+        "vulkan_export_fd_close_errno": 0,
+        "hip_result": 0,
+        "hip_free_result": 0,
+        "hip_destroy_result": 0,
+        "d2d_plane_copies": 2,
+        "decode_source_release_hip_stream_synchronize_calls": 1,
+        "decode_source_release_hip_stream_synchronize_result": 0,
+        "copy_synchronization": "null-stream-source-release",
+        "fixed_context_bound": True,
+    }
+    result.update(overrides)
+    return result
+
+
+def _audit(*, inspect=None, copy=None, session=None, process_stats=None):
+    return module._AmfInteropTransportAudit(
+        inspect_amf_surface=inspect or (lambda _frame: _safe_inspection()),
+        copy_amf_surface_to_hip=copy or (lambda *_args: _safe_copy_result()),
+        get_transport_stats=process_stats or (lambda: {}),
+        identity_session=session or _IdentitySession(),
+        device=torch.device("cpu"),
+    )
+
+
+def test_explicit_open_fails_closed_when_session_copy_is_missing(monkeypatch) -> None:
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    session = _IdentitySession()
+    bridge = SimpleNamespace(
+        inspect_amf_surface=lambda _frame: _safe_inspection(),
+        copy_amf_surface_to_hip=lambda *_args: _safe_copy_result(),
+        get_transport_stats=lambda: {},
+        AmfVulkanHipInteropSession=lambda _purpose: session,
+    )
+    reader = _reader(_metadata(), 1)
+    pyav_open = MagicMock()
+    monkeypatch.setattr(module, "_load_amf_interop_bridge", lambda: bridge)
+    monkeypatch.setattr(reader, "_open_pyav", pyav_open)
+
+    with pytest.raises(module.VideoDecodeError, match="copy_amf_surface_to_hip"):
+        reader._open_amf_interop_backend()
+
+    assert session.closed is True
+    pyav_open.assert_not_called()
+
+
+def test_explicit_open_uses_session_bound_copy_not_top_level_bridge(monkeypatch) -> None:
+    class _SessionWithBoundCopy(_IdentitySession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.copy_calls = []
+
+        def copy_amf_surface_to_hip(self, *args):
+            self.copy_calls.append(args)
+            return _safe_copy_result()
+
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    session = _SessionWithBoundCopy()
+    top_level_copy = MagicMock(side_effect=AssertionError("top-level copy used"))
+    bridge = SimpleNamespace(
+        inspect_amf_surface=lambda _frame: _safe_inspection(),
+        copy_amf_surface_to_hip=top_level_copy,
+        get_transport_stats=lambda: {},
+        AmfVulkanHipInteropSession=lambda _purpose: session,
+    )
+    reader = _reader(_metadata(), 1)
+    pyav_open = MagicMock()
+    monkeypatch.setattr(module, "_load_amf_interop_bridge", lambda: bridge)
+    monkeypatch.setattr(reader, "_open_pyav", pyav_open)
+
+    reader._open_amf_interop_backend()
+    audit = reader._amf_interop_audit
+    assert audit is not None
+    frame = object()
+    audit.copy_to_hip(frame, 123, 456)
+    reader._close_amf_interop_backend()
+
+    pyav_open.assert_called_once_with(software_only=False, amf_interop=True)
+    assert session.copy_calls == [(frame, 123, 456, 0)]
+    top_level_copy.assert_not_called()
+    assert session.closed is True
+
+
+@pytest.mark.parametrize(
+    "counter",
+    [
+        "host_frame_transfers",
+        "cpu_map_calls",
+        "staging_copy_calls",
+        "d2h_copy_calls",
+        "hip_non_d2d_copy_calls",
+        "av_hwframe_transfer_data_calls",
+        "failed_bridge_copies",
+    ],
+)
+def test_transport_audit_rejects_host_or_non_d2d_counters(counter: str) -> None:
+    audit = _audit(copy=lambda *_args: _safe_copy_result(**{counter: 1}))
+    with pytest.raises(module.VideoDecodeError, match="non-native transport"):
+        audit.copy_to_hip(object(), 1, 128)
+    assert audit.snapshot()["copy_to_hip_failures"] == 1
+
+
+def test_transport_audit_rejects_bridge_failed_copy() -> None:
+    audit = _audit(copy=lambda *_args: _safe_copy_result(hip_result=700))
+    with pytest.raises(module.VideoDecodeError, match="did not prove"):
+        audit.copy_to_hip(object(), 1, 128)
+    assert audit.snapshot()["copy_to_hip_failures"] == 1
+
+
+@pytest.mark.parametrize(
+    "fd_telemetry",
+    [
+        {"vulkan_export_fd_close_calls": 0},
+        {
+            "vulkan_export_fd_close_result": -1,
+            "vulkan_export_fd_close_errno": 5,
+        },
+    ],
+)
+def test_transport_audit_rejects_unbalanced_vulkan_export_fd(
+    fd_telemetry: dict[str, int],
+) -> None:
+    audit = _audit(
+        copy=lambda *_args: _safe_copy_result(**fd_telemetry)
+    )
+    with pytest.raises(module.VideoDecodeError, match="did not prove"):
+        audit.copy_to_hip(object(), 1, 128)
+    assert audit.snapshot()["copy_to_hip_failures"] == 1
+
+
+def test_transport_audit_rejects_copy_without_fixed_context_binding() -> None:
+    audit = _audit(copy=lambda *_args: _safe_copy_result(fixed_context_bound=False))
+    with pytest.raises(module.VideoDecodeError, match="did not prove"):
+        audit.copy_to_hip(object(), 1, 128)
+    assert audit.snapshot()["copy_to_hip_failures"] == 1
+
+
+def test_transport_audit_rejects_failed_copy_counter_from_bridge() -> None:
+    audit = _audit(process_stats=lambda: {"failed_bridge_copies": 1})
+    with pytest.raises(module.VideoDecodeError, match="non-native transport"):
+        audit.copy_to_hip(object(), 1, 128)
+    assert audit.snapshot()["copy_to_hip_failures"] == 1
+
+
+def test_transport_audit_rejects_fixed_context_change() -> None:
+    inspections = iter([_safe_inspection(device=41), _safe_inspection(device=42)])
+    audit = _audit(inspect=lambda _frame: next(inspections))
+    audit.copy_to_hip(object(), 1, 128)
+    with pytest.raises(module.VideoDecodeError, match="identity changed"):
+        audit.copy_to_hip(object(), 2, 128)
+
+
+@pytest.mark.parametrize("field", ["frames_context", "amf_context", "vulkan_device"])
+def test_transport_audit_rejects_null_fixed_context_identity(field: str) -> None:
+    inspection = _safe_inspection()
+    inspection["fixed_context"][field] = 0
+    audit = _audit(inspect=lambda _frame: inspection)
+    with pytest.raises(module.VideoDecodeError, match="non-null AMF context"):
+        audit.copy_to_hip(object(), 1, 128)
+
+
+def test_transport_audit_balances_create_close_and_per_frame_resources() -> None:
+    session = _IdentitySession()
+    audit = _audit(session=session)
+    audit.copy_to_hip(object(), 1, 128)
+    audit.copy_to_hip(object(), 2, 128)
+    audit.close()
+    stats = audit.validate_closed()
+
+    assert session.closed is True
+    assert stats["fixed_context_session_create_calls"] == 1
+    assert stats["fixed_context_session_close_calls"] == 1
+    assert stats["vulkan_memory_exports"] == 2
+    assert stats["hip_external_memory_destroys"] == 2
+    assert stats["hip_d2d_plane_copies"] == 4
+
+
+def test_transport_audit_does_not_swallow_session_close_failure() -> None:
+    audit = _audit(session=_IdentitySession(close_error=RuntimeError("native close failed")))
+    with pytest.raises(RuntimeError, match="native close failed"):
+        audit.close()
+    assert audit.snapshot()["fixed_context_session_close_failures"] == 1
