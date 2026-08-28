@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""Atomically install one accepted PyAV/FFmpeg runtime artifact."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import sys
+import tempfile
+import time
+import zipfile
+from dataclasses import dataclass
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+from jasna import runtime_contract  # noqa: E402
+
+
+@dataclass(frozen=True)
+class InstallResult:
+    target_root: Path
+    backup_root: Path | None
+
+
+def _find_single(directory: Path, pattern: str, label: str) -> Path:
+    matches = sorted(path for path in directory.glob(pattern) if path.is_file())
+    if len(matches) != 1:
+        raise runtime_contract.RuntimeContractError(
+            f"{label} must resolve to exactly one file below {directory}; "
+            f"observed {len(matches)}"
+        )
+    return matches[0]
+
+
+def _require_hash(path: Path, expected: str, label: str) -> None:
+    if not path.is_file():
+        raise runtime_contract.RuntimeContractError(f"{label} is missing: {path}")
+    actual = runtime_contract.sha256_file(path)
+    if actual != expected:
+        raise runtime_contract.RuntimeContractError(
+            f"{label} SHA256 mismatch: expected {expected}, observed {actual}"
+        )
+
+
+def _copy_contents(source: Path, destination: Path) -> None:
+    if not source.is_dir():
+        raise runtime_contract.RuntimeContractError(
+            f"runtime source directory is missing: {source}"
+        )
+    shutil.copytree(source, destination, dirs_exist_ok=True, symlinks=True)
+
+
+def _extract_wheel(wheel: Path, destination: Path) -> None:
+    destination_root = destination.resolve()
+    with zipfile.ZipFile(wheel) as archive:
+        for member in archive.infolist():
+            member_path = Path(member.filename)
+            if member_path.is_absolute() or ".." in member_path.parts:
+                raise runtime_contract.RuntimeContractError(
+                    f"PyAV wheel contains an unsafe path: {member.filename!r}"
+                )
+            extracted = (destination / member_path).resolve(strict=False)
+            if not extracted.is_relative_to(destination_root):
+                raise runtime_contract.RuntimeContractError(
+                    f"PyAV wheel path escapes site-packages: {member.filename!r}"
+                )
+        archive.extractall(destination)
+
+
+def _require_contained_symlinks(root: Path) -> None:
+    resolved_root = root.resolve()
+    for path in root.rglob("*"):
+        if not path.is_symlink():
+            continue
+        resolved = path.resolve(strict=False)
+        if not resolved.is_relative_to(resolved_root):
+            raise runtime_contract.RuntimeContractError(
+                f"runtime symlink escapes the installation: {path} -> {resolved}"
+            )
+
+
+def _validate_target_root(
+    requested_target: Path,
+    *,
+    build_root: Path,
+    repo_root: Path,
+) -> Path:
+    if requested_target.is_symlink():
+        raise runtime_contract.RuntimeContractError(
+            f"target runtime must not be a symlink: {requested_target}"
+        )
+    target = requested_target.resolve(strict=False)
+    filesystem_root = Path(target.anchor)
+    home = Path.home().resolve()
+    if target in {filesystem_root, home, build_root, repo_root}:
+        raise runtime_contract.RuntimeContractError(
+            f"refusing unsafe runtime target: {target}"
+        )
+    if build_root.is_relative_to(target) or target.is_relative_to(build_root):
+        raise runtime_contract.RuntimeContractError(
+            "runtime target must not contain or be contained by the build root"
+        )
+    if repo_root.is_relative_to(target) or target.is_relative_to(repo_root):
+        raise runtime_contract.RuntimeContractError(
+            "runtime target must not contain or be contained by the repository"
+        )
+    if home.is_relative_to(target):
+        raise runtime_contract.RuntimeContractError(
+            f"runtime target must not contain the user home: {target}"
+        )
+    return target
+
+
+def _next_backup_path(target_root: Path) -> Path:
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    base = target_root.with_name(f"{target_root.name}.backup-{timestamp}")
+    candidate = base
+    counter = 1
+    while candidate.exists() or candidate.is_symlink():
+        candidate = base.with_name(f"{base.name}-{counter}")
+        counter += 1
+    return candidate
+
+
+def install_runtime(args: argparse.Namespace) -> InstallResult:
+    platform_key = runtime_contract.runtime_platform_key(args.platform)
+    policy = runtime_contract.RUNTIME_POLICIES[platform_key]
+    build_root = Path(args.build_root).expanduser().resolve()
+    repo_root = Path(args.repo_root).expanduser().resolve()
+    requested_target = Path(args.target_root).expanduser()
+    target_root = _validate_target_root(
+        requested_target,
+        build_root=build_root,
+        repo_root=repo_root,
+    )
+    build_manifest = runtime_contract.parse_build_manifest(
+        build_root / "build-manifest.txt"
+    )
+
+    expected_pins = {
+        **runtime_contract.EXPECTED_SOURCE_PINS,
+        **policy.extra_source_pins,
+    }
+    for name, expected in expected_pins.items():
+        actual = build_manifest.get(name)
+        if actual != expected:
+            raise runtime_contract.RuntimeContractError(
+                f"{name}: expected accepted pin {expected}, observed {actual!r}"
+            )
+
+    wheel = _find_single(build_root / "wheels", "av-*.whl", "PyAV wheel")
+    _require_hash(wheel, policy.wheel_sha256, "PyAV wheel")
+
+    if (target_root.exists() or target_root.is_symlink()) and not args.force:
+        raise runtime_contract.RuntimeContractError(
+            f"target runtime already exists: {target_root}; use --force to replace it"
+        )
+
+    target_root.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(
+            prefix=f".{target_root.name}.staging-",
+            dir=target_root.parent,
+        )
+    )
+    backup_root: Path | None = None
+    try:
+        site_packages = staging / "site-packages"
+        site_packages.mkdir()
+        _extract_wheel(wheel, site_packages)
+
+        ffmpeg_install = build_root / "ffmpeg-install"
+        _copy_contents(ffmpeg_install / "bin", staging / "bin")
+        if platform_key == "linux-amd":
+            _copy_contents(ffmpeg_install / "lib", staging / "lib")
+        _require_contained_symlinks(staging)
+
+        source_pins = {name: build_manifest[name] for name in expected_pins}
+        runtime_manifest: dict[str, object] = {
+            "schema_version": runtime_contract.RUNTIME_SCHEMA_VERSION,
+            "platform": platform_key,
+            "installed_unix_seconds": time.time(),
+            "source_build_root": str(build_root),
+            "repo_root": str(repo_root),
+            "source_pins": source_pins,
+            "wheel_filename": wheel.name,
+            "wheel_sha256": runtime_contract.sha256_file(wheel),
+            "product_defaults": {"batch_size": 4},
+        }
+        (staging / "runtime.json").write_text(
+            json.dumps(runtime_manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        runtime_contract.validate_runtime_layout(staging, platform=args.platform)
+
+        if target_root.exists():
+            backup_root = _next_backup_path(target_root)
+            target_root.replace(backup_root)
+        try:
+            staging.replace(target_root)
+        except Exception:
+            if backup_root is not None and not target_root.exists():
+                backup_root.replace(target_root)
+            raise
+        return InstallResult(target_root=target_root, backup_root=backup_root)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--build-root", required=True)
+    parser.add_argument("--repo-root", default=str(REPO_ROOT))
+    parser.add_argument(
+        "--target-root",
+        default=str(runtime_contract.default_runtime_root()),
+    )
+    parser.add_argument("--platform", default=sys.platform)
+    parser.add_argument("--force", action="store_true")
+    return parser
+
+
+def main() -> int:
+    try:
+        result = install_runtime(build_parser().parse_args())
+    except (
+        OSError,
+        KeyError,
+        ValueError,
+        runtime_contract.RuntimeContractError,
+        zipfile.BadZipFile,
+    ) as exc:
+        print(f"Unified runtime installation failed: {exc}", file=sys.stderr)
+        return 1
+    print(result.target_root)
+    if result.backup_root is not None:
+        print(f"Previous runtime preserved at: {result.backup_root}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
