@@ -54,6 +54,7 @@ class TestProcessorPullLoop:
     def test_processes_jobs_in_order_by_status(self):
         processed_ids: list[int] = []
         p = Processor()
+        p._validate_completed_video_output = MagicMock()
         jobs = _make_jobs("a.mp4", "b.mp4", "c.mp4")
 
         def fake_pipeline(job_id, inp, out):
@@ -75,6 +76,7 @@ class TestProcessorPullLoop:
     def test_skips_removed_pending_job(self):
         processed_ids: list[int] = []
         p = Processor()
+        p._validate_completed_video_output = MagicMock()
         jobs = _make_jobs("a.mp4", "b.mp4", "c.mp4")
 
         call_count = [0]
@@ -103,6 +105,7 @@ class TestProcessorPullLoop:
     def test_progress_update_carries_job_id(self):
         updates: list[ProgressUpdate] = []
         p = Processor(on_progress=lambda u: updates.append(u))
+        p._validate_completed_video_output = MagicMock()
         jobs = _make_jobs("a.mp4")
 
         with patch.object(p, "_run_pipeline"):
@@ -122,6 +125,7 @@ class TestProcessorPullLoop:
     def test_reorder_during_processing_respects_new_order(self):
         processed_filenames: list[str] = []
         p = Processor()
+        p._validate_completed_video_output = MagicMock()
         jobs = _make_jobs("a.mp4", "b.mp4", "c.mp4")
 
         call_count = [0]
@@ -152,6 +156,7 @@ class TestProcessorPullLoop:
     def test_runs_post_export_action_after_queue_completes(self):
         calls: list[tuple[str, str]] = []
         p = Processor()
+        p._validate_completed_video_output = MagicMock()
         jobs = _make_jobs("a.mp4")
 
         with (
@@ -183,6 +188,7 @@ class TestProcessorPullLoop:
     def test_runs_post_export_video_command_after_each_video(self, tmp_path):
         calls: list[tuple[str, Path, Path]] = []
         p = Processor()
+        p._validate_completed_video_output = MagicMock()
         jobs = _make_jobs(str(tmp_path / "a.mp4"), str(tmp_path / "b.mp4"))
 
         with (
@@ -219,6 +225,7 @@ class TestProcessorPullLoop:
 
     def test_post_export_video_command_failure_marks_job_error_and_continues(self, tmp_path):
         p = Processor()
+        p._validate_completed_video_output = MagicMock()
         jobs = _make_jobs(str(tmp_path / "a.mp4"), str(tmp_path / "b.mp4"))
 
         def run_command(_command, _input_path, output_path, _cancel):
@@ -268,6 +275,7 @@ class TestProcessorPullLoop:
         (tmp_path / "clip_restored.mp4").touch()
         command = MagicMock()
         p = Processor()
+        p._validate_completed_video_output = MagicMock()
         jobs = _make_jobs(str(tmp_path / "clip.mp4"))
 
         with (
@@ -291,6 +299,7 @@ class TestProcessorPullLoop:
     def test_per_video_and_queue_wide_actions_both_run(self, tmp_path):
         calls: list[str] = []
         p = Processor()
+        p._validate_completed_video_output = MagicMock()
         jobs = _make_jobs(str(tmp_path / "clip.mp4"))
 
         with (

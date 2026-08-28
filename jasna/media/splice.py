@@ -206,6 +206,49 @@ def _fsync_directory(path: Path) -> None:
         os.close(directory_fd)
 
 
+def sync_and_validate_final_output(
+    path: str | Path,
+    *,
+    source: str | Path | None = None,
+    expected_codec: str | None = None,
+    expected_duration: float | None = None,
+) -> None:
+    """Validate an output before and after the filesystem durability barriers."""
+
+    output = Path(path)
+    validate_video_output(
+        output,
+        source=source,
+        expected_codec=expected_codec,
+        expected_duration=expected_duration,
+    )
+    _fsync_file(output)
+    _fsync_directory(output.parent)
+    validate_video_output(
+        output,
+        source=source,
+        expected_codec=expected_codec,
+        expected_duration=expected_duration,
+    )
+
+
+def commit_video_output(
+    temporary: Path,
+    destination: Path,
+    *,
+    source: Path,
+    codec: str,
+) -> None:
+    """Durably publish a structurally valid video from a same-directory staging path."""
+
+    validate_video_output(temporary, source=source, expected_codec=codec)
+    _fsync_file(temporary)
+    os.replace(temporary, destination)
+    _fsync_file(destination)
+    _fsync_directory(destination.parent)
+    validate_video_output(destination, source=source, expected_codec=codec)
+
+
 def _commit_smart_output(
     temporary: Path,
     destination: Path,
@@ -213,12 +256,14 @@ def _commit_smart_output(
     source: Path,
     codec: str,
 ) -> None:
-    validate_video_output(temporary, source=source, expected_codec=codec)
-    _fsync_file(temporary)
-    os.replace(temporary, destination)
-    _fsync_file(destination)
-    _fsync_directory(destination.parent)
-    validate_video_output(destination, source=source, expected_codec=codec)
+    """Backward-compatible Smart Render wrapper around the generic commit."""
+
+    commit_video_output(
+        temporary,
+        destination,
+        source=source,
+        codec=codec,
+    )
 
 
 @dataclass(frozen=True)
