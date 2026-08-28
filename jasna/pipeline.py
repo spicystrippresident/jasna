@@ -18,7 +18,7 @@ import torch
 
 from jasna.accelerator import vendor_for_device
 from jasna.media import UnsupportedColorspaceError, get_video_meta_data
-from jasna.media.video_encoder import NvidiaVideoEncoder
+from jasna.media.video_encoder import NvidiaVideoEncoder, resolve_hevc_smart_render_vui
 from jasna.media.frame_rate import resolve_frame_rate_retarget
 from jasna.media.splice import (
     SplicePlan,
@@ -646,6 +646,8 @@ class Pipeline:
             ) as temp_dir_name:
                 temp_dir = Path(temp_dir_name)
                 fragments: list[tuple[Path, float]] = []
+                render_metadata = None
+                render_output_fps = None
                 fragment_suffix = ".ts" if codec in {"h264", "hevc"} else ".mkv"
                 for span_index, span in enumerate(plan.spans):
                     if self._cancel_event.is_set():
@@ -654,15 +656,22 @@ class Pipeline:
                     normalized = temp_dir / f"{span_index:04d}{fragment_suffix}"
                     duration = float((span.end_pts - span.start_pts) * index.time_base)
                     if span.is_render:
+                        if render_metadata is None:
+                            render_metadata = metadata
+                            render_output_fps = metadata.video_fps_exact
+                            if codec == "hevc":
+                                render_metadata, render_output_fps = (
+                                    resolve_hevc_smart_render_vui(metadata)
+                                )
                         encoder_ctx = NvidiaVideoEncoder(
                             str(raw),
                             device=self.device,
-                            metadata=metadata,
+                            metadata=render_metadata,
                             codec=codec,
                             encoder_settings=smart_encoder_settings,
                             lut_path=self.lut_path,
                             sharpen_strength=self.sharpen_strength,
-                            output_fps=metadata.video_fps_exact,
+                            output_fps=render_output_fps,
                             mux_audio=False,
                             pts_origin=span.start_pts,
                             match_input_bit_depth=True,
