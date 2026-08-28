@@ -28,6 +28,7 @@ commit。校验失败时启动器直接退出，不回退到系统 PyAV、系统
 runtime-root/
 ├── runtime.json
 ├── site-packages/av/
+├── bridge/             # Linux AMD AMF Vulkan/HIP extension
 ├── bin/ffmpeg[.exe]
 ├── bin/ffprobe[.exe]
 └── lib/                 # Linux；Windows DLL 位于 bin/
@@ -76,9 +77,15 @@ scripts\run_jasna_unified_windows.ps1 -- <jasna 参数>
 成功预检会在用户状态目录记录 `jasna/runtime-preflight.json`；状态目录不可写不会改变已通过的
 runtime 结论。
 
+Linux runtime 的 manifest 还固定 bridge 文件名、二进制 SHA-256 与 bridge source
+SHA-256。启动器把 `bridge/` 放在仓库源码之前，并在 preflight 中验证 extension 从所选
+runtime 加载且具有 surface inspection、dependency probe 和 fixed-context session
+入口。Windows runtime 不包含这个 Linux-only extension。
+
 ## 边界与回滚
 
 - 不自动修改当前 shell 的 `PATH`、`PYTHONPATH` 或 `LD_LIBRARY_PATH`；只构造 Jasna 子进程环境。
-- 不接入 AMF Vulkan/HIP bridge、MIGraphX、rocDecode 或产品 GUI 自动启动。
+- 不接入 MIGraphX、rocDecode 或产品 GUI 自动启动；Linux AMF bridge 只作为已校验的
+  runtime ABI 组件随子进程加载，解码路由仍由独立 PR 决定。
 - 不修改 B4、CQ、codec、VR auto 或任何媒体路由默认值。
 - 回滚本功能只需停止使用 `scripts/run_jasna_unified*`；普通 `python -m jasna` 行为未改变。

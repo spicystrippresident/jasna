@@ -10,8 +10,9 @@
 - Windows：`scripts/build_unified_ffmpeg_pyav_windows.ps1`
 
 它们只从固定源码构建一组共享 FFmpeg 库、`ffmpeg`/`ffprobe` 和 PyAV wheel，并写出
-`build-manifest.txt`。它们不会安装 runtime、不会改变默认解码/编码路由，也不会接入
-AMF bridge、MIGraphX、Smart Render 或 GUI。
+`build-manifest.txt`。Linux 构建器还会针对同一 PyAV/FFmpeg ABI 构建 AMF Vulkan/HIP
+bridge；它不会安装 runtime、不会改变默认解码/编码路由，也不会接入 MIGraphX、
+Smart Render 或 GUI。
 
 已有的 `jasna.runtime_contract` 和 `scripts/install_unified_runtime.py` 是单独的责任：前者
 定义可接受 runtime，后者只安装已经通过其 pin 与哈希检查的构建产物。本流水线与安装器
@@ -79,6 +80,8 @@ Vulkan headers。默认会查找 `/usr/include/vulkan/vulkan.h`；如 headers �
 ```text
 unified-linux/
 ├── build-manifest.txt
+├── amf-interop-bridge/
+│   └── _jasna_amf_surface_probe.<python-soabi>.so
 ├── ffmpeg-install/
 │   ├── bin/ffmpeg
 │   ├── bin/ffprobe
@@ -86,6 +89,11 @@ unified-linux/
 └── wheels/
     └── av-*.whl
 ```
+
+Linux bridge 使用同一个 PyAV source、FFmpeg install、AMF/Vulkan headers 与指定的 ROCm
+headers 构建。默认 ROCm include 是 `/opt/rocm/include`，也可用 `--rocm-include` 显式
+覆盖。manifest 同时记录 bridge 二进制和 `scripts/amf_surface_probe.pyx` 的 SHA-256；
+安装器会再次校验二进制、源码和当前 Python SOABI。
 
 构建成功不等同于 runtime 已接受。只有当 wheel 和 FFmpeg 文件哈希也符合现有 runtime
 合同的白名单时，才可把同一输出目录交给已有安装器，例如：

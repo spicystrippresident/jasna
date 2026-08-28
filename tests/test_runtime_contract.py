@@ -52,6 +52,7 @@ def test_validate_runtime_layout_checks_pins_and_every_file_hash(
     runtime_root = tmp_path / "runtime"
     executable_payload = b"ffmpeg"
     library_payload = b"libavcodec"
+    bridge_payload = b"amf-bridge"
     wheel_hash = _sha256(b"wheel")
     policy = runtime_contract.RuntimePolicy(
         wheel_sha256=wheel_hash,
@@ -67,6 +68,9 @@ def test_validate_runtime_layout_checks_pins_and_every_file_hash(
     (runtime_root / "bin/ffmpeg").write_bytes(executable_payload)
     (runtime_root / "lib").mkdir()
     (runtime_root / "lib/libavcodec.so").write_bytes(library_payload)
+    (runtime_root / "bridge").mkdir()
+    bridge_filename = "_jasna_amf_surface_probe.cpython-test.so"
+    (runtime_root / "bridge" / bridge_filename).write_bytes(bridge_payload)
     (runtime_root / "runtime.json").write_text(
         json.dumps(
             {
@@ -74,6 +78,11 @@ def test_validate_runtime_layout_checks_pins_and_every_file_hash(
                 "platform": "linux-amd",
                 "wheel_sha256": wheel_hash,
                 "source_pins": dict(runtime_contract.EXPECTED_SOURCE_PINS),
+                "amf_interop_bridge": {
+                    "filename": bridge_filename,
+                    "sha256": _sha256(bridge_payload),
+                    "source_sha256": _sha256(b"bridge-source"),
+                },
             }
         ),
         encoding="utf-8",
@@ -135,6 +144,7 @@ def test_build_runtime_environment_drops_ambient_native_python_paths(
 
     assert environment["PYTHONPATH"].split(os.pathsep) == [
         str(runtime_root / "site-packages"),
+        str(runtime_root / "bridge"),
         str(repo_root),
     ]
     assert "/stale/pyav" not in environment["PYTHONPATH"]

@@ -17,7 +17,8 @@ Usage:
   build_unified_ffmpeg_pyav_ubuntu.sh \
     --ffmpeg-source PATH --pyav-source PATH --amf-source PATH \
     --output-root PATH [--python PYTHON] [--jobs N] \
-    [--vulkan-headers PATH] [--apply-frames-context-fix] \
+    [--vulkan-headers PATH] [--rocm-include PATH] \
+    [--apply-frames-context-fix] \
     [--apply-dynamic-resolution-fix] \
     [--apply-spherical-metadata-patch]
 
@@ -43,6 +44,7 @@ pyav_source=
 amf_source=
 output_root=
 vulkan_headers=
+rocm_include=/opt/rocm/include
 apply_frames_context_fix=false
 apply_dynamic_resolution_fix=false
 apply_spherical_metadata_patch=false
@@ -79,6 +81,11 @@ while (($#)); do
     --vulkan-headers)
       require_option_value "$@"
       vulkan_headers=$2
+      shift 2
+      ;;
+    --rocm-include)
+      require_option_value "$@"
+      rocm_include=$2
       shift 2
       ;;
     --python)
@@ -209,6 +216,11 @@ fi
   printf '%s\n' 'Vulkan headers are required; pass --vulkan-headers PATH.' >&2
   exit 1
 }
+rocm_include=$(realpath "$rocm_include")
+[[ -f $rocm_include/hip/hip_runtime_api.h ]] || {
+  printf 'ROCm HIP headers were not found below %s\n' "$rocm_include" >&2
+  exit 1
+}
 
 extra_cflags="-I$amf_include -I$vulkan_include"
 build_dir=$output_root/ffmpeg-build
@@ -277,6 +289,24 @@ wheel=$(find "$pyav_source/dist" -maxdepth 1 -type f -name 'av-*.whl' \
 cp -f "$wheel" "$wheel_dir/"
 copied_wheel=$wheel_dir/$(basename "$wheel")
 
+bridge_dir=$output_root/amf-interop-bridge
+"$python" "$repo_root/scripts/build_amf_surface_probe.py" \
+  --pyav-source "$pyav_source" \
+  --amf-include "$amf_include" \
+  --ffmpeg-include "$install_dir/include" \
+  --ffmpeg-lib "$install_dir/lib" \
+  --vulkan-include "$vulkan_include" \
+  --rocm-include "$rocm_include" \
+  --output-dir "$bridge_dir"
+mapfile -t bridges < <(find "$bridge_dir" -maxdepth 1 -type f \
+  -name '_jasna_amf_surface_probe.*.so' -print)
+if ((${#bridges[@]} != 1)); then
+  printf 'AMF interop bridge build produced %d extension modules below %s\n' \
+    "${#bridges[@]}" "$bridge_dir" >&2
+  exit 1
+fi
+bridge=${bridges[0]}
+
 cat >"$output_root/build-manifest.txt" <<EOF
 FFMPEG_COMMIT=$expected_ffmpeg
 PYAV_COMMIT=$expected_pyav
@@ -291,9 +321,12 @@ SPHERICAL_METADATA_PATCH_SHA256=$(sha256sum "$spherical_metadata_patch" | awk '{
 VULKAN_INCLUDE=$vulkan_include
 WHEEL=$copied_wheel
 WHEEL_SHA256=$(sha256sum "$copied_wheel" | awk '{print $1}')
+AMF_INTEROP_BRIDGE=$bridge
+AMF_INTEROP_BRIDGE_SHA256=$(sha256sum "$bridge" | awk '{print $1}')
+AMF_INTEROP_BRIDGE_SOURCE_SHA256=$(sha256sum "$repo_root/scripts/amf_surface_probe.pyx" | awk '{print $1}')
 FFMPEG_BIN=$install_dir/bin
 FFMPEG_LIB=$install_dir/lib
 EOF
 
-printf 'FFmpeg SDK: %s\nPyAV wheel: %s\nManifest: %s\n' \
-  "$install_dir" "$copied_wheel" "$output_root/build-manifest.txt"
+printf 'FFmpeg SDK: %s\nPyAV wheel: %s\nAMF bridge: %s\nManifest: %s\n' \
+  "$install_dir" "$copied_wheel" "$bridge" "$output_root/build-manifest.txt"

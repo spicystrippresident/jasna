@@ -57,7 +57,6 @@ def test_ubuntu_builder_keeps_patch_selection_narrow_and_idempotent() -> None:
     for forbidden in (
         "--enable-encode-probe",
         "EnableEncodeProbe",
-        "build_amf_surface_probe.py",
         "install_unified_runtime.py",
     ):
         assert forbidden not in script
@@ -91,10 +90,14 @@ def test_ubuntu_builder_enables_the_limited_amf_decode_surface_and_manifest() ->
         "DYNAMIC_RESOLUTION_FIX_APPLIED=$apply_dynamic_resolution_fix",
         "SPHERICAL_METADATA_PATCH_APPLIED=$apply_spherical_metadata_patch",
         "WHEEL_SHA256=",
+        "AMF_INTEROP_BRIDGE_SHA256=",
+        "AMF_INTEROP_BRIDGE_SOURCE_SHA256=",
         "FFMPEG_BIN=$install_dir/bin",
         "FFMPEG_LIB=$install_dir/lib",
     ):
         assert manifest_field in script
+    assert '"$repo_root/scripts/build_amf_surface_probe.py"' in script
+    assert "--rocm-include" in script
 
 
 def test_windows_builder_pins_and_packages_dav1d() -> None:

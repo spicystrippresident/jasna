@@ -155,6 +155,32 @@ def install_runtime(args: argparse.Namespace) -> InstallResult:
     wheel = _find_single(build_root / "wheels", "av-*.whl", "PyAV wheel")
     _require_hash(wheel, policy.wheel_sha256, "PyAV wheel")
 
+    bridge: Path | None = None
+    bridge_sha256: str | None = None
+    bridge_source_sha256: str | None = None
+    if platform_key == "linux-amd":
+        bridge = _find_single(
+            build_root / "amf-interop-bridge",
+            "_jasna_amf_surface_probe.*.so",
+            "AMF interop bridge",
+        )
+        bridge_sha256 = build_manifest.get("AMF_INTEROP_BRIDGE_SHA256")
+        bridge_source_sha256 = build_manifest.get(
+            "AMF_INTEROP_BRIDGE_SOURCE_SHA256"
+        )
+        if not bridge_sha256 or not bridge_source_sha256:
+            raise runtime_contract.RuntimeContractError(
+                "build manifest is missing AMF bridge hashes"
+            )
+        _require_hash(bridge, bridge_sha256, "AMF interop bridge")
+        source = repo_root / "scripts/amf_surface_probe.pyx"
+        _require_hash(source, bridge_source_sha256, "AMF interop bridge source")
+        if sys.implementation.cache_tag not in bridge.name:
+            raise runtime_contract.RuntimeContractError(
+                "AMF interop bridge Python ABI does not match this installer: "
+                f"{bridge.name} vs {sys.implementation.cache_tag}"
+            )
+
     if (target_root.exists() or target_root.is_symlink()) and not args.force:
         raise runtime_contract.RuntimeContractError(
             f"target runtime already exists: {target_root}; use --force to replace it"
@@ -177,6 +203,9 @@ def install_runtime(args: argparse.Namespace) -> InstallResult:
         _copy_contents(ffmpeg_install / "bin", staging / "bin")
         if platform_key == "linux-amd":
             _copy_contents(ffmpeg_install / "lib", staging / "lib")
+            assert bridge is not None
+            (staging / "bridge").mkdir()
+            shutil.copy2(bridge, staging / "bridge" / bridge.name)
         _require_contained_symlinks(staging)
 
         source_pins = {name: build_manifest[name] for name in expected_pins}
@@ -191,6 +220,12 @@ def install_runtime(args: argparse.Namespace) -> InstallResult:
             "wheel_sha256": runtime_contract.sha256_file(wheel),
             "product_defaults": {"batch_size": 4},
         }
+        if bridge is not None:
+            runtime_manifest["amf_interop_bridge"] = {
+                "filename": bridge.name,
+                "sha256": bridge_sha256,
+                "source_sha256": bridge_source_sha256,
+            }
         (staging / "runtime.json").write_text(
             json.dumps(runtime_manifest, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
