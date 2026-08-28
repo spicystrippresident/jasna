@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+import ast
+import inspect
+from pathlib import Path
+import textwrap
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
 import pytest
 
 from jasna.gui.mosaic_scan import (
@@ -7,6 +14,8 @@ from jasna.gui.mosaic_scan import (
     _ScanTensorCollector,
     scan_sample_stride,
     segments_from_scores,
+    MosaicScanWorker,
+    SCAN_SCORE_FLOOR,
 )
 from jasna.gui.segment_editor_state import SegmentEditorState
 from jasna.segments import SegmentRange
@@ -156,3 +165,71 @@ def test_segment_sample_indices_ownership():
     assert segment_sample_indices(times, 0.0, 10.0, is_last=False) == [0, 1]
     assert segment_sample_indices(times, 10.0, 20.0, is_last=True) == [2, 3]
     assert segment_sample_indices([5.0], 10.0, 20.0, is_last=True) == []
+
+
+def test_scan_and_preview_inherit_shared_auto_decoder_without_rocdecode_branch():
+    for method in (MosaicScanWorker._scan, MosaicScanWorker._detect_mask):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(method)))
+        reader_calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "NvidiaVideoReader"
+        ]
+        assert reader_calls
+        assert all(
+            keyword.arg != "decode_backend"
+            for call in reader_calls
+            for keyword in call.keywords
+        )
+        assert not any(
+            isinstance(node, ast.Name) and node.id.casefold() == "rocdecode"
+            for node in ast.walk(tree)
+        )
+
+
+def test_scan_detector_delegates_product_selection_to_shared_registry(monkeypatch):
+    import jasna.engine_compiler as compiler
+    import jasna.mosaic.detection_registry as registry
+    import jasna.vr180 as vr180
+
+    weights = Path("models/rfdetr-v6.pt")
+    detector = MagicMock()
+    build = MagicMock(return_value=detector)
+    compile_engines = MagicMock()
+    monkeypatch.setattr(compiler, "ensure_engines_compiled", compile_engines)
+    monkeypatch.setattr(registry, "coerce_detection_model_name", lambda _name: "rfdetr-v6")
+    monkeypatch.setattr(registry, "require_detection_model_weights", lambda _name: weights)
+    monkeypatch.setattr(registry, "build_detection_model", build)
+    monkeypatch.setattr(
+        vr180,
+        "resolve_vr_mode",
+        lambda *_args, **_kwargs: SimpleNamespace(is_sbs=False),
+    )
+    worker = MosaicScanWorker(
+        "input.mp4",
+        SimpleNamespace(),
+        SimpleNamespace(
+            detection_model="rfdetr-v6",
+            batch_size=4,
+            fp16_mode=True,
+            vr_mode="auto",
+        ),
+        stride_seconds=1.0,
+    )
+
+    assert worker._build_detector() is detector
+
+    request = compile_engines.call_args.args[0]
+    assert request.detection_model_name == "rfdetr-v6"
+    assert request.detection_batch_size == 4
+    assert request.fp16 is True
+    kwargs = build.call_args.kwargs
+    assert kwargs == {
+        "batch_size": 4,
+        "device": kwargs["device"],
+        "score_threshold": SCAN_SCORE_FLOOR,
+        "fp16": True,
+    }
+    assert "amd_migraphx_manifest_path" not in kwargs
