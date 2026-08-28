@@ -452,7 +452,7 @@ EN = {
         "tip_detection_score_threshold": "Default confidence required before marking an area for restoration.\nLower = detects more (may include false positives).\nHigher = detects less (may miss some).\n\nThe segment editor can override and remember this separately for each video.\n\nDefault: each model's recommended value (rfdetr-v6: 0.35, rfdetr-v6-large: 0.40)",
         "tip_codec": "Output video format.\nH.264 (AVC): plays everywhere, larger files.\nHEVC (H.265): excellent quality at smaller file sizes.\nAV1: best compression, needs newer players; encoding requires a recent NVIDIA GPU generation.",
         "tip_encoder_cq": "Video quality target (CQ). The displayed number is sent unchanged to the encoder; lower numbers give better quality but larger files. Jasna also limits output size, so nearby values can give the same result when that limit is reached.\nNVIDIA defaults: H.264 25, HEVC 28, AV1 35. Ranges: 1–51 for H.264/HEVC, 1–63 for AV1.\nAMD defaults: H.264 24, HEVC 25, AV1 32. Range: 0–51.",
-        "tip_encoder_custom_args": "Advanced encoder parameters as comma-separated key=value pairs.\nLeave empty unless you know what you're doing.\n\nExample: rc-lookahead=32",
+        "tip_encoder_custom_args": "Set the processing batch size with --batch-size 4 or --batch-size 8.\nThe default is B4 when left empty. Separate encoder key=value parameters with commas.\n\nExample: --batch-size 8,rc-lookahead=32",
         "tip_post_export_action": "Optional action after the whole queue finishes.\n\nNone: do nothing.\nShutdown PC: powers off the computer.\nCustom Command: runs the command below in the system shell.",
         "tip_post_export_video_command": "Runs in the system shell after each successful video export and waits for it to finish. Leave empty to disable. Paths are already quoted.\n\nPlaceholders: {input}, {output}, {output_dir}, {output_stem}, {output_suffix}",
         "tip_output_location": "Folder where processed videos are saved.\nLeave empty to save next to the original file.",
@@ -489,6 +489,7 @@ EN = {
         "error_cannot_start": "Cannot start processing:",
         "error_invalid_tvai": "Invalid TVAI configuration",
         "error_post_export_command_required": "Custom post-export command is required",
+        "error_batch_size_custom_args": "Batch size must be written as --batch-size 4 or --batch-size 8; separate it from other encoder parameters with commas.",
 
         # Settings panel
         "dialog_select_tvai_ffmpeg": "Select Topaz Video ffmpeg.exe",

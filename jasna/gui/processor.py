@@ -388,7 +388,12 @@ class Processor:
         validate_encoder_cq(cq, codec=codec, vendor=vendor)
         encoder_settings = {"cq": cq}
         if settings.encoder_custom_args:
-            custom_settings = parse_encoder_settings(settings.encoder_custom_args)
+            from jasna.gui.hardware_policy import split_batch_size_custom_arg
+
+            _batch_size, encoder_custom_args = split_batch_size_custom_arg(
+                settings.encoder_custom_args
+            )
+            custom_settings = parse_encoder_settings(encoder_custom_args)
             cq_aliases = {"cq"}
             if vendor is AcceleratorVendor.AMD:
                 cq_aliases.add("qvbr_quality_level")
