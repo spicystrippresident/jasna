@@ -223,6 +223,27 @@ def _get_frame_count_by_counting(path: str) -> int:
     return frame_count
 
 
+def _stream_pixel_format(json_video_stream: dict) -> str:
+    """Return ffprobe's pixel format or a standardized AV1 codec-string inference.
+
+    The minimal unified AMF runtime exposes only the hardware AV1 decoder.  Its
+    stream probe reports the standardized ``av01`` MIME codec string but no
+    ``pix_fmt`` until decode.  Preserve a fixed-format decision by translating
+    only the explicit 8/10-bit 4:2:0 depths this reader supports.
+    """
+
+    pixel_format = str(json_video_stream.get("pix_fmt") or "").lower()
+    if pixel_format or str(json_video_stream.get("codec_name") or "").lower() != "av1":
+        return pixel_format
+    codec_parts = str(json_video_stream.get("mime_codec_string") or "").split(".")
+    if len(codec_parts) < 4 or codec_parts[0].lower() != "av01":
+        return ""
+    return {
+        "08": "yuv420p",
+        "10": "yuv420p10le",
+    }.get(codec_parts[3], "")
+
+
 def is_stream_10bit(json_video_stream: dict) -> bool:
     bprs = json_video_stream.get('bits_per_raw_sample')
     if isinstance(bprs, (int, float)):
@@ -233,7 +254,7 @@ def is_stream_10bit(json_video_stream: dict) -> bool:
                 return True
         except ValueError:
             pass
-    pix_fmt = (json_video_stream.get('pix_fmt') or '').lower()
+    pix_fmt = _stream_pixel_format(json_video_stream)
     ten_bit_markers = (
         'p10',
         'p010',
@@ -357,6 +378,7 @@ def get_video_meta_data(path: str) -> VideoMetadata:
     num_frames = int(json_video_stream.get('nb_frames', 0))
     if num_frames == 0:
         num_frames = _get_frame_count_by_counting(path)
+    pixel_format = _stream_pixel_format(json_video_stream)
     is_10bit = is_stream_10bit(json_video_stream)
     stereo_layout, spherical_projection = parse_spatial_metadata(json_video_stream)
 
@@ -376,7 +398,7 @@ def get_video_meta_data(path: str) -> VideoMetadata:
         num_frames=num_frames,
         is_10bit=is_10bit,
         sample_aspect_ratio=parse_sample_aspect_ratio(json_video_stream),
-        pixel_format=str(json_video_stream.get("pix_fmt") or ""),
+        pixel_format=pixel_format,
         profile=str(json_video_stream.get("profile") or ""),
         field_order=str(json_video_stream.get("field_order") or ""),
         color_primaries=str(json_video_stream.get("color_primaries") or ""),

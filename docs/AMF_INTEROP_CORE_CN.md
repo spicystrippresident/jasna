@@ -1,7 +1,8 @@
 # Linux AMD AMF Vulkan→HIP D2D Core
 
-本文记录 `codex/linux-amd-amf-interop-core` 上的独立研究入口。它只建立
-H.264/HEVC 的 native bridge 基础，不迁移产品默认解码策略，也不覆盖 AV1。
+本文记录从 `codex/linux-amd-amf-interop-core` 开始的独立研究入口。基础 PR 建立
+H.264/HEVC 的 native bridge；后续 `codex/linux-amd-amf-av1-native` 复用同一
+bridge 扩展固定格式 AV1。两者都不迁移产品默认解码策略。
 
 ## 使用边界
 
@@ -18,8 +19,10 @@ JASNA_DECODE_BACKEND=amf-interop
 | H.264 | Main 或 High，8-bit | NV12 |
 | HEVC | Main，8-bit | NV12 |
 | HEVC | Main10，10-bit | P010 |
+| AV1 | Main，8-bit | NV12 |
+| AV1 | Main，10-bit | P010 |
 
-reader batch 只能是 `1`、`2`、`4` 或 `8`；Linux 以外、非 AMD、AV1、其他
+reader batch 只能是 `1`、`2`、`4` 或 `8`；Linux 以外、非 AMD、其他
 profile/pixel format 均会在打开前报错。本 core 只接受一个 session 内分辨率、
 位深和 surface format 不变的输入，不覆盖中途重配。HEVC 的旧 ffprobe 元数据若
 没有 profile，只有在 NV12/8-bit 或 P010/10-bit 的同一范围内才会推断为对应的
@@ -81,7 +84,7 @@ contract 不会自动把 `bridge/` 加入 `PYTHONPATH`；这是本 PR 保持的�
 ## 独立验收
 
 焦点测试位于 `tests/test_amf_interop_core.py`，覆盖 backend/env、Linux AMD
-scope/batch 矩阵、Windows/NVIDIA/AV1 拒绝、auto 不选择、bridge 缺失、non-native
+scope/batch 矩阵、Windows/NVIDIA/不支持格式拒绝、auto 不选择、bridge 缺失、non-native
 frame、transport counter 拒绝、close 配平和 cache 默认值。现有 decoder backend
 与 AMD software-path 测试也作为回归检查。
 
@@ -113,4 +116,5 @@ export/import/map/release/destroy、16 次 D2D plane copy 和 session 1/1 全部
 也不启用 CPU fallback。运行后 kernel journal 没有 GPU reset、ring timeout、page
 fault 或 OOM。
 
-AV1、auto route、编码、动态重配和产品流水线均保持后续独立工作项。
+auto route、编码、动态重配和产品流水线均保持后续独立工作项。AV1 的额外元数据
+边界与实机结果见 `docs/AMF_AV1_NATIVE_CN.md`。
