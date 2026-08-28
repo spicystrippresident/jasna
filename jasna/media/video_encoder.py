@@ -148,7 +148,7 @@ DEFAULT_AMF_AV1_ENCODER_OPTIONS: dict[str, str] = {
     ),
     "g": "250",
     "preanalysis": "1",
-    "vbaq": "1",
+    "aq_mode": "caq",
     "profile": "main",
     "bitdepth": "10",
 }
@@ -274,6 +274,7 @@ NVENC_H264_SOURCE_BITRATE_CAP_FACTOR = 2.0
 # Any VBV buffer of roughly a second or more never becomes the binding
 # constraint; only sub-second buffers throttle, which is the #243 unit trap.
 SOURCE_BITRATE_CAP_BUFFER_RATIO = 2
+FFMPEG_ENCODER_RATE_MAX = 2_147_483_647
 
 
 def source_bitrate_cap_options(
@@ -295,9 +296,17 @@ def source_bitrate_cap_options(
             metadata.codec_name.lower(), DEFAULT_SOURCE_BITRATE_CAP_FACTOR
         )
     maxrate = int(metadata.video_bitrate * factor)
+    bufsize = maxrate * SOURCE_BITRATE_CAP_BUFFER_RATIO
+    if maxrate > FFMPEG_ENCODER_RATE_MAX or bufsize > FFMPEG_ENCODER_RATE_MAX:
+        logger.warning(
+            "Source bitrate ceiling for %s exceeds the encoder option range; "
+            "encoding without a source-tied bitrate ceiling",
+            metadata.video_file,
+        )
+        return {}
     return {
         "maxrate": str(maxrate),
-        "bufsize": str(maxrate * SOURCE_BITRATE_CAP_BUFFER_RATIO),
+        "bufsize": str(bufsize),
     }
 
 
@@ -402,6 +411,16 @@ def _normalized_audio_layout(layout: av.AudioLayout) -> av.AudioLayout:
     return layout
 
 
+@dataclass(order=True, frozen=True)
+class _BufferedEncodeItem:
+    """Keep each buffered tensor paired with its own PTS and LUT decision."""
+
+    pts: int
+    sequence: int
+    frame: torch.Tensor = field(compare=False)
+    apply_lut: bool = field(compare=False)
+
+
 class NvidiaVideoEncoder:
     def __init__(
         self,
@@ -490,6 +509,16 @@ class NvidiaVideoEncoder:
 
         self.encoder_options = dict(spec.default_options)
         overrides: dict[str, str] = {}
+        self._target_bit_rate: int | None = None
+        amd_av1_main10 = (
+            self.vendor is AcceleratorVendor.AMD
+            and codec == "av1"
+            and spec.ten_bit
+        )
+        if amd_av1_main10:
+            # Supported Linux and Windows AMF runtimes cannot reliably open
+            # P010 AV1 while PreAnalysis is enabled.
+            self.encoder_options["preanalysis"] = "0"
         if encoder_settings:
             overrides = {k: _option_value(v) for k, v in encoder_settings.items()}
             # FFmpeg accepts both spellings for HEVC/H.264, but their defaults
@@ -520,11 +549,28 @@ class NvidiaVideoEncoder:
                 )
             )
         self.encoder_options.update(overrides)
+        if amd_av1_main10:
+            # Without PreAnalysis, QVBR can ignore maxrate/bufsize on large
+            # inputs. Peak VBR plus codec_context.bit_rate keeps the accepted
+            # source-tied rate contract on both AMD platforms.
+            self.encoder_options["rc"] = "vbr_peak"
+            self.encoder_options["preanalysis"] = "0"
+            self.encoder_options.pop("qvbr_quality_level", None)
+            pixel_rate = (
+                int(metadata.video_width)
+                * int(metadata.video_height)
+                * float(metadata.video_fps)
+            )
+            self._target_bit_rate = int(
+                metadata.video_bitrate
+                or max(2_000_000, min(100_000_000, round(pixel_rate * 0.02)))
+            )
         if self.smart_fragment:
             self.encoder_options.update(spec.smart_fragment_options)
 
         self.BUFFER_MAX_SIZE = 8
-        self._lut_flags: deque[bool] = deque()
+        self.frame_buffer: list[_BufferedEncodeItem] = []
+        self._next_buffer_sequence = 0
         # Set on AMD in __enter__, where the frame size is known; NVIDIA leaves
         # them None and allocates per frame (NVENC outlives encode()).
         self._packed: torch.Tensor | None = None
@@ -562,6 +608,8 @@ class NvidiaVideoEncoder:
         out_v.height = self.metadata.video_height
         out_v.time_base = self.metadata.time_base
         ctx = out_v.codec_context
+        if self._target_bit_rate is not None:
+            ctx.bit_rate = self._target_bit_rate
         ctx.time_base = self.metadata.time_base
         ctx.framerate = self.output_fps
         ctx.pix_fmt = (
@@ -631,9 +679,8 @@ class NvidiaVideoEncoder:
                 dtype=dtype,
                 pin_memory=True,
             )
-        self.pts_heap: list[int] = []
-        self.frame_buffer: deque = deque()
-        self._lut_flags.clear()
+        self.frame_buffer = []
+        self._next_buffer_sequence = 0
         self.pts_set: set[int] = set()
         self._last_emitted_pts: int | None = None
         self._video_started = False
@@ -948,15 +995,14 @@ class NvidiaVideoEncoder:
 
     def _process_buffer(self, flush_all=False):
         if len(self.frame_buffer) > (self.BUFFER_MAX_SIZE // 2) or (flush_all and self.frame_buffer):
-            frame_to_encode = self.frame_buffer.popleft()
-            pts_to_assign = heapq.heappop(self.pts_heap)
-            self.pts_set.remove(pts_to_assign)
-            pts_to_assign = self._clamp_pts_monotonic(pts_to_assign)
-            apply_lut = self._lut_flags.popleft() if self._lut_flags else True
-            if apply_lut:
-                item = self._build_encode_item(frame_to_encode, pts_to_assign)
-            else:
-                item = self._build_encode_item(frame_to_encode, pts_to_assign, False)
+            buffered = heapq.heappop(self.frame_buffer)
+            self.pts_set.remove(buffered.pts)
+            pts_to_assign = self._clamp_pts_monotonic(buffered.pts)
+            item = self._build_encode_item(
+                buffered.frame,
+                pts_to_assign,
+                buffered.apply_lut,
+            )
             self._encode_queue.put(item)
 
     def _encoder_open_error(self, exc: Exception) -> RuntimeError:
@@ -1063,8 +1109,23 @@ class NvidiaVideoEncoder:
         pts = int(pts) - self.pts_origin
         while pts in self.pts_set:
             pts += 1
-        heapq.heappush(self.pts_heap, pts)
-        self.frame_buffer.append(frame)
-        self._lut_flags.append(bool(apply_lut))
+        # AMD decode batches can expose storage that is reused after the next
+        # native batch. Own it before the asynchronous encoder window retains
+        # the tensor; NVIDIA keeps the established producer-owned fast path.
+        owned_frame = (
+            frame.clone()
+            if self.vendor is AcceleratorVendor.AMD and isinstance(frame, torch.Tensor)
+            else frame
+        )
+        heapq.heappush(
+            self.frame_buffer,
+            _BufferedEncodeItem(
+                pts=pts,
+                sequence=self._next_buffer_sequence,
+                frame=owned_frame,
+                apply_lut=bool(apply_lut),
+            ),
+        )
+        self._next_buffer_sequence += 1
         self.pts_set.add(pts)
         self._process_buffer()
