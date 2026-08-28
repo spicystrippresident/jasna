@@ -63,6 +63,7 @@ def _reader(
 def _clear_interop_env(monkeypatch):
     monkeypatch.delenv(module.DECODE_BACKEND_ENV, raising=False)
     monkeypatch.delenv(module.AMF_INTEROP_RESOURCE_CACHE_ENV, raising=False)
+    monkeypatch.delenv(module.AMF_INTEROP_DECODE_COPY_STREAM_ENV, raising=False)
 
 
 def test_backend_enumeration_and_environment_override(monkeypatch) -> None:
@@ -201,6 +202,18 @@ def test_resource_cache_defaults_off_and_true_is_explicit(monkeypatch) -> None:
     assert module._amf_interop_resource_cache_enabled() is False
     monkeypatch.setenv(module.AMF_INTEROP_RESOURCE_CACHE_ENV, "true")
     assert module._amf_interop_resource_cache_enabled() is True
+
+
+def test_decode_copy_stream_defaults_to_null_and_deferred_is_explicit(monkeypatch) -> None:
+    assert module._amf_interop_decode_copy_stream() == "null"
+    monkeypatch.setenv(
+        module.AMF_INTEROP_DECODE_COPY_STREAM_ENV,
+        "private-deferred",
+    )
+    assert module._amf_interop_decode_copy_stream() == "private-deferred"
+    monkeypatch.setenv(module.AMF_INTEROP_DECODE_COPY_STREAM_ENV, "private")
+    with pytest.raises(ValueError, match="expected 'null' or 'private-deferred'"):
+        module._amf_interop_decode_copy_stream()
 
 
 def test_explicit_decoder_owns_amf_surfaces_and_tolerates_missing_timing(monkeypatch) -> None:
@@ -375,6 +388,77 @@ class _IdentitySession:
         }
 
 
+class _DeferredIdentitySession(_IdentitySession):
+    def __init__(self) -> None:
+        super().__init__()
+        self.copy_calls = 0
+
+    def copy_amf_surface_to_hip_private_deferred_stream(self, *args):
+        self.copy_calls += 1
+        return _safe_deferred_copy_result(consumer_stream_handle=args[-1])
+
+    def stats(self) -> dict[str, object]:
+        calls = self.copy_calls
+        return {
+            "cache_entries": 0,
+            "closed": self.closed,
+            "vulkan_memory_exports": calls,
+            "hip_external_memory_imports": calls,
+            "hip_mapped_buffer_acquires": calls,
+            "hip_mapped_buffer_releases": calls if self.closed else 0,
+            "hip_external_memory_destroys": calls if self.closed else 0,
+            "decode_private_deferred_source_release_hip_stream_create_calls": (
+                1 if calls else 0
+            ),
+            "decode_private_deferred_source_release_hip_stream_create_failures": 0,
+            "decode_private_deferred_source_release_hip_stream_destroy_calls": (
+                1 if self.closed and calls else 0
+            ),
+            "decode_private_deferred_source_release_hip_stream_destroy_failures": 0,
+            "decode_private_deferred_source_release_hip_async_copy_calls": calls * 2,
+            "decode_private_deferred_source_release_hip_stream_synchronize_calls": 0,
+            "decode_private_deferred_source_release_error_stream_synchronize_calls": 0,
+            "decode_private_deferred_source_release_hip_event_create_calls": (
+                6 if calls else 0
+            ),
+            "decode_private_deferred_source_release_hip_event_create_failures": 0,
+            "decode_private_deferred_source_release_hip_event_record_calls": calls * 2,
+            "decode_private_deferred_source_release_hip_event_record_failures": 0,
+            "decode_private_deferred_source_release_hip_event_query_calls": max(calls - 1, 0),
+            "decode_private_deferred_source_release_hip_event_query_not_ready": 0,
+            "decode_private_deferred_source_release_hip_event_synchronize_calls": (
+                (
+                    max(calls - 3, 0) + min(calls, 3)
+                    if self.closed
+                    else max(calls - 3, 0)
+                )
+            ),
+            "decode_private_deferred_source_release_hip_event_synchronize_failures": 0,
+            "decode_private_deferred_source_release_hip_event_destroy_calls": (
+                6 if self.closed and calls else 0
+            ),
+            "decode_private_deferred_source_release_hip_event_destroy_failures": 0,
+            "decode_private_deferred_source_release_device_wait_calls": calls,
+            "decode_private_deferred_source_release_device_wait_failures": 0,
+            "decode_private_deferred_source_release_source_acquires": calls,
+            "decode_private_deferred_source_release_source_releases": (
+                calls if self.closed else max(calls - 3, 0)
+            ),
+            "decode_private_deferred_source_release_forced_drains": max(calls - 3, 0),
+            "decode_private_deferred_source_release_close_drains": (
+                min(calls, 3) if self.closed else 0
+            ),
+            "decode_private_deferred_source_release_max_in_flight": min(calls, 3),
+            "decode_private_deferred_source_release_failures": 0,
+            "last_decode_private_deferred_source_release_hip_stream_handle": (
+                91 if calls else 0
+            ),
+            "decode_private_deferred_source_release_in_flight": (
+                0 if self.closed else min(calls, 3)
+            ),
+        }
+
+
 def _safe_inspection(*, device: int = 41, frames_context: int = 11) -> dict[str, object]:
     return {
         "memory_type": "vulkan",
@@ -405,13 +489,56 @@ def _safe_copy_result(**overrides) -> dict[str, object]:
     return result
 
 
-def _audit(*, inspect=None, copy=None, session=None, process_stats=None):
+def _safe_deferred_copy_result(
+    *,
+    consumer_stream_handle: int = 71,
+    **overrides,
+) -> dict[str, object]:
+    result: dict[str, object] = {
+        "width": 16,
+        "height": 16,
+        "bytes_per_sample": 1,
+        "hip_result": 0,
+        "d2d_plane_copies": 2,
+        "decode_source_release_hip_stream_synchronize_calls": 0,
+        "decode_null_stream_source_release_hip_stream_synchronize_calls": 0,
+        "decode_private_deferred_source_release_hip_async_copy_calls": 2,
+        "decode_private_deferred_source_release_hip_stream_synchronize_calls": 0,
+        "decode_private_deferred_source_release_error_stream_synchronize_calls": 0,
+        "decode_private_deferred_source_release_hip_stream_create_calls": 0,
+        "decode_private_deferred_source_release_hip_event_create_calls": 0,
+        "decode_private_deferred_source_release_hip_event_record_calls": 2,
+        "decode_private_deferred_source_release_hip_event_query_calls": 0,
+        "decode_private_deferred_source_release_hip_event_query_not_ready": 0,
+        "decode_private_deferred_source_release_hip_event_synchronize_calls": 0,
+        "decode_private_deferred_source_release_hip_event_destroy_calls": 0,
+        "decode_private_deferred_source_release_device_wait_calls": 1,
+        "decode_private_deferred_source_release_source_acquires": 1,
+        "decode_private_deferred_source_release_source_releases": 0,
+        "decode_private_deferred_source_release_forced_drains": 0,
+        "consumer_stream_handle": consumer_stream_handle,
+        "copy_synchronization": "private-deferred-device-wait",
+        "fixed_context_bound": True,
+    }
+    result.update(overrides)
+    return result
+
+
+def _audit(
+    *,
+    inspect=None,
+    copy=None,
+    session=None,
+    process_stats=None,
+    decode_copy_stream: str = "null",
+):
     return module._AmfInteropTransportAudit(
         inspect_amf_surface=inspect or (lambda _frame: _safe_inspection()),
         copy_amf_surface_to_hip=copy or (lambda *_args: _safe_copy_result()),
         get_transport_stats=process_stats or (lambda: {}),
         identity_session=session or _IdentitySession(),
         device=torch.device("cpu"),
+        decode_copy_stream=decode_copy_stream,
     )
 
 
@@ -471,6 +598,75 @@ def test_explicit_open_uses_session_bound_copy_not_top_level_bridge(monkeypatch)
     assert session.copy_calls == [(frame, 123, 456, 0)]
     top_level_copy.assert_not_called()
     assert session.closed is True
+
+
+def test_deferred_open_requires_session_entrypoint_and_dependency_probe(monkeypatch) -> None:
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    monkeypatch.setenv(
+        module.AMF_INTEROP_DECODE_COPY_STREAM_ENV,
+        "private-deferred",
+    )
+    session = _IdentitySession()
+    bridge = SimpleNamespace(
+        inspect_amf_surface=lambda _frame: _safe_inspection(),
+        copy_amf_surface_to_hip=lambda *_args: _safe_copy_result(),
+        get_transport_stats=lambda: {},
+        AmfVulkanHipInteropSession=lambda _purpose: session,
+    )
+    reader = _reader(_metadata(), 1)
+    monkeypatch.setattr(module, "_load_amf_interop_bridge", lambda: bridge)
+
+    with pytest.raises(module.VideoDecodeError, match="private_deferred_stream"):
+        reader._open_amf_interop_backend()
+
+    assert session.closed is True
+
+
+def test_deferred_open_runs_one_time_dependency_probe(monkeypatch) -> None:
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    monkeypatch.setenv(
+        module.AMF_INTEROP_DECODE_COPY_STREAM_ENV,
+        "private-deferred",
+    )
+    session = _DeferredIdentitySession()
+    probe = MagicMock(
+        return_value={
+            "mode": "private-deferred",
+            "consumer_stream_handle": 79,
+            "stream_create_calls": 1,
+            "stream_synchronize_calls": 0,
+            "device_wait_calls": 1,
+            "event_create_calls": 2,
+            "event_record_calls": 2,
+            "event_synchronize_calls": 1,
+            "event_destroy_calls": 2,
+        }
+    )
+    bridge = SimpleNamespace(
+        inspect_amf_surface=lambda _frame: _safe_inspection(),
+        copy_amf_surface_to_hip=lambda *_args: _safe_copy_result(),
+        get_transport_stats=lambda: {},
+        verify_private_deferred_stream_dependency=probe,
+        AmfVulkanHipInteropSession=lambda _purpose: session,
+    )
+    reader = _reader(_metadata(), 1)
+    pyav_open = MagicMock()
+    monkeypatch.setattr(module, "_load_amf_interop_bridge", lambda: bridge)
+    monkeypatch.setattr(
+        module,
+        "new_stream",
+        lambda _device: SimpleNamespace(cuda_stream=79),
+    )
+    monkeypatch.setattr(reader, "_open_pyav", pyav_open)
+
+    reader._open_amf_interop_backend()
+
+    assert reader._amf_interop_audit is not None
+    assert reader._amf_interop_audit.decode_copy_stream == "private-deferred"
+    assert reader._amf_interop_consumer_stream.cuda_stream == 79
+    probe.assert_called_once_with(0, 79)
+    pyav_open.assert_called_once_with(software_only=False, amf_interop=True)
+    reader._close_amf_interop_backend()
 
 
 @pytest.mark.parametrize(
@@ -544,6 +740,123 @@ def test_transport_audit_balances_create_close_and_per_frame_resources() -> None
     assert stats["vulkan_memory_exports"] == 2
     assert stats["hip_external_memory_destroys"] == 2
     assert stats["hip_d2d_plane_copies"] == 4
+
+
+def test_deferred_audit_requires_a_non_null_consumer_stream() -> None:
+    session = _DeferredIdentitySession()
+    audit = _audit(
+        copy=session.copy_amf_surface_to_hip_private_deferred_stream,
+        session=session,
+        decode_copy_stream="private-deferred",
+    )
+
+    with pytest.raises(module.VideoDecodeError, match="non-null Torch consumer"):
+        audit.copy_to_hip(object(), 1, 128, consumer_stream_handle=0)
+
+
+def test_deferred_audit_requires_event_pool_telemetry() -> None:
+    audit = _audit(
+        copy=lambda *_args: _safe_deferred_copy_result(
+            decode_private_deferred_source_release_hip_event_destroy_calls=1
+        ),
+        session=_DeferredIdentitySession(),
+        decode_copy_stream="private-deferred",
+    )
+
+    with pytest.raises(module.VideoDecodeError, match="did not prove"):
+        audit.copy_to_hip(object(), 1, 128, consumer_stream_handle=71)
+
+
+def test_deferred_audit_validates_three_slot_event_pool_at_close() -> None:
+    session = _DeferredIdentitySession()
+    audit = _audit(
+        copy=session.copy_amf_surface_to_hip_private_deferred_stream,
+        session=session,
+        decode_copy_stream="private-deferred",
+    )
+
+    for index in range(5):
+        audit.copy_to_hip(object(), index + 1, 128, consumer_stream_handle=71)
+    audit.close()
+    stats = audit.validate_closed()
+
+    assert stats["decode_private_deferred_source_release_hip_event_create_calls"] == 6
+    assert stats["decode_private_deferred_source_release_hip_event_destroy_calls"] == 6
+    assert stats["decode_private_deferred_source_release_hip_event_record_calls"] == 10
+    assert stats["decode_private_deferred_source_release_device_wait_calls"] == 5
+    assert stats["decode_private_deferred_source_release_source_acquires"] == 5
+    assert stats["decode_private_deferred_source_release_source_releases"] == 5
+    assert stats["decode_private_deferred_source_release_max_in_flight"] == 3
+    assert stats["decode_private_deferred_source_release_in_flight"] == 0
+    assert stats["decode_private_deferred_source_release_hip_stream_synchronize_calls"] == 0
+
+
+def test_deferred_copy_uses_verified_nondefault_stream_for_wait_and_conversion(monkeypatch) -> None:
+    class _Stream:
+        cuda_stream = 73
+
+        def __init__(self) -> None:
+            self.synchronize_calls = 0
+
+        def synchronize(self) -> None:
+            self.synchronize_calls += 1
+
+    class _DeferredAudit:
+        decode_copy_stream = "private-deferred"
+
+        def __init__(self) -> None:
+            self.calls = []
+
+        def copy_to_hip(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return _safe_deferred_copy_result(
+                consumer_stream_handle=kwargs["consumer_stream_handle"]
+            )
+
+    stream = _Stream()
+    audit = _DeferredAudit()
+    frame = SimpleNamespace(
+        format=SimpleNamespace(name="amf"),
+        sw_format=SimpleNamespace(name="nv12"),
+        width=16,
+        height=16,
+        pts=0,
+    )
+    uploader = module.AmfInteropUploader(
+        file="input.mp4",
+        batch_size=1,
+        device=torch.device("cpu"),
+        metadata=_metadata(),
+        height=16,
+        width=16,
+        full_range=False,
+        audit=audit,
+        consumer_stream=stream,
+    )
+    context = MagicMock()
+    monkeypatch.setattr(module, "stream_context", lambda actual: context(actual))
+    monkeypatch.setattr(module, "YuvToRgbConverter", MagicMock())
+
+    batches = uploader.frames(iter(()), [frame])
+    batch, pts = next(batches)
+
+    assert batch.shape == (1, 3, 16, 16)
+    assert pts == [0]
+    assert audit.calls[0][1]["consumer_stream_handle"] == 73
+    context.assert_called_once_with(stream)
+    assert stream.synchronize_calls == 1
+
+
+def test_reader_exit_keeps_primary_copy_error_when_deferred_teardown_also_fails() -> None:
+    reader = _reader(_metadata(), 1)
+    reader._close_pyav = MagicMock()
+    reader._amf_interop_audit = SimpleNamespace(
+        close=MagicMock(side_effect=RuntimeError("deferred close failed"))
+    )
+
+    # __exit__ returns normally so the original with-body exception propagates.
+    assert reader.__exit__(RuntimeError, RuntimeError("copy failed"), None) is None
+    reader._amf_interop_audit.close.assert_called_once()
 
 
 def test_transport_audit_does_not_swallow_session_close_failure() -> None:

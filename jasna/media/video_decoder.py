@@ -59,7 +59,9 @@ _DECODE_BACKENDS = (
 
 _AMF_INTEROP_MODULE = "_jasna_amf_surface_probe"
 AMF_INTEROP_RESOURCE_CACHE_ENV = "JASNA_AMF_INTEROP_RESOURCE_CACHE"
+AMF_INTEROP_DECODE_COPY_STREAM_ENV = "JASNA_AMF_INTEROP_DECODE_COPY_STREAM"
 _AMF_INTEROP_READER_BATCH_SIZES = frozenset({1, 2, 4, 8})
+_AMF_INTEROP_DECODE_COPY_STREAMS = frozenset({"null", "private-deferred"})
 
 # PyAV's avcodec_find_decoder returns libdav1d for AV1, which carries no NVDEC
 # hwaccel config, so av.open silently decodes AV1 in software. Force the native
@@ -152,6 +154,100 @@ def _amf_interop_resource_cache_enabled(*, default: bool = False) -> bool:
         f"Invalid {AMF_INTEROP_RESOURCE_CACHE_ENV} value {value!r}; "
         "expected 0/1, false/true, no/yes, or off/on"
     )
+
+
+def _amf_interop_decode_copy_stream(*, default: str = "null") -> str:
+    """Return the explicit AMF decode-copy synchronization mode.
+
+    ``null`` preserves the already-proven source-release implementation.  The
+    event-pool route is deliberately unavailable unless an operator both opts
+    into the AMF backend and asks for ``private-deferred`` explicitly.
+    """
+
+    if default not in _AMF_INTEROP_DECODE_COPY_STREAMS:
+        raise ValueError(f"Invalid AMF interop decode-copy default {default!r}")
+    raw_value = os.environ.get(AMF_INTEROP_DECODE_COPY_STREAM_ENV)
+    if raw_value is None:
+        return default
+    value = raw_value.strip().casefold()
+    if value in _AMF_INTEROP_DECODE_COPY_STREAMS:
+        return value
+    raise ValueError(
+        f"Invalid {AMF_INTEROP_DECODE_COPY_STREAM_ENV} value {value!r}; "
+        "expected 'null' or 'private-deferred'"
+    )
+
+
+def _amf_interop_stream_handle(stream: object) -> int:
+    """Return a non-null PyTorch CUDA/HIP stream handle for native interop."""
+
+    try:
+        handle = int(getattr(stream, "cuda_stream"))
+    except (AttributeError, OverflowError, TypeError, ValueError) as exc:
+        raise VideoDecodeError(
+            "The private-deferred AMF decode-copy mode requires a dedicated "
+            "PyTorch CUDA/HIP consumer stream handle"
+        ) from exc
+    if handle <= 0:
+        raise VideoDecodeError(
+            "The private-deferred AMF decode-copy mode requires a non-null "
+            "PyTorch CUDA/HIP consumer stream handle"
+        )
+    return handle
+
+
+def _verify_amf_interop_private_deferred_stream_dependency(
+    bridge,
+    device: torch.device,
+) -> object:
+    """Fail closed unless HIP can order a private producer and Torch consumer.
+
+    This is an open-time capability probe.  It may synchronize its own probe
+    event once, but production copies are prohibited from synchronizing either
+    the private producer stream or the device per frame.
+    """
+
+    verifier = getattr(bridge, "verify_private_deferred_stream_dependency", None)
+    if not callable(verifier):
+        raise VideoDecodeError(
+            f"{AMF_INTEROP_DECODE_COPY_STREAM_ENV}=private-deferred requires bridge "
+            "entry point verify_private_deferred_stream_dependency"
+        )
+    probe_stream = new_stream(device)
+    consumer_stream_handle = _amf_interop_stream_handle(probe_stream)
+    try:
+        result = verifier(int(device.index or 0), consumer_stream_handle)
+    except BaseException as exc:
+        raise VideoDecodeError(
+            "The private-deferred AMF decode-copy mode could not verify its "
+            "Torch HIP stream dependency"
+        ) from exc
+    if not isinstance(result, dict):
+        raise VideoDecodeError(
+            "The private-deferred AMF decode-copy dependency probe returned "
+            f"invalid telemetry: {result!r}"
+        )
+    expected = {
+        "mode": "private-deferred",
+        "consumer_stream_handle": consumer_stream_handle,
+        "stream_create_calls": 1,
+        "stream_synchronize_calls": 0,
+        "device_wait_calls": 1,
+        "event_create_calls": 2,
+        "event_record_calls": 2,
+        "event_synchronize_calls": 1,
+        "event_destroy_calls": 2,
+    }
+    if any(result.get(name) != value for name, value in expected.items()):
+        raise VideoDecodeError(
+            "The private-deferred AMF decode-copy dependency probe did not "
+            f"confirm its device-wait contract: {result}"
+        )
+    # Keep the exact non-default Torch stream whose native handle was proven by
+    # the bridge.  The legacy/default HIP stream legitimately has handle zero,
+    # so rediscovering ``current_stream`` later would make an otherwise valid
+    # reader fail on a normal, idle PyTorch thread.
+    return probe_stream
 
 
 def _amf_interop_format_supported(metadata: VideoMetadata) -> bool:
@@ -681,12 +777,14 @@ class _RocDecodeFrameSource:
 
 
 class _AmfInteropTransportAudit:
-    """Per-reader proof that explicit AMF interop stayed GPU-only.
+    """Per-reader proof that explicit AMF interop stays native and balanced.
 
-    The bridge's process counters are useful diagnostics but may include other
-    readers.  This object records the exact calls owned by one reader and
-    rejects any result that reports a host transfer, CPU mapping, staging copy,
-    D2H copy, failed native operation, or context identity change.
+    The ordinary explicit route synchronizes the null stream before releasing a
+    source.  The opt-in private-deferred route instead keeps the source and its
+    per-frame external-memory import alive until a consumer-stream event says
+    the queued wait has passed.  Both contracts are intentionally audited here
+    instead of letting a bridge telemetry regression become a silent lifetime
+    change.
     """
 
     _FORBIDDEN_TRANSPORT_COUNTERS = (
@@ -698,6 +796,40 @@ class _AmfInteropTransportAudit:
         "av_hwframe_transfer_data_calls",
         "failed_bridge_copies",
     )
+    _DEFERRED_SESSION_COUNTERS = (
+        "vulkan_memory_exports",
+        "hip_external_memory_imports",
+        "hip_mapped_buffer_acquires",
+        "hip_mapped_buffer_releases",
+        "hip_external_memory_destroys",
+        "decode_private_deferred_source_release_hip_stream_create_calls",
+        "decode_private_deferred_source_release_hip_stream_create_failures",
+        "decode_private_deferred_source_release_hip_stream_destroy_calls",
+        "decode_private_deferred_source_release_hip_stream_destroy_failures",
+        "decode_private_deferred_source_release_hip_async_copy_calls",
+        "decode_private_deferred_source_release_hip_stream_synchronize_calls",
+        "decode_private_deferred_source_release_error_stream_synchronize_calls",
+        "decode_private_deferred_source_release_hip_event_create_calls",
+        "decode_private_deferred_source_release_hip_event_create_failures",
+        "decode_private_deferred_source_release_hip_event_record_calls",
+        "decode_private_deferred_source_release_hip_event_record_failures",
+        "decode_private_deferred_source_release_hip_event_query_calls",
+        "decode_private_deferred_source_release_hip_event_query_not_ready",
+        "decode_private_deferred_source_release_hip_event_synchronize_calls",
+        "decode_private_deferred_source_release_hip_event_synchronize_failures",
+        "decode_private_deferred_source_release_hip_event_destroy_calls",
+        "decode_private_deferred_source_release_hip_event_destroy_failures",
+        "decode_private_deferred_source_release_device_wait_calls",
+        "decode_private_deferred_source_release_device_wait_failures",
+        "decode_private_deferred_source_release_source_acquires",
+        "decode_private_deferred_source_release_source_releases",
+        "decode_private_deferred_source_release_forced_drains",
+        "decode_private_deferred_source_release_close_drains",
+        "decode_private_deferred_source_release_max_in_flight",
+        "decode_private_deferred_source_release_failures",
+        "last_decode_private_deferred_source_release_hip_stream_handle",
+        "decode_private_deferred_source_release_in_flight",
+    )
 
     def __init__(
         self,
@@ -707,11 +839,18 @@ class _AmfInteropTransportAudit:
         get_transport_stats,
         identity_session,
         device: torch.device,
+        decode_copy_stream: str = "null",
     ) -> None:
+        if decode_copy_stream not in _AMF_INTEROP_DECODE_COPY_STREAMS:
+            raise ValueError(
+                "decode_copy_stream must be 'null' or 'private-deferred', got "
+                f"{decode_copy_stream!r}"
+            )
         self._inspect_amf_surface = inspect_amf_surface
         self._copy_amf_surface_to_hip = copy_amf_surface_to_hip
         self._get_transport_stats = get_transport_stats
         self._identity_session = identity_session
+        self._decode_copy_stream = decode_copy_stream
         self._device = int(device.index or 0)
         self._identity: tuple[int, int, int, int] | None = None
         self._closed = False
@@ -734,7 +873,12 @@ class _AmfInteropTransportAudit:
             "resource_cache_session_close_failures": 0,
             "resource_cache_hits": 0,
             "resource_cache_misses": 0,
+            **{name: 0 for name in self._DEFERRED_SESSION_COUNTERS},
         }
+
+    @property
+    def decode_copy_stream(self) -> str:
+        return self._decode_copy_stream
 
     @classmethod
     def _reject_forbidden_transport(cls, values, *, source: str) -> None:
@@ -789,11 +933,7 @@ class _AmfInteropTransportAudit:
         fixed_context = info.get("fixed_context")
         if not isinstance(fixed_context, dict):
             fixed_context = {}
-        frames_context = self._integer(
-            fixed_context,
-            "frames_context",
-            default=0,
-        )
+        frames_context = self._integer(fixed_context, "frames_context", default=0)
         amf_context = self._integer(fixed_context, "amf_context", default=0)
         vulkan_device = self._integer(
             fixed_context,
@@ -821,33 +961,25 @@ class _AmfInteropTransportAudit:
             )
         return info
 
-    def copy_to_hip(self, frame, destination: int, destination_size: int) -> dict:
-        self._stats["copy_to_hip_calls"] += 1
-        self.inspect_frame(frame)
-        try:
-            result = self._copy_amf_surface_to_hip(
-                frame,
-                int(destination),
-                int(destination_size),
-                self._device,
-            )
-        except BaseException:
-            self._stats["copy_to_hip_failures"] += 1
-            raise
-        if not isinstance(result, dict):
-            self._stats["copy_to_hip_failures"] += 1
-            raise VideoDecodeError(
-                f"amf-interop bridge returned invalid copy telemetry: {result!r}"
-            )
-        try:
-            self._reject_forbidden_transport(result, source="copy result")
-            process_stats = self._get_transport_stats()
-            self._reject_forbidden_transport(process_stats, source="bridge counters")
+    def _validate_copy_result(
+        self,
+        result: dict,
+        *,
+        consumer_stream_handle: int | None,
+    ) -> None:
+        self._reject_forbidden_transport(result, source="copy result")
+        process_stats = self._get_transport_stats()
+        self._reject_forbidden_transport(process_stats, source="bridge counters")
+        common = (
+            self._integer(result, "hip_result") == 0
+            and self._integer(result, "d2d_plane_copies", default=2) == 2
+            and result.get("fixed_context_bound") is True
+        )
+        if self._decode_copy_stream == "null":
             valid = (
-                self._integer(result, "hip_result") == 0
+                common
                 and self._integer(result, "hip_free_result") == 0
                 and self._integer(result, "hip_destroy_result") == 0
-                and self._integer(result, "d2d_plane_copies", default=2) == 2
                 and self._integer(
                     result,
                     "decode_source_release_hip_stream_synchronize_calls",
@@ -859,25 +991,147 @@ class _AmfInteropTransportAudit:
                 )
                 == 0
                 and result.get("copy_synchronization") == "null-stream-source-release"
-                and result.get("fixed_context_bound") is True
             )
-        except VideoDecodeError:
-            self._stats["copy_to_hip_failures"] += 1
-            raise
+        else:
+            returned_consumer = self._integer(result, "consumer_stream_handle", default=0)
+            valid = (
+                common
+                and consumer_stream_handle is not None
+                and consumer_stream_handle > 0
+                and returned_consumer == consumer_stream_handle
+                and self._integer(
+                    result,
+                    "decode_source_release_hip_stream_synchronize_calls",
+                    default=0,
+                )
+                == 0
+                and self._integer(
+                    result,
+                    "decode_null_stream_source_release_hip_stream_synchronize_calls",
+                    default=0,
+                )
+                == 0
+                and self._integer(
+                    result,
+                    "decode_private_deferred_source_release_hip_async_copy_calls",
+                )
+                == 2
+                and self._integer(
+                    result,
+                    "decode_private_deferred_source_release_hip_stream_synchronize_calls",
+                    default=0,
+                )
+                == 0
+                and self._integer(
+                    result,
+                    "decode_private_deferred_source_release_device_wait_calls",
+                )
+                == 1
+                and self._integer(
+                    result,
+                    "decode_private_deferred_source_release_hip_event_record_calls",
+                )
+                == 2
+                and self._integer(
+                    result,
+                    "decode_private_deferred_source_release_source_acquires",
+                )
+                == 1
+                and self._integer(
+                    result,
+                    "decode_private_deferred_source_release_hip_event_destroy_calls",
+                    default=0,
+                )
+                == 0
+                and result.get("copy_synchronization") == "private-deferred-device-wait"
+            )
         if not valid:
-            self._stats["copy_to_hip_failures"] += 1
             raise VideoDecodeError(
                 "amf-interop bridge did not prove its AMF-source-release D2D "
                 f"contract: {result}"
             )
-        self._stats["copy_to_hip_successes"] += 1
+
+    def _accumulate_deferred_result(self, result: dict) -> None:
+        # Imports are per source; releases and final pool teardown are session
+        # totals and replace these provisional counters in ``snapshot``.
         self._stats["vulkan_memory_exports"] += 1
         self._stats["hip_external_memory_imports"] += 1
         self._stats["hip_mapped_buffer_acquires"] += 1
-        self._stats["hip_mapped_buffer_releases"] += 1
-        self._stats["hip_external_memory_destroys"] += 1
+        for name in self._DEFERRED_SESSION_COUNTERS:
+            if name in result and name not in {
+                "decode_private_deferred_source_release_max_in_flight",
+                "last_decode_private_deferred_source_release_hip_stream_handle",
+                "decode_private_deferred_source_release_in_flight",
+            }:
+                self._stats[name] += self._integer(result, name)
+        for name in (
+            "decode_private_deferred_source_release_max_in_flight",
+            "last_decode_private_deferred_source_release_hip_stream_handle",
+            "decode_private_deferred_source_release_in_flight",
+        ):
+            if name in result:
+                self._stats[name] = self._integer(result, name)
+
+    def copy_to_hip(
+        self,
+        frame,
+        destination: int,
+        destination_size: int,
+        *,
+        consumer_stream_handle: int | None = None,
+    ) -> dict:
+        self._stats["copy_to_hip_calls"] += 1
+        self.inspect_frame(frame)
+        if self._decode_copy_stream == "private-deferred":
+            if consumer_stream_handle is None or int(consumer_stream_handle) <= 0:
+                self._stats["copy_to_hip_failures"] += 1
+                raise VideoDecodeError(
+                    "private-deferred AMF copies require a non-null Torch consumer "
+                    "stream handle"
+                )
+            copy_args = (
+                frame,
+                int(destination),
+                int(destination_size),
+                self._device,
+                int(consumer_stream_handle),
+            )
+        else:
+            if consumer_stream_handle is not None:
+                self._stats["copy_to_hip_failures"] += 1
+                raise VideoDecodeError(
+                    "null-stream AMF copies must not receive a deferred consumer stream"
+                )
+            copy_args = (frame, int(destination), int(destination_size), self._device)
+        try:
+            result = self._copy_amf_surface_to_hip(*copy_args)
+        except BaseException:
+            self._stats["copy_to_hip_failures"] += 1
+            raise
+        if not isinstance(result, dict):
+            self._stats["copy_to_hip_failures"] += 1
+            raise VideoDecodeError(
+                f"amf-interop bridge returned invalid copy telemetry: {result!r}"
+            )
+        try:
+            self._validate_copy_result(
+                result,
+                consumer_stream_handle=consumer_stream_handle,
+            )
+        except VideoDecodeError:
+            self._stats["copy_to_hip_failures"] += 1
+            raise
+        self._stats["copy_to_hip_successes"] += 1
         self._stats["hip_d2d_plane_copies"] += 2
-        self._stats["decode_source_release_hip_stream_synchronize_calls"] += 1
+        if self._decode_copy_stream == "null":
+            self._stats["vulkan_memory_exports"] += 1
+            self._stats["hip_external_memory_imports"] += 1
+            self._stats["hip_mapped_buffer_acquires"] += 1
+            self._stats["hip_mapped_buffer_releases"] += 1
+            self._stats["hip_external_memory_destroys"] += 1
+            self._stats["decode_source_release_hip_stream_synchronize_calls"] += 1
+        else:
+            self._accumulate_deferred_result(result)
         return result
 
     def close(self) -> None:
@@ -892,19 +1146,27 @@ class _AmfInteropTransportAudit:
         self._stats["fixed_context_session_close_calls"] += 1
         self._closed = True
 
-    def snapshot(self) -> dict[str, object]:
-        stats = dict(self._stats)
+    def _session_stats(self) -> dict[str, object]:
         try:
             session_stats = dict(self._identity_session.stats())
         except BaseException as exc:
             raise VideoDecodeError(
                 f"amf-interop fixed-context session telemetry failed: {exc}"
             ) from exc
-        if int(session_stats.get("cache_entries", 0)) != 0:
+        if self._integer(session_stats, "cache_entries", default=0) != 0:
             raise VideoDecodeError(
                 "amf-interop resource cache was unexpectedly populated: "
                 f"{session_stats}"
             )
+        return session_stats
+
+    def snapshot(self) -> dict[str, object]:
+        stats = dict(self._stats)
+        session_stats = self._session_stats()
+        if self._decode_copy_stream == "private-deferred":
+            for name in self._DEFERRED_SESSION_COUNTERS:
+                if name in session_stats:
+                    stats[name] = self._integer(session_stats, name)
         stats.update(
             {
                 "schema": "jasna.amf.vulkan-hip-transport.v1",
@@ -920,9 +1182,16 @@ class _AmfInteropTransportAudit:
                 "transport_reconfigures": 0,
                 "transport_restarts": 0,
                 "resource_strategy": (
-                    "per-frame Vulkan external-memory import/map with balanced release"
+                    "per-frame Vulkan external-memory import/map retained until "
+                    "consumer-event release"
+                    if self._decode_copy_stream == "private-deferred"
+                    else "per-frame Vulkan external-memory import/map with balanced release"
                 ),
-                "copy_synchronization": "null-stream-source-release",
+                "copy_synchronization": (
+                    "private-deferred-device-wait"
+                    if self._decode_copy_stream == "private-deferred"
+                    else "null-stream-source-release"
+                ),
                 "fixed_context_identity": self._identity,
                 "fixed_context_session_closed": bool(session_stats.get("closed", False)),
             }
@@ -940,11 +1209,10 @@ class _AmfInteropTransportAudit:
             int(stats["hip_mapped_buffer_releases"]),
             int(stats["hip_external_memory_destroys"]),
         }
-        valid = (
+        common = (
             stats["copy_to_hip_successes"] == calls
             and stats["copy_to_hip_failures"] == 0
             and stats["hip_d2d_plane_copies"] == calls * 2
-            and stats["decode_source_release_hip_stream_synchronize_calls"] == calls
             and len(resource_counts) == 1
             and stats["fixed_context_session_create_calls"] == 1
             and stats["fixed_context_session_close_calls"] == 1
@@ -955,7 +1223,88 @@ class _AmfInteropTransportAudit:
             and stats["resource_cache_hits"] == 0
             and stats["resource_cache_misses"] == 0
         )
-        if not valid:
+        if self._decode_copy_stream == "null":
+            source_release_valid = (
+                stats["decode_source_release_hip_stream_synchronize_calls"] == calls
+            )
+        else:
+            pool_events = 6 if calls else 0
+            source_release_valid = (
+                stats["decode_source_release_hip_stream_synchronize_calls"] == 0
+                and stats[
+                    "decode_private_deferred_source_release_hip_async_copy_calls"
+                ]
+                == calls * 2
+                and stats[
+                    "decode_private_deferred_source_release_hip_stream_synchronize_calls"
+                ]
+                == 0
+                and stats[
+                    "decode_private_deferred_source_release_error_stream_synchronize_calls"
+                ]
+                == 0
+                and stats[
+                    "decode_private_deferred_source_release_hip_stream_create_calls"
+                ]
+                == (1 if calls else 0)
+                and stats[
+                    "decode_private_deferred_source_release_hip_stream_destroy_calls"
+                ]
+                == (1 if calls else 0)
+                and stats[
+                    "decode_private_deferred_source_release_hip_event_create_calls"
+                ]
+                == pool_events
+                and stats[
+                    "decode_private_deferred_source_release_hip_event_destroy_calls"
+                ]
+                == pool_events
+                and stats[
+                    "decode_private_deferred_source_release_hip_event_record_calls"
+                ]
+                == calls * 2
+                and stats[
+                    "decode_private_deferred_source_release_device_wait_calls"
+                ]
+                == calls
+                and stats[
+                    "decode_private_deferred_source_release_source_acquires"
+                ]
+                == calls
+                and stats[
+                    "decode_private_deferred_source_release_source_releases"
+                ]
+                == calls
+                and stats[
+                    "decode_private_deferred_source_release_hip_event_synchronize_calls"
+                ]
+                == stats["decode_private_deferred_source_release_forced_drains"]
+                + stats["decode_private_deferred_source_release_close_drains"]
+                and stats[
+                    "decode_private_deferred_source_release_in_flight"
+                ]
+                == 0
+                and (
+                    calls == 0
+                    or 0
+                    < stats["decode_private_deferred_source_release_max_in_flight"]
+                    <= 3
+                )
+                and all(
+                    stats[name] == 0
+                    for name in (
+                        "decode_private_deferred_source_release_hip_stream_create_failures",
+                        "decode_private_deferred_source_release_hip_stream_destroy_failures",
+                        "decode_private_deferred_source_release_hip_event_create_failures",
+                        "decode_private_deferred_source_release_hip_event_record_failures",
+                        "decode_private_deferred_source_release_hip_event_synchronize_failures",
+                        "decode_private_deferred_source_release_hip_event_destroy_failures",
+                        "decode_private_deferred_source_release_device_wait_failures",
+                        "decode_private_deferred_source_release_failures",
+                    )
+                )
+            )
+        if not common or not source_release_valid:
             raise VideoDecodeError(
                 "amf-interop violated its GPU-only resource/lifetime contract: "
                 f"{stats}"
@@ -977,6 +1326,7 @@ class AmfInteropUploader:
         width: int,
         full_range: bool,
         audit: _AmfInteropTransportAudit,
+        consumer_stream: object | None = None,
     ) -> None:
         self.file = file
         self.batch_size = int(batch_size)
@@ -986,6 +1336,7 @@ class AmfInteropUploader:
         self.width = int(width)
         self.full_range = bool(full_range)
         self.audit = audit
+        self.consumer_stream = consumer_stream
         self.is_10bit = bool(metadata.is_10bit)
         self.software_format = "p010le" if self.is_10bit else "nv12"
         self.bytes_per_sample = 2 if self.is_10bit else 1
@@ -1000,62 +1351,86 @@ class AmfInteropUploader:
             self.is_10bit,
             self.device,
         )
+        deferred = getattr(self.audit, "decode_copy_stream", "null") == "private-deferred"
+        if deferred:
+            if self.consumer_stream is None:
+                raise VideoDecodeError(
+                    "private-deferred AMF upload requires the verified non-default "
+                    "Torch consumer stream"
+                )
+            consumer_stream = self.consumer_stream
+            consumer_stream_handle = _amf_interop_stream_handle(consumer_stream)
+        else:
+            consumer_stream = None
+            consumer_stream_handle = None
         while group:
-            packed = torch.empty(
-                (len(group), H + H // 2, W),
-                dtype=torch.uint16 if self.is_10bit else torch.uint8,
-                device=self.device,
-            )
-            batch = torch.empty(
-                (len(group), 3, H, W),
-                dtype=torch.uint8,
-                device=self.device,
-            )
-            pts: list[int] = []
-            for index, frame in enumerate(group):
-                frame_format = getattr(getattr(frame, "format", None), "name", None)
-                software_format = getattr(
-                    getattr(frame, "sw_format", None), "name", None
+            with stream_context(consumer_stream):
+                packed = torch.empty(
+                    (len(group), H + H // 2, W),
+                    dtype=torch.uint16 if self.is_10bit else torch.uint8,
+                    device=self.device,
                 )
-                if (
-                    frame_format != "amf"
-                    or software_format != self.software_format
-                    or int(frame.width) != W
-                    or int(frame.height) != H
-                ):
-                    raise VideoDecodeError(
-                        "amf-interop requires a native AMF Vulkan "
-                        f"{self.software_format.upper()} frame; got "
-                        f"format={frame_format}, sw_format={software_format}, "
-                        f"size={getattr(frame, 'width', None)}x"
-                        f"{getattr(frame, 'height', None)} for {self.file}. "
-                        "Host fallback is forbidden."
+                batch = torch.empty(
+                    (len(group), 3, H, W),
+                    dtype=torch.uint8,
+                    device=self.device,
+                )
+                pts: list[int] = []
+                for index, frame in enumerate(group):
+                    frame_format = getattr(getattr(frame, "format", None), "name", None)
+                    software_format = getattr(
+                        getattr(frame, "sw_format", None), "name", None
                     )
-                copied = self.audit.copy_to_hip(
-                    frame,
-                    packed[index].data_ptr(),
-                    packed[index].numel() * packed[index].element_size(),
-                )
-                if (
-                    int(copied.get("width", -1)) != W
-                    or int(copied.get("height", -1)) != H
-                    or int(copied.get("bytes_per_sample", -1))
-                    != self.bytes_per_sample
-                ):
-                    raise VideoDecodeError(
-                        "amf-interop bridge returned an invalid native copy result: "
-                        f"{copied}"
+                    if (
+                        frame_format != "amf"
+                        or software_format != self.software_format
+                        or int(frame.width) != W
+                        or int(frame.height) != H
+                    ):
+                        raise VideoDecodeError(
+                            "amf-interop requires a native AMF Vulkan "
+                            f"{self.software_format.upper()} frame; got "
+                            f"format={frame_format}, sw_format={software_format}, "
+                            f"size={getattr(frame, 'width', None)}x"
+                            f"{getattr(frame, 'height', None)} for {self.file}. "
+                            "Host fallback is forbidden."
+                        )
+                    if deferred:
+                        copied = self.audit.copy_to_hip(
+                            frame,
+                            packed[index].data_ptr(),
+                            packed[index].numel() * packed[index].element_size(),
+                            consumer_stream_handle=consumer_stream_handle,
+                        )
+                    else:
+                        copied = self.audit.copy_to_hip(
+                            frame,
+                            packed[index].data_ptr(),
+                            packed[index].numel() * packed[index].element_size(),
+                        )
+                    if (
+                        int(copied.get("width", -1)) != W
+                        or int(copied.get("height", -1)) != H
+                        or int(copied.get("bytes_per_sample", -1))
+                        != self.bytes_per_sample
+                    ):
+                        raise VideoDecodeError(
+                            "amf-interop bridge returned an invalid native copy result: "
+                            f"{copied}"
+                        )
+                    converter.convert_into(
+                        packed[index, :H],
+                        packed[index, H:].view(H // 2, W // 2, 2),
+                        batch[index],
                     )
-                converter.convert_into(
-                    packed[index, :H],
-                    packed[index, H:].view(H // 2, W // 2, 2),
-                    batch[index],
-                )
-                pts.append(frame.pts)
-            # Source lifetime was synchronized by the bridge before each frame
-            # reference can be released; this only completes the RGB conversion
-            # before the batch crosses the reader boundary.
-            current_stream(self.device).synchronize()
+                    pts.append(frame.pts)
+            # The null route released every source before return.  The deferred
+            # route instead queued each conversion behind a producer event on
+            # this same Torch stream, and only the bridge later retires its
+            # retained source after the consumer acknowledgement.  This group
+            # synchronization remains the existing B8 handoff boundary; it is
+            # not a source-release synchronization inside the per-frame route.
+            (consumer_stream or current_stream(self.device)).synchronize()
             # A Python ``for`` target retains its final value after the loop.
             # Drop it and clear the previous AMF surface list before asking the
             # decoder for another group, otherwise native surfaces span two
@@ -1108,6 +1483,8 @@ class NvidiaVideoReader:
         self._amf_interop_bridge = None
         self._amf_interop_audit: _AmfInteropTransportAudit | None = None
         self._amf_interop_resource_cache = False
+        self._amf_interop_decode_copy_stream = "null"
+        self._amf_interop_consumer_stream = None
         self.amf_interop_stats: dict[str, object] | None = None
         self._decode_backend = DECODE_BACKEND
         self._raw_stream: int | None = None
@@ -1123,6 +1500,8 @@ class NvidiaVideoReader:
         self._amf_interop_bridge = None
         self._amf_interop_audit = None
         self._amf_interop_resource_cache = False
+        self._amf_interop_decode_copy_stream = "null"
+        self._amf_interop_consumer_stream = None
         self.amf_interop_stats = None
         self.container = None
         self.video_stream = None
@@ -1258,6 +1637,7 @@ class NvidiaVideoReader:
                 f"{AMF_INTEROP_RESOURCE_CACHE_ENV}=1 is not implemented by this "
                 "amf-interop core; per-frame balanced external-memory ownership is required"
             )
+        decode_copy_stream = _amf_interop_decode_copy_stream()
         bridge = _load_amf_interop_bridge()
         try:
             identity_session = bridge.AmfVulkanHipInteropSession("decode")
@@ -1266,13 +1646,18 @@ class NvidiaVideoReader:
                 "The explicit amf-interop backend could not create its fixed-context "
                 f"bridge session: {exc}"
             ) from exc
-        session_copy = getattr(identity_session, "copy_amf_surface_to_hip", None)
+        session_copy_name = (
+            "copy_amf_surface_to_hip_private_deferred_stream"
+            if decode_copy_stream == "private-deferred"
+            else "copy_amf_surface_to_hip"
+        )
+        session_copy = getattr(identity_session, session_copy_name, None)
         session_close = getattr(identity_session, "close", None)
         session_stats = getattr(identity_session, "stats", None)
         missing_methods = [
             name
             for name, method in (
-                ("copy_amf_surface_to_hip()", session_copy),
+                (f"{session_copy_name}()", session_copy),
                 ("close()", session_close),
                 ("stats()", session_stats),
             )
@@ -1291,15 +1676,35 @@ class NvidiaVideoReader:
                 "The explicit amf-interop bridge session is missing required methods: "
                 + ", ".join(missing_methods)
             )
+        if decode_copy_stream == "private-deferred":
+            try:
+                consumer_stream = _verify_amf_interop_private_deferred_stream_dependency(
+                    bridge, self.device
+                )
+            except BaseException:
+                try:
+                    session_close()
+                except BaseException as close_error:
+                    log.warning(
+                        "AMF private-deferred dependency probe cleanup failed for %s: %s",
+                        self.file,
+                        close_error,
+                    )
+                raise
+        else:
+            consumer_stream = None
         audit = _AmfInteropTransportAudit(
             inspect_amf_surface=bridge.inspect_amf_surface,
             copy_amf_surface_to_hip=session_copy,
             get_transport_stats=bridge.get_transport_stats,
             identity_session=identity_session,
             device=self.device,
+            decode_copy_stream=decode_copy_stream,
         )
         self._amf_interop_bridge = bridge
         self._amf_interop_audit = audit
+        self._amf_interop_decode_copy_stream = decode_copy_stream
+        self._amf_interop_consumer_stream = consumer_stream
         self._amf_interop_enabled = True
         try:
             self._open_pyav(software_only=False, amf_interop=True)
@@ -1316,6 +1721,8 @@ class NvidiaVideoReader:
             self._amf_interop_enabled = False
             self._amf_interop_audit = None
             self._amf_interop_bridge = None
+            self._amf_interop_decode_copy_stream = "null"
+            self._amf_interop_consumer_stream = None
             if cleanup_errors:
                 raise VideoDecodeError(
                     "amf-interop failed while opening and could not complete cleanup: "
@@ -1362,6 +1769,8 @@ class NvidiaVideoReader:
         self._amf_interop_enabled = False
         self._amf_interop_audit = None
         self._amf_interop_bridge = None
+        self._amf_interop_decode_copy_stream = "null"
+        self._amf_interop_consumer_stream = None
 
     def _open_rocdecode_source(self) -> None:
         if self.vendor is not AcceleratorVendor.AMD:
@@ -1544,13 +1953,33 @@ class NvidiaVideoReader:
             source, self._vali_source = self._vali_source, None
             source.close()
             return
-        try:
-            if self._rocdecode_source is not None:
+        cleanup_errors: list[BaseException] = []
+        if self._rocdecode_source is not None:
+            try:
                 self._close_rocdecode_source(discard_decoder=False)
+            except BaseException as error:
+                cleanup_errors.append(error)
+        try:
             self._close_pyav()
-        finally:
-            if self._amf_interop_audit is not None:
+        except BaseException as error:
+            cleanup_errors.append(error)
+        if self._amf_interop_audit is not None:
+            try:
                 self._close_amf_interop_backend(validate=exc_type is None)
+            except BaseException as error:
+                cleanup_errors.append(error)
+        if cleanup_errors:
+            if exc_type is not None:
+                # The body exception carries the actionable decode/copy cause.
+                # Keep teardown faults visible in logs without replacing it.
+                for error in cleanup_errors:
+                    log.warning(
+                        "Cleanup after AMF/video decode failure for %s also failed: %s",
+                        self.file,
+                        error,
+                    )
+            else:
+                raise cleanup_errors[0]
         if self._raw_stream is None:
             return
         result = _cuda_driver().cuStreamDestroy(ctypes.c_void_p(self._raw_stream))
@@ -1805,6 +2234,7 @@ class NvidiaVideoReader:
             width=self.width,
             full_range=self._full_range,
             audit=audit,
+            consumer_stream=self._amf_interop_consumer_stream,
         )
         yield from uploader.frames(decoded, group)
 
