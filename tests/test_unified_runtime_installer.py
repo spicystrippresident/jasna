@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
 import zipfile
 from pathlib import Path
 
@@ -31,6 +32,9 @@ def _fixture(
     wheel_dir.mkdir(parents=True)
     bin_dir.mkdir(parents=True)
     repo_root.mkdir()
+    bridge_source = repo_root / "scripts/amf_surface_probe.pyx"
+    bridge_source.parent.mkdir()
+    bridge_source.write_bytes(b"accepted-amf-bridge-source")
 
     wheel = wheel_dir / "av-18.1.0-test.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
@@ -42,6 +46,13 @@ def _fixture(
         library = build_root / "ffmpeg-install/lib/libavcodec.so"
         library.parent.mkdir()
         library_directory = "lib"
+        bridge = (
+            build_root
+            / "amf-interop-bridge"
+            / f"_jasna_amf_surface_probe.{sys.implementation.cache_tag}-test.so"
+        )
+        bridge.parent.mkdir()
+        bridge.write_bytes(b"accepted-amf-bridge")
     else:
         executable = bin_dir / "ffmpeg.exe"
         library = bin_dir / "avcodec-62.dll"
@@ -58,8 +69,16 @@ def _fixture(
     monkeypatch.setitem(runtime_contract.RUNTIME_POLICIES, platform_key, policy)
 
     pins = dict(runtime_contract.EXPECTED_SOURCE_PINS)
+    manifest_values = dict(pins)
+    if platform_key == "linux-amd":
+        manifest_values.update(
+            {
+                "AMF_INTEROP_BRIDGE_SHA256": _sha256(bridge),
+                "AMF_INTEROP_BRIDGE_SOURCE_SHA256": _sha256(bridge_source),
+            }
+        )
     (build_root / "build-manifest.txt").write_text(
-        "".join(f"{name}={value}\n" for name, value in pins.items()),
+        "".join(f"{name}={value}\n" for name, value in manifest_values.items()),
         encoding="utf-8",
     )
     args = argparse.Namespace(
@@ -90,7 +109,11 @@ def test_install_runtime_builds_a_valid_atomic_layout(
     assert result.backup_root is None
     manifest = runtime_contract.validate_runtime_layout(target_root, platform=platform)
     assert manifest["product_defaults"] == {"batch_size": 4}
-    assert "bridge_filename" not in manifest
+    if platform == "linux":
+        bridge = manifest["amf_interop_bridge"]
+        assert (target_root / "bridge" / bridge["filename"]).is_file()
+    else:
+        assert "amf_interop_bridge" not in manifest
     assert "migraphx_manifest" not in manifest
     assert not list(target_root.parent.glob(f".{target_root.name}.staging-*"))
 

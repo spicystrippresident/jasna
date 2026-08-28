@@ -5,8 +5,9 @@
 ## 功能边界
 
 `scripts/install_unified_runtime.py` 只安装已经构建并被
-`jasna.runtime_contract` 接受的 PyAV/FFmpeg ABI 单元。它不负责构建源码，也不安装 AMF
-Vulkan/HIP bridge、MIGraphX artifact、rocDecode 或模型文件。
+`jasna.runtime_contract` 接受的 PyAV/FFmpeg ABI 单元。Linux 构建产物中的 ABI-matched
+AMF Vulkan/HIP bridge 会一并原子安装；安装器不负责构建源码，也不安装 MIGraphX
+artifact、rocDecode 或模型文件。
 
 因此本功能不会改变 GUI、解码/编码路由、B4、VR auto 或普通 `python -m jasna` 启动方式。
 
@@ -15,6 +16,8 @@ Vulkan/HIP bridge、MIGraphX artifact、rocDecode 或模型文件。
 ```text
 build-root/
 ├── build-manifest.txt
+├── amf-interop-bridge/     # Linux only
+│   └── _jasna_amf_surface_probe.<python-soabi>.so
 ├── wheels/
 │   └── av-*.whl
 └── ffmpeg-install/
@@ -28,6 +31,7 @@ build-root/
 - PyAV wheel 哈希；
 - FFmpeg/FFprobe、动态库和 Windows DLL 的逐文件哈希；
 - wheel 内部路径不能逃逸 `site-packages`；
+- Linux bridge 的二进制哈希、源码哈希与当前 Python SOABI；
 - runtime 中的符号链接不能指向安装目录外部。
 
 ## 安装与回滚

@@ -37,6 +37,7 @@ EXPECTED_AV_LIBRARY_VERSIONS: Mapping[str, tuple[int, int, int]] = {
     "libswscale": (9, 8, 100),
     "libswresample": (6, 4, 100),
 }
+AMF_INTEROP_BRIDGE_PREFIX = "_jasna_amf_surface_probe."
 
 
 @dataclass(frozen=True)
@@ -239,6 +240,35 @@ def validate_runtime_layout(
     library_root = root / policy.library_directory
     for name, expected in policy.libraries.items():
         _require_file_hash(library_root / name, expected, name)
+    if key == "linux-amd":
+        bridge = data.get("amf_interop_bridge")
+        if not isinstance(bridge, dict):
+            raise RuntimeContractError(
+                "Linux AMD runtime manifest is missing amf_interop_bridge"
+            )
+        filename = bridge.get("filename")
+        digest = bridge.get("sha256")
+        source_digest = bridge.get("source_sha256")
+        if (
+            not isinstance(filename, str)
+            or Path(filename).name != filename
+            or not filename.startswith(AMF_INTEROP_BRIDGE_PREFIX)
+            or not filename.endswith(".so")
+        ):
+            raise RuntimeContractError(
+                f"invalid Linux AMD AMF interop bridge filename: {filename!r}"
+            )
+        for label, value in (
+            ("AMF interop bridge", digest),
+            ("AMF interop bridge source", source_digest),
+        ):
+            if (
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise RuntimeContractError(f"invalid {label} SHA256: {value!r}")
+        _require_file_hash(root / "bridge" / filename, digest, "AMF interop bridge")
     return data
 
 
@@ -259,7 +289,11 @@ def build_runtime_environment(
 
     environment = dict(os.environ if base_environment is None else base_environment)
     python_dir = str(Path(python_executable).expanduser().resolve().parent)
-    environment["PYTHONPATH"] = os.pathsep.join((str(root / "site-packages"), str(repo)))
+    python_paths = [str(root / "site-packages")]
+    if key == "linux-amd":
+        python_paths.append(str(root / "bridge"))
+    python_paths.append(str(repo))
+    environment["PYTHONPATH"] = os.pathsep.join(python_paths)
 
     path_prefix = [str(root / "bin"), python_dir]
     if key == "linux-amd":
@@ -308,6 +342,25 @@ def validate_loaded_runtime(
     if not jasna_file.is_relative_to(repo):
         raise RuntimeContractError(f"Jasna loaded outside selected repository: {jasna_file}")
 
+    bridge_file: Path | None = None
+    if key == "linux-amd":
+        import _jasna_amf_surface_probe as amf_bridge
+
+        bridge_file = Path(amf_bridge.__file__).resolve()
+        if not bridge_file.is_relative_to(root / "bridge"):
+            raise RuntimeContractError(
+                f"AMF interop bridge loaded outside unified runtime: {bridge_file}"
+            )
+        for name in (
+            "inspect_amf_surface",
+            "verify_private_deferred_stream_dependency",
+            "AmfVulkanHipInteropSession",
+        ):
+            if not callable(getattr(amf_bridge, name, None)):
+                raise RuntimeContractError(
+                    f"AMF interop bridge is missing required entry point: {name}"
+                )
+
     loaded_ffmpeg_libraries: list[str] = []
     maps = Path("/proc/self/maps")
     if key == "linux-amd" and maps.is_file():
@@ -330,6 +383,7 @@ def validate_loaded_runtime(
         "python": sys.executable,
         "pyav_version": av.__version__,
         "pyav_file": str(av_file),
+        "amf_interop_bridge_file": str(bridge_file) if bridge_file is not None else None,
         "ffmpeg_abi": {name: list(value) for name, value in observed_versions.items()},
         "loaded_ffmpeg_libraries": sorted(set(loaded_ffmpeg_libraries)),
     }
