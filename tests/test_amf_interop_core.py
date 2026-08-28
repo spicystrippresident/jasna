@@ -158,21 +158,77 @@ def test_unapproved_batch_sizes_are_rejected(monkeypatch, batch_size: int) -> No
         reader._validate_amf_interop_scope()
 
 
-def test_auto_never_selects_or_loads_amf_interop(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        _metadata(codec="h264", profile="high", pixel_format="yuv420p"),
+        _metadata(codec="hevc", profile="main", pixel_format="yuv420p"),
+        _metadata(
+            codec="hevc",
+            profile="main 10",
+            pixel_format="p010le",
+            is_10bit=True,
+        ),
+    ],
+)
+def test_auto_linux_amd_selects_private_deferred_amf_interop(
+    monkeypatch,
+    metadata: VideoMetadata,
+) -> None:
     monkeypatch.setattr(module.sys, "platform", "linux")
     monkeypatch.setattr(module, "current_stream", lambda _device: None)
     monkeypatch.setattr(module, "vendor_for_device", lambda _device: AcceleratorVendor.AMD)
-    loader = MagicMock(side_effect=AssertionError("auto must not load bridge"))
-    monkeypatch.setattr(module, "_load_amf_interop_bridge", loader)
-    reader = module.NvidiaVideoReader("input.mp4", 4, torch.device("cpu"), _metadata())
-    pyav_open = MagicMock()
-    monkeypatch.setattr(reader, "_open_pyav", pyav_open)
+    reader = module.NvidiaVideoReader("input.mp4", 4, torch.device("cpu"), metadata)
+    native_open = MagicMock()
+    monkeypatch.setattr(reader, "_open_amf_interop_backend", native_open)
 
     reader.__enter__()
 
     assert reader._decode_backend == "auto"
-    loader.assert_not_called()
+    native_open.assert_called_once_with(decode_copy_stream="private-deferred")
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        _metadata(codec="av1", profile="main", pixel_format="yuv420p"),
+        _metadata(codec="h264", profile="baseline", pixel_format="yuv420p"),
+        _metadata(codec="vp9", profile="profile 0", pixel_format="yuv420p"),
+    ],
+)
+def test_auto_linux_amd_leaves_noneligible_formats_on_existing_order(
+    monkeypatch,
+    metadata: VideoMetadata,
+) -> None:
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    monkeypatch.setattr(module, "current_stream", lambda _device: None)
+    monkeypatch.setattr(module, "vendor_for_device", lambda _device: AcceleratorVendor.AMD)
+    reader = module.NvidiaVideoReader("input.mp4", 4, torch.device("cpu"), metadata)
+    native_open = MagicMock()
+    pyav_open = MagicMock()
+    monkeypatch.setattr(reader, "_open_amf_interop_backend", native_open)
+    monkeypatch.setattr(reader, "_open_pyav", pyav_open)
+
+    reader.__enter__()
+
+    native_open.assert_not_called()
     pyav_open.assert_called_once_with(software_only=False)
+
+
+def test_auto_linux_amd_native_failure_is_terminal(monkeypatch) -> None:
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    monkeypatch.setattr(module, "current_stream", lambda _device: None)
+    monkeypatch.setattr(module, "vendor_for_device", lambda _device: AcceleratorVendor.AMD)
+    reader = module.NvidiaVideoReader("input.mp4", 4, torch.device("cpu"), _metadata())
+    native_open = MagicMock(side_effect=module.VideoDecodeError("native bridge failed"))
+    pyav_open = MagicMock()
+    monkeypatch.setattr(reader, "_open_amf_interop_backend", native_open)
+    monkeypatch.setattr(reader, "_open_pyav", pyav_open)
+
+    with pytest.raises(module.VideoDecodeError, match="native bridge failed"):
+        reader.__enter__()
+
+    pyav_open.assert_not_called()
 
 
 def test_missing_bridge_fails_closed(monkeypatch) -> None:
