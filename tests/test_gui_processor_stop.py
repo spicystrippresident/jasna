@@ -6,6 +6,13 @@ from jasna.gui.models import AppSettings, JobItem, JobStatus
 from jasna.gui.processor import Processor, ProgressUpdate
 
 
+@pytest.fixture(autouse=True)
+def _skip_gpu_cleanup_for_stop_tests(monkeypatch) -> None:
+    """Stop synchronization tests do not exercise GPU cache reclamation."""
+
+    monkeypatch.setattr("jasna.gui.processor._cleanup_torch", lambda _torch: None)
+
+
 class _FakePipeline:
     def __init__(self):
         self.cancel_requested = False

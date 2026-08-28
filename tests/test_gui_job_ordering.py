@@ -4,9 +4,18 @@ import threading
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
+import pytest
+
 from jasna.gui.processor import Processor, ProgressUpdate
 from jasna.gui.models import JobItem, JobStatus, AppSettings
 from jasna.post_export_action import PostExportVideoCommandError
+
+
+@pytest.fixture(autouse=True)
+def _skip_gpu_cleanup_for_ordering_tests(monkeypatch) -> None:
+    """Ordering tests must not inherit full-suite GPU synchronization cost."""
+
+    monkeypatch.setattr("jasna.gui.processor._cleanup_torch", lambda _torch: None)
 
 
 def _make_jobs(*names: str) -> list[JobItem]:

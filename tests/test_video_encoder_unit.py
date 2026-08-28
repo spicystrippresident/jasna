@@ -61,6 +61,17 @@ def _make_encoder(tmp_path, encoder_settings=None, codec="hevc", **meta_override
     )
 
 
+@pytest.fixture(autouse=True)
+def _use_nvidia_encoder_contracts_by_default(monkeypatch) -> None:
+    """This legacy suite asserts NVENC unless a test explicitly selects AMD."""
+
+    monkeypatch.setattr(
+        video_encoder_module,
+        "vendor_for_device",
+        lambda _device=None: AcceleratorVendor.NVIDIA,
+    )
+
+
 # Measured hevc_nvenc configuration; the HEVC path must never drift from it.
 _HEVC_OPTIONS_SNAPSHOT = {
     "preset": "p5",

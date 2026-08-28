@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
+import sys
+from types import ModuleType
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -57,17 +60,45 @@ def _build_session(
     amd: bool = False,
 ):
     compile_result = MagicMock(use_basicvsrpp_tensorrt=True)
+    basic_module = importlib.import_module(
+        "jasna.restorer.basicvsrpp_mosaic_restorer"
+    )
+    pipeline_module = importlib.import_module("jasna.restorer.restoration_pipeline")
+    tvai_cls = MagicMock(name="TvaiSecondaryRestorer")
+    unet_cls = MagicMock(name="Unet4xSecondaryRestorer")
+    rtx_cls = MagicMock(name="RtxSuperresSecondaryRestorer")
+
+    def stub_module(name: str, export: str, value) -> ModuleType:
+        module = ModuleType(name)
+        setattr(module, export, value)
+        return module
+
+    secondary_modules = {
+        "jasna.restorer.tvai_secondary_restorer": stub_module(
+            "jasna.restorer.tvai_secondary_restorer",
+            "TvaiSecondaryRestorer",
+            tvai_cls,
+        ),
+        "jasna.restorer.unet4x_secondary_restorer": stub_module(
+            "jasna.restorer.unet4x_secondary_restorer",
+            "Unet4xSecondaryRestorer",
+            unet_cls,
+        ),
+        "jasna.restorer.rtx_superres_secondary_restorer": stub_module(
+            "jasna.restorer.rtx_superres_secondary_restorer",
+            "RtxSuperresSecondaryRestorer",
+            rtx_cls,
+        ),
+    }
     with (
+        patch.dict(sys.modules, secondary_modules),
         patch("jasna.accelerator.is_amd_device", return_value=amd),
         patch(
             "jasna.engine_compiler.ensure_engines_compiled",
             return_value=compile_result,
         ) as compiled,
-        patch("jasna.restorer.basicvsrpp_mosaic_restorer.BasicvsrppMosaicRestorer") as restorer_cls,
-        patch("jasna.restorer.restoration_pipeline.RestorationPipeline") as pipeline_cls,
-        patch("jasna.restorer.tvai_secondary_restorer.TvaiSecondaryRestorer") as tvai_cls,
-        patch("jasna.restorer.unet4x_secondary_restorer.Unet4xSecondaryRestorer") as unet_cls,
-        patch("jasna.restorer.rtx_superres_secondary_restorer.RtxSuperresSecondaryRestorer") as rtx_cls,
+        patch.object(basic_module, "BasicvsrppMosaicRestorer") as restorer_cls,
+        patch.object(pipeline_module, "RestorationPipeline") as pipeline_cls,
     ):
         session = build_restoration_session(
             config,
