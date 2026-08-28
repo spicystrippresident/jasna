@@ -8,6 +8,13 @@ from jasna.gui.locales import t
 def validate_gui_start(settings: AppSettings) -> list[str]:
     errors: list[str] = []
 
+    from jasna.gui.hardware_policy import split_batch_size_custom_arg
+
+    try:
+        split_batch_size_custom_arg(settings.encoder_custom_args)
+    except ValueError:
+        errors.append(t("error_batch_size_custom_args"))
+
     from jasna.post_export_action import validate_post_export_action
     try:
         validate_post_export_action(settings.post_export_action, settings.post_export_command)
