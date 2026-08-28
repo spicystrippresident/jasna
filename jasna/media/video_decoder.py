@@ -42,7 +42,7 @@ _libcuda: ctypes.CDLL | None = None
 # - "pyav-hw": skip VALI, use the PyAV hwaccel path with its software fallback.
 # - "pyav-sw": force FFmpeg software decoding with GPU upload on every vendor.
 # - "amf-interop": explicit Linux AMD research backend.  It accepts only the
-#                  documented H.264/HEVC AMF Vulkan surface scope and copies
+#                  documented H.264/HEVC/AV1 AMF Vulkan surface scope and copies
 #                  directly to HIP, or raises; it is never selected by auto.
 DECODE_BACKEND = "auto"
 DECODE_BACKEND_ENV = "JASNA_DECODE_BACKEND"
@@ -127,6 +127,12 @@ def _amf_interop_format_supported(metadata: VideoMetadata) -> bool:
         # ffprobe reports the source decoder's common yuv420p label; native
         # AMF output is checked separately at the first returned frame.
         return profile in {"main", "high"} and not is_10bit
+    if codec == "av1":
+        if profile != "main":
+            return False
+        if is_10bit:
+            return pixel_format in {"yuv420p10le", "p010le"}
+        return pixel_format in {"yuv420p", "nv12"}
     if codec != "hevc":
         return False
     if not is_10bit and profile == "main":
@@ -1262,7 +1268,8 @@ class NvidiaVideoReader:
         if not _amf_interop_format_supported(self.metadata):
             failures.append(
                 "only fixed-format H.264 Main/High 8-bit NV12, HEVC Main 8-bit "
-                "NV12, or HEVC Main10 10-bit P010 is accepted"
+                "NV12, HEVC Main10 10-bit P010, AV1 Main 8-bit NV12, or AV1 "
+                "Main 10-bit P010 is accepted"
             )
         if int(self.batch_size) not in _AMF_INTEROP_READER_BATCH_SIZES:
             failures.append(

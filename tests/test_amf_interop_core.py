@@ -78,6 +78,10 @@ def test_backend_enumeration_and_environment_override(monkeypatch) -> None:
         ("h264", "high", "nv12", False),
         ("hevc", "main", "yuv420p", False),
         ("hevc", "main 10", "p010le", True),
+        ("av1", "main", "yuv420p", False),
+        ("av1", "main", "nv12", False),
+        ("av1", "main", "yuv420p10le", True),
+        ("av1", "main", "p010le", True),
     ],
 )
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8])
@@ -110,11 +114,11 @@ def test_linux_amd_scope_accepts_only_supported_format_and_batch_matrix(
         (
             "linux",
             AcceleratorVendor.AMD,
-            _metadata(codec="av1", profile="main", pixel_format="yuv420p"),
+            _metadata(codec="vp9", profile="profile 0", pixel_format="yuv420p"),
         ),
     ],
 )
-def test_windows_nvidia_and_av1_are_rejected(
+def test_windows_nvidia_and_unsupported_codec_are_rejected(
     monkeypatch,
     platform: str,
     vendor: AcceleratorVendor,
@@ -124,6 +128,25 @@ def test_windows_nvidia_and_av1_are_rejected(
     reader = _reader(metadata, 4, vendor)
     with pytest.raises(module.VideoDecodeError, match="cannot satisfy"):
         reader._validate_amf_interop_scope()
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        _metadata(codec="av1", profile="professional", pixel_format="yuv420p"),
+        _metadata(codec="av1", profile="main", pixel_format="", is_10bit=False),
+        _metadata(codec="av1", profile="main", pixel_format="yuv420p12le", is_10bit=False),
+        _metadata(codec="av1", profile="main", pixel_format="yuv420p", is_10bit=True),
+        _metadata(codec="av1", profile="main", pixel_format="p010le", is_10bit=False),
+    ],
+)
+def test_av1_out_of_scope_profiles_depths_and_formats_are_rejected(
+    monkeypatch,
+    metadata: VideoMetadata,
+) -> None:
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    with pytest.raises(module.VideoDecodeError, match="cannot satisfy"):
+        _reader(metadata, 4)._validate_amf_interop_scope()
 
 
 @pytest.mark.parametrize("batch_size", [0, 3, 5, 16])
