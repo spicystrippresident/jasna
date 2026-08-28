@@ -3,9 +3,10 @@ from __future__ import annotations
 import heapq
 import logging
 import queue
+import sys
 import threading
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
 from types import MappingProxyType
@@ -30,6 +31,7 @@ from jasna.media import (
     AMF_SUPPORTED_ENCODER_SETTINGS_BY_CODEC,
     SUPPORTED_ENCODER_SETTINGS_BY_CODEC,
     VideoMetadata,
+    hevc_level_to_amf_option,
     validate_encoder_settings,
 )
 from jasna.media.audio_utils import needs_audio_reencode
@@ -156,6 +158,10 @@ DEFAULT_AMF_AV1_ENCODER_OPTIONS: dict[str, str] = {
 NVENC_SMART_FRAGMENT_OPTIONS = MappingProxyType({"forced-idr": "1"})
 AMF_SMART_FRAGMENT_OPTIONS = MappingProxyType({"forced_idr": "1"})
 
+# CQP 30 measured near the portable CQ 28 source-quality point for Linux AMF
+# HEVC fragments. Keep the shared CQ scale with a fragment-only offset.
+AMD_HEVC_CQP_OFFSET = 2
+
 
 @dataclass(frozen=True)
 class EncoderSpec:
@@ -249,6 +255,8 @@ _COLOR_TRANSFERS = {
     "smpte2084": 16,
     "arib-std-b67": 18,
 }
+_COLOR_PRIMARIES_BY_CODE = {value: key for key, value in _COLOR_PRIMARIES.items()}
+_COLOR_TRANSFERS_BY_CODE = {value: key for key, value in _COLOR_TRANSFERS.items()}
 _COLOR_VARIANTS = {
     (AvColorspace.ITU709, AvColorRange.MPEG): "bt709_limited",
     (AvColorspace.ITU709, AvColorRange.JPEG): "bt709_full",
@@ -259,6 +267,73 @@ _COLOR_VARIANTS = {
 }
 
 _NVENC_PITCH_ALIGNMENT = 16
+
+
+def resolve_hevc_smart_render_vui(
+    metadata: VideoMetadata,
+) -> tuple[VideoMetadata, Fraction]:
+    """Return encoder-only metadata matching the source HEVC SPS VUI."""
+
+    replacements: dict[str, object] = {}
+    output_fps = metadata.video_fps_exact
+    try:
+        with av.open(metadata.video_file) as source:
+            stream = source.streams.video[0]
+            context_rate = stream.codec_context.framerate or stream.codec_context.rate
+            if context_rate is not None and context_rate > 0:
+                output_fps = Fraction(context_rate)
+            frame = next(source.decode(stream), None)
+            if frame is not None:
+                try:
+                    color_range = AvColorRange(int(frame.color_range))
+                    colorspace = AvColorspace(int(frame.colorspace))
+                except ValueError:
+                    color_range = None
+                    colorspace = None
+                if (colorspace, color_range) in _COLOR_VARIANTS:
+                    replacements["color_range"] = color_range
+                    replacements["color_space"] = colorspace
+                primaries = _COLOR_PRIMARIES_BY_CODE.get(int(frame.color_primaries))
+                transfer = _COLOR_TRANSFERS_BY_CODE.get(int(frame.color_trc))
+                if primaries is not None:
+                    replacements["color_primaries"] = primaries
+                if transfer is not None:
+                    replacements["color_transfer"] = transfer
+    except (av.FFmpegError, IndexError, TypeError, ValueError, OSError) as exc:
+        logger.warning(
+            "Could not read HEVC source VUI from %s: %s",
+            metadata.video_file,
+            exc,
+        )
+    replacements.update(
+        video_fps=float(output_fps),
+        average_fps=float(output_fps),
+        video_fps_exact=output_fps,
+    )
+    return replace(metadata, **replacements), output_fps
+
+
+def add_amd_hevc_smart_fragment_source_level(
+    encoder_settings: Mapping[str, object],
+    metadata: VideoMetadata,
+    *,
+    codec: str,
+    vendor: AcceleratorVendor,
+) -> dict[str, object]:
+    """Add source HEVC level to Linux AMF fragments when not explicit."""
+
+    effective = dict(encoder_settings)
+    if (
+        vendor is not AcceleratorVendor.AMD
+        or sys.platform != "linux"
+        or codec != "hevc"
+        or "level" in effective
+    ):
+        return effective
+    level = hevc_level_to_amf_option(metadata.hevc_level)
+    if level is not None:
+        effective["level"] = level
+    return effective
 
 # `cq` alone targets a fixed quality and ignores how the source was stored, so a
 # cheaply encoded source is re-encoded far above its own quality point and grows
@@ -445,6 +520,13 @@ class NvidiaVideoEncoder:
             raise RuntimeError(
                 f"GPU video encoding is not supported on {self.vendor.value}"
             )
+        if smart_fragment:
+            encoder_settings = add_amd_hevc_smart_fragment_source_level(
+                encoder_settings,
+                metadata,
+                codec=codec,
+                vendor=self.vendor,
+            )
         specs = (
             AMF_ENCODER_SPECS
             if self.vendor is AcceleratorVendor.AMD
@@ -519,6 +601,15 @@ class NvidiaVideoEncoder:
             # Supported Linux and Windows AMF runtimes cannot reliably open
             # P010 AV1 while PreAnalysis is enabled.
             self.encoder_options["preanalysis"] = "0"
+        use_amd_hevc_smart_fragment_cqp = (
+            self.vendor is AcceleratorVendor.AMD
+            and sys.platform == "linux"
+            and codec == "hevc"
+            and smart_fragment
+            and "cq" in encoder_settings
+            and "rc" not in encoder_settings
+            and "qvbr_quality_level" not in encoder_settings
+        )
         if encoder_settings:
             overrides = {k: _option_value(v) for k, v in encoder_settings.items()}
             # FFmpeg accepts both spellings for HEVC/H.264, but their defaults
@@ -527,12 +618,26 @@ class NvidiaVideoEncoder:
             if "spatial-aq" in overrides and "spatial_aq" in self.encoder_options:
                 overrides["spatial_aq"] = overrides.pop("spatial-aq")
             if self.vendor is AcceleratorVendor.AMD:
-                _normalize_amf_cq(
-                    codec,
-                    overrides,
-                    self.encoder_options,
-                    ten_bit=spec.ten_bit,
-                )
+                if use_amd_hevc_smart_fragment_cqp:
+                    portable_cq = int(overrides.pop("cq"))
+                    cqp = max(0, min(51, portable_cq + AMD_HEVC_CQP_OFFSET))
+                    self.encoder_options.pop("qvbr_quality_level", None)
+                    self.encoder_options.pop("vbaq", None)
+                    self.encoder_options.update(
+                        {
+                            "rc": "cqp",
+                            "qp_i": str(cqp),
+                            "qp_p": str(cqp),
+                            "preanalysis": "0",
+                        }
+                    )
+                else:
+                    _normalize_amf_cq(
+                        codec,
+                        overrides,
+                        self.encoder_options,
+                        ten_bit=spec.ten_bit,
+                    )
             else:
                 _drop_unsupported_nvenc_overrides(codec, overrides, self.encoder_options)
         uses_amf_hevc_cqp = (
@@ -565,6 +670,15 @@ class NvidiaVideoEncoder:
                 metadata.video_bitrate
                 or max(2_000_000, min(100_000_000, round(pixel_rate * 0.02)))
             )
+        if (
+            smart_fragment
+            and self.vendor is AcceleratorVendor.AMD
+            and sys.platform == "linux"
+            and codec == "hevc"
+        ):
+            # Repeated HEVC fragment sessions can abort natively with
+            # PreAnalysis enabled; custom settings cannot re-enable it.
+            self.encoder_options["preanalysis"] = "0"
         if self.smart_fragment:
             self.encoder_options.update(spec.smart_fragment_options)
 
