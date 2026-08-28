@@ -508,6 +508,9 @@ class MosaicScanWorker:
         import torch
 
         from jasna.accelerator import is_amd_device
+        # Deliberately use the shared reader with its product ``auto`` policy.
+        # Scan owns sampling only; it must not grow a scan-specific rocDecode or
+        # AMD host-decode branch beside the normal processing route.
         from jasna.media.video_decoder import NvidiaVideoReader
 
         metadata = self.metadata
@@ -692,6 +695,7 @@ class MosaicScanWorker:
     def _detect_mask(self, detector, command: _MaskRequest) -> ScanMaskReady:
         import torch
 
+        # Preview and whole-video scan share the same product auto reader.
         from jasna.media.video_decoder import NvidiaVideoReader
 
         metadata = self.metadata
