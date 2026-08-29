@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import gc
+import json
+import logging
 import weakref
 from fractions import Fraction
 from types import SimpleNamespace
@@ -575,6 +577,10 @@ class _CacheIdentitySession(_IdentitySession):
             "cache_fd_export_failures": 0,
             "cache_fd_stat_calls": self.copy_calls,
             "cache_fd_stat_failures": 0,
+            "cache_fd_close_calls": self.copy_calls - misses,
+            "cache_fd_close_failures": 0,
+            "cache_last_fd_close_errno": 0,
+            "cache_fd_ownership_transfers": misses,
             "vulkan_memory_exports": self.copy_calls,
             "hip_external_memory_imports": misses,
             "hip_mapped_buffer_acquires": misses,
@@ -758,6 +764,61 @@ def test_av1_cache_open_uses_session_cache_and_balances_reader_epoch(monkeypatch
     assert reader.amf_interop_stats["resource_cache_misses"] == 2
     assert reader.amf_interop_stats["hip_external_memory_imports"] == 2
     assert reader.amf_interop_stats["hip_external_memory_destroys"] == 2
+    assert reader.amf_interop_stats["cache_fd_close_calls"] == 2
+    assert reader.amf_interop_stats["cache_fd_close_failures"] == 0
+    assert reader.amf_interop_stats["cache_fd_ownership_transfers"] == 2
+
+
+def test_cache_close_audit_fails_closed_on_native_fd_close_error() -> None:
+    session = _CacheIdentitySession(misses=1)
+    audit = _audit(
+        copy=session.copy_amf_surface_to_hip_resource_cache,
+        session=session,
+        resource_cache=True,
+    )
+    audit.copy_to_hip(object(), 1, 128)
+    audit.copy_to_hip(object(), 2, 128)
+    audit.close()
+    original_stats = session.stats
+
+    def failed_close_stats():
+        stats = original_stats()
+        stats["cache_fd_close_failures"] = 1
+        stats["cache_last_fd_close_errno"] = 9
+        return stats
+
+    session.stats = failed_close_stats
+
+    with pytest.raises(module.VideoDecodeError, match="resource/lifetime"):
+        audit.validate_closed()
+
+
+def test_reader_close_serializes_validated_transport_audit(caplog) -> None:
+    stats = {
+        "schema": "jasna.amf.vulkan-hip-transport.v1",
+        "copy_to_hip_calls": 120,
+        "fixed_context_session_closed": True,
+    }
+    audit = SimpleNamespace(
+        close=MagicMock(),
+        validate_closed=MagicMock(return_value=stats),
+        snapshot=MagicMock(side_effect=AssertionError("partial snapshot used")),
+    )
+    reader = _reader(_metadata(), 1)
+    reader._amf_interop_audit = audit
+
+    with caplog.at_level(logging.INFO, logger=module.__name__):
+        reader._close_amf_interop_backend(validate=True)
+
+    audit.close.assert_called_once_with()
+    audit.validate_closed.assert_called_once_with()
+    records = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith(module.AMF_INTEROP_STATS_PREFIX)
+    ]
+    assert len(records) == 1
+    assert json.loads(records[0][len(module.AMF_INTEROP_STATS_PREFIX) :]) == stats
 
 
 def test_deferred_open_requires_session_entrypoint_and_dependency_probe(monkeypatch) -> None:
