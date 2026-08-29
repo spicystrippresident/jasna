@@ -23,17 +23,27 @@ native AMF bridge、缺少真实模型/媒体/NVIDIA 编码硬件，以及原仓
 ## 审计边界
 
 - 产品默认仍是 B4；B8 只由 GUI 自定义参数 `--batch-size 8` 显式选择。
-- AMF resource cache 默认关闭；没有修改共享检测阈值、Tracker、BasicVSR++ 编排或
-  NVIDIA restoration 路线。
-- Linux H.264/HEVC 已进入统一 PyAV/AMF native D2D 产品路由；AV1 仍保留临时
-  rocDecode fallback，不能在完整 8/10-bit 产品门之前删除。
+- AMF resource cache 只对 Linux AMD AV1 Main NV12/P010 的 `auto` 默认开启；
+  H.264/HEVC、Windows、NVIDIA 均不启用。没有修改共享检测阈值、Tracker、
+  BasicVSR++ 编排或 NVIDIA restoration 路线。
+- Linux H.264/HEVC 已进入统一 PyAV/AMF native D2D 产品路由。AV1 native 已完成
+  8/10-bit、4K/8K、10,000 帧生命周期、停止/关闭和 strict/hash 验收，但公平性能门
+  用户随后明确接受稳定 cache 的剩余性能差距，因此 AV1 已进入产品 `auto`；rocDecode
+  暂时保留为显式诊断及 native gate 外兼容能力。
 - 工作树验收只允许保留故意的未跟踪文件 `1` 和
   `docs/CHECKPOINT_FEATURE_AUDIT_CN.md`；生成媒体、模型、缓存和 build 输出不得进入 PR。
 
-## 尚需外部环境完成
+## Linux AV1 收口结论
 
-1. Windows 按 PR 分段预检后，再做累计链 runtime、H.264/HEVC/AV1、Smart Render、
-   Stop/cancel、原子发布、run log 与打包验收。
-2. Linux AV1 native interop 补齐真实 8-bit/10-bit、4K/8K（有对应样本时）、长生命周期、
-   strict decode、帧数/PTS/hash、资源配平、性能、取消/关闭和既定温控门。
-3. 只有以上两项完成，才另建独立 PR 删除 rocDecode；本轮不提前删除或静默绕过它。
+Linux AV1 native interop 的能力边界验收已经完成，完整证据位于
+`docs/AMF_AV1_NATIVE_CN.md` 所列事务目录。正确性与资源生命周期通过；三轮交错纯
+解码中 native B4 中位数 `412.756 fps`，rocDecode B4 `1000.787 fps`，替换性能门
+失败。后续稳定 dma-buf cache 两轮 10,000 帧实验中位把差距收窄到 `9.72%`；安全的
+产品实现因不能复用已交给下游的 RGB output slot，最终为 `924.696 fps`，比 rocDecode
+`1137.729 fps` 慢 `18.72%`。用户接受该差距后，当前裁决改为：
+
+1. Linux AMD AV1 Main NV12/P010 的 `auto` 默认启用单 reader epoch cache；
+2. 暂不删除 rocDecode，另行清点 native gate 外输入和显式诊断替代；
+3. 不把 AV1 失败结论扩大到已经通过验收的 H.264/HEVC native 产品路线；
+4. 不为追求实验吞吐复用已 yield 的 RGB 输出，不改变共享修复编排或产品默认 B4；
+5. Windows cache 必须单独实现 Win32 external-memory identity/lifecycle，不能复用 Linux FD 代码。
