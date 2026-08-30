@@ -10,6 +10,8 @@ by the exported dma-buf backing identity rather than reusable Vulkan handles.
 from av.video.frame cimport VideoFrame
 from libc.stdint cimport uint64_t, uintptr_t
 
+import os
+
 
 _TRANSPORT_STATS_SCHEMA = "jasna.amf.vulkan-hip-transport.v1"
 _transport_stats = {}
@@ -110,6 +112,7 @@ cdef extern from *:
     #include <stdint.h>
     #include <stdlib.h>
     #include <string.h>
+    #include <errno.h>
     #include <unistd.h>
     #include <sys/stat.h>
     #include <dlfcn.h>
@@ -155,6 +158,8 @@ cdef extern from *:
         uint64_t fd_device;
         uint64_t fd_inode;
         int fd_stat_result;
+        int fd_close_result;
+        int fd_close_errno;
         int cache_hit;
         int cache_miss;
     } JasnaAmfCopyInfo;
@@ -245,6 +250,8 @@ cdef extern from *:
         uint64_t resource_cache_fd_stat_calls;
         uint64_t resource_cache_fd_stat_failures;
         uint64_t resource_cache_fd_close_calls;
+        uint64_t resource_cache_fd_close_failures;
+        int resource_cache_last_fd_close_errno;
         uint64_t resource_cache_fd_ownership_transfers;
         uint64_t resource_cache_raw_handle_identity_changes;
         uint64_t resource_cache_stable_identity_raw_handle_changes;
@@ -297,6 +304,8 @@ cdef extern from *:
         uint64_t resource_cache_fd_stat_calls;
         uint64_t resource_cache_fd_stat_failures;
         uint64_t resource_cache_fd_close_calls;
+        uint64_t resource_cache_fd_close_failures;
+        int resource_cache_last_fd_close_errno;
         uint64_t resource_cache_fd_ownership_transfers;
         uint64_t resource_cache_raw_handle_identity_changes;
         uint64_t resource_cache_stable_identity_raw_handle_changes;
@@ -1101,6 +1110,10 @@ cdef extern from *:
             session->resource_cache_fd_stat_failures;
         stats->resource_cache_fd_close_calls =
             session->resource_cache_fd_close_calls;
+        stats->resource_cache_fd_close_failures =
+            session->resource_cache_fd_close_failures;
+        stats->resource_cache_last_fd_close_errno =
+            session->resource_cache_last_fd_close_errno;
         stats->resource_cache_fd_ownership_transfers =
             session->resource_cache_fd_ownership_transfers;
         stats->resource_cache_raw_handle_identity_changes =
@@ -1799,6 +1812,8 @@ cdef extern from *:
         info->wait_result = VK_SUCCESS;
         info->export_result = -1;
         info->fd_stat_result = -1;
+        info->fd_close_result = 0;
+        info->fd_close_errno = 0;
         info->hip_result = -1;
         info->hip_free_result = -1;
         info->hip_destroy_result = -1;
@@ -1992,14 +2007,19 @@ cdef extern from *:
         if (matched_index >= 0) {
             session->resource_cache_hits += 1;
             info->cache_hit = 1;
-            if (close(fd) != 0) {
+            session->resource_cache_fd_close_calls += 1;
+            info->fd_close_result = close(fd);
+            if (info->fd_close_result != 0) {
+                info->fd_close_errno = errno;
+                session->resource_cache_fd_close_failures += 1;
+                session->resource_cache_last_fd_close_errno =
+                    info->fd_close_errno;
                 fd = -1;
                 *error = "closing a cache-hit exported dma-buf fd failed";
                 status = -21;
                 goto cleanup;
             }
             fd = -1;
-            session->resource_cache_fd_close_calls += 1;
         } else {
             JasnaAmfDmabufCacheEntry *entry;
             hipExternalMemoryHandleDesc memory_description;
@@ -2118,8 +2138,17 @@ cdef extern from *:
             }
         }
         if (fd >= 0) {
-            close(fd);
             session->resource_cache_fd_close_calls += 1;
+            info->fd_close_result = close(fd);
+            if (info->fd_close_result != 0) {
+                info->fd_close_errno = errno;
+                session->resource_cache_fd_close_failures += 1;
+                session->resource_cache_last_fd_close_errno =
+                    info->fd_close_errno;
+            }
+            /* Linux releases fd on close errors other than EBADF.  Never
+             * retry here because the integer may already have been reused. */
+            fd = -1;
         }
         if (context1) {
             context1->pVtbl->Release(context1);
@@ -2161,6 +2190,8 @@ cdef extern from *:
         unsigned long long fd_device
         unsigned long long fd_inode
         int fd_stat_result
+        int fd_close_result
+        int fd_close_errno
         int cache_hit
         int cache_miss
 
@@ -2213,6 +2244,8 @@ cdef extern from *:
         unsigned long long resource_cache_fd_stat_calls
         unsigned long long resource_cache_fd_stat_failures
         unsigned long long resource_cache_fd_close_calls
+        unsigned long long resource_cache_fd_close_failures
+        int resource_cache_last_fd_close_errno
         unsigned long long resource_cache_fd_ownership_transfers
         unsigned long long resource_cache_raw_handle_identity_changes
         unsigned long long resource_cache_stable_identity_raw_handle_changes
@@ -2309,6 +2342,8 @@ def _cached_copy_result(JasnaAmfCopyInfo info):
             "fd_device": int(info.fd_device),
             "fd_inode": int(info.fd_inode),
             "fd_stat_result": info.fd_stat_result,
+            "fd_close_result": info.fd_close_result,
+            "fd_close_errno": info.fd_close_errno,
             "cache_hit": bool(info.cache_hit),
             "cache_miss": bool(info.cache_miss),
             "copy_synchronization": "null-stream-cache-retained",
@@ -2651,6 +2686,12 @@ cdef class AmfVulkanHipInteropSession:
             "cache_fd_stat_calls": int(stats.resource_cache_fd_stat_calls),
             "cache_fd_stat_failures": int(stats.resource_cache_fd_stat_failures),
             "cache_fd_close_calls": int(stats.resource_cache_fd_close_calls),
+            "cache_fd_close_failures": int(
+                stats.resource_cache_fd_close_failures
+            ),
+            "cache_last_fd_close_errno": int(
+                stats.resource_cache_last_fd_close_errno
+            ),
             "cache_fd_ownership_transfers": int(
                 stats.resource_cache_fd_ownership_transfers
             ),
@@ -2830,10 +2871,17 @@ cdef class AmfVulkanHipInteropSession:
         if status != 0:
             _transport_stats["copy_to_hip_failures"] += 1
             message = error.decode("utf-8", "replace") if error != NULL else "unknown error"
+            close_error = (
+                os.strerror(info.fd_close_errno)
+                if info.fd_close_errno > 0
+                else "not recorded"
+            )
             raise RuntimeError(
                 f"cached fixed-context AMF-to-HIP D2D copy failed ({status}, "
                 f"Vulkan wait {info.wait_result}, Vulkan export {info.export_result}, "
-                f"fstat {info.fd_stat_result}, HIP {info.hip_result}): {message}"
+                f"fstat {info.fd_stat_result}, close {info.fd_close_result}, "
+                f"errno {info.fd_close_errno} ({close_error}), "
+                f"HIP {info.hip_result}): {message}"
             )
         _transport_stats["copy_to_hip_successes"] += 1
         _transport_stats["vulkan_memory_exports"] += 1

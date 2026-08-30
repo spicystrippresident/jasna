@@ -1,5 +1,6 @@
 import ctypes
 import importlib
+import json
 import logging
 import os
 import sys
@@ -63,6 +64,7 @@ _DECODE_BACKENDS = (
 _AMF_INTEROP_MODULE = "_jasna_amf_surface_probe"
 AMF_INTEROP_RESOURCE_CACHE_ENV = "JASNA_AMF_INTEROP_RESOURCE_CACHE"
 AMF_INTEROP_DECODE_COPY_STREAM_ENV = "JASNA_AMF_INTEROP_DECODE_COPY_STREAM"
+AMF_INTEROP_STATS_PREFIX = "AMF interop transport stats reader="
 _AMF_INTEROP_READER_BATCH_SIZES = frozenset({1, 2, 4, 8})
 _AMF_INTEROP_DECODE_COPY_STREAMS = frozenset({"null", "private-deferred"})
 
@@ -1247,6 +1249,10 @@ class _AmfInteropTransportAudit:
                 "cache_fd_export_failures",
                 "cache_fd_stat_calls",
                 "cache_fd_stat_failures",
+                "cache_fd_close_calls",
+                "cache_fd_close_failures",
+                "cache_last_fd_close_errno",
+                "cache_fd_ownership_transfers",
             ):
                 if name in session_stats:
                     target = {
@@ -1322,6 +1328,11 @@ class _AmfInteropTransportAudit:
                 and int(stats.get("cache_fd_export_failures", -1)) == 0
                 and int(stats.get("cache_fd_stat_calls", -1)) == calls
                 and int(stats.get("cache_fd_stat_failures", -1)) == 0
+                and int(stats.get("cache_fd_close_calls", -1))
+                == int(stats["resource_cache_hits"])
+                and int(stats.get("cache_fd_close_failures", -1)) == 0
+                and int(stats.get("cache_last_fd_close_errno", -1)) == 0
+                and int(stats.get("cache_fd_ownership_transfers", -1)) == misses
                 and stats["resource_cache_session_create_calls"] == 1
                 and stats["resource_cache_session_close_calls"] == 1
                 and stats["resource_cache_session_close_failures"] == 0
@@ -2133,6 +2144,11 @@ class NvidiaVideoReader:
         # Normal close still applies full lifecycle validation; exceptional
         # close records the audit without replacing the original native cause.
         self.amf_interop_stats = audit.validate_closed() if validate else audit.snapshot()
+        log.info(
+            "%s%s",
+            AMF_INTEROP_STATS_PREFIX,
+            json.dumps(self.amf_interop_stats, sort_keys=True),
+        )
         self._amf_interop_enabled = False
         self._amf_interop_audit = None
         self._amf_interop_bridge = None
