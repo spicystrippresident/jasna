@@ -44,6 +44,7 @@ def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_pat
         180,
         max_b_frames=3,
         uses_b_references=False,
+        decode_delay_pts=2,
     )
     plan = SplicePlan(
         index=index,
@@ -66,9 +67,8 @@ def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_pat
         patch("jasna.pipeline.build_splice_plan") as build_splice_plan,
         patch("jasna.pipeline.NvidiaVideoEncoder") as encoder,
         patch("jasna.pipeline.create_copy_fragment") as copy_fragment,
-        patch("jasna.pipeline.normalize_fragment"),
-        patch("jasna.pipeline.concatenate_fragments") as concatenate,
-        patch("jasna.pipeline.mux_final_output") as mux,
+        patch("jasna.pipeline.normalize_fragment") as normalize_fragment,
+        patch("jasna.pipeline.mux_fragments_final_output") as mux,
     ):
         pipeline._run_smart(metadata)
 
@@ -92,8 +92,77 @@ def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_pat
     assert pass_args["seek_ts"] == 2.0
     assert pass_args["end_pts"] == 120
     assert pass_args["effect_ranges"] == ((75, 90),)
-    concatenate.assert_called_once()
+    assert [call.kwargs for call in normalize_fragment.call_args_list] == [
+        {"codec": "h264"},
+        {"codec": "h264", "decode_delay": Fraction(1, 15)},
+        {"codec": "h264"},
+    ]
     mux.assert_called_once()
+    assert mux.call_args.args[0][0][0].parent == mux.call_args.kwargs["manifest"].parent
+
+
+def test_hevc_smart_run_checks_parameter_sets_and_bounded_copy_gops(tmp_path) -> None:
+    pipeline = object.__new__(Pipeline)
+    pipeline.input_video = tmp_path / "input.mkv"
+    pipeline.output_video = tmp_path / "output.mkv"
+    pipeline.codec = "hevc"
+    pipeline.encoder_settings = {"cq": 22}
+    pipeline.device = torch.device("cuda:0")
+    pipeline.disable_progress = True
+    pipeline.progress_callback = None
+    pipeline.lut_path = None
+    pipeline.sharpen_strength = 0.0
+    pipeline.retarget_high_fps = False
+    pipeline.segments = (SegmentRange(2.5, 3.0),)
+    pipeline.working_dir = tmp_path
+    pipeline._cancel_event = threading.Event()
+    pipeline._run_pass = MagicMock()
+    metadata = MagicMock(
+        video_fps=30.0,
+        video_fps_exact=Fraction(30, 1),
+        duration=6.0,
+        profile="Main 10",
+    )
+    plan = SplicePlan(
+        index=KeyframeIndex(
+            (0, 30, 60, 90, 120, 150),
+            Fraction(1, 30),
+            0,
+            180,
+        ),
+        spans=(
+            SpliceSpan("copy", 0, 60),
+            SpliceSpan("render", 60, 120, ((75, 90),)),
+            SpliceSpan("copy", 120, 180),
+        ),
+        segments=pipeline.segments,
+    )
+    pipeline.splice_plan = plan
+    with (
+        patch("jasna.pipeline.validate_smart_render", return_value="hevc"),
+        patch("jasna.pipeline.resolve_smart_encoder_settings", return_value={}),
+        patch("jasna.pipeline.NvidiaVideoEncoder") as encoder,
+        patch("jasna.pipeline.create_copy_fragment"),
+        patch("jasna.pipeline.normalize_fragment"),
+        patch("jasna.pipeline.validate_hevc_fragment_parameter_sets") as validate_sets,
+        patch("jasna.pipeline.mux_fragments_final_output") as mux,
+    ):
+        pipeline._run_smart(metadata)
+
+    assert encoder.call_args.kwargs["metadata"] is metadata
+    assert encoder.call_args.kwargs["output_fps"] == metadata.video_fps_exact
+    fragment_paths = [fragment for fragment, _duration in mux.call_args.args[0]]
+    validate_sets.assert_called_once_with(
+        [
+            (fragment_paths[0], "copy"),
+            (fragment_paths[1], "render"),
+            (fragment_paths[2], "copy"),
+        ]
+    )
+    assert mux.call_args.kwargs["copy_validation_ranges"] == (
+        (1.0, 1.0),
+        (4.0, 1.0),
+    )
 
 
 def test_smart_run_uses_working_dir_for_temp_files(tmp_path) -> None:
@@ -131,13 +200,13 @@ def test_smart_run_uses_working_dir_for_temp_files(tmp_path) -> None:
         patch("jasna.pipeline.NvidiaVideoEncoder"),
         patch("jasna.pipeline.create_copy_fragment"),
         patch("jasna.pipeline.normalize_fragment"),
-        patch("jasna.pipeline.concatenate_fragments"),
-        patch("jasna.pipeline.mux_final_output") as mux,
+        patch("jasna.pipeline.mux_fragments_final_output") as mux,
     ):
         pipeline._run_smart(metadata)
 
-    assembled = mux.call_args.args[0]
-    assert assembled.parent.parent == pipeline.working_dir
+    fragments = mux.call_args.args[0]
+    assert all(fragment.parent.parent == pipeline.working_dir for fragment, _ in fragments)
+    assert mux.call_args.kwargs["manifest"].parent.parent == pipeline.working_dir
     assert pipeline.working_dir.is_dir()
     assert pipeline.output_video.parent.is_dir()
 

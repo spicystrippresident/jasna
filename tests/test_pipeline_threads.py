@@ -20,6 +20,8 @@ from jasna.media import VideoMetadata
 from jasna.pipeline_items import ClipRestoreItem, FrameMeta, PrimaryRestoreResult, SecondaryRestoreResult, _SENTINEL
 from jasna.pipeline_threads import (
     FrameWriter,
+    _PtsAlignedFrameReader,
+    _PtsRecoveryCancelled,
     decode_detect_loop,
     primary_restore_loop,
     secondary_restore_loop,
@@ -60,12 +62,57 @@ def _mock_reader(batches, seek_ts_check=None):
     return r
 
 
+class _ScriptedPtsReader:
+    def __init__(
+        self,
+        batches,
+        *,
+        start_pts: int = 0,
+        decode_backend: str = "auto",
+        on_first_batch=None,
+    ) -> None:
+        self.batches = list(batches)
+        self.start_pts = start_pts
+        self._decode_backend = decode_backend
+        self.on_first_batch = on_first_batch
+        self.seek_calls: list[float | None] = []
+        self.enter_calls = 0
+        self.exit_calls = 0
+
+    def __enter__(self):
+        self.enter_calls += 1
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.exit_calls += 1
+
+    def frames(self, seek_ts=None):
+        self.seek_calls.append(seek_ts)
+        for index, batch in enumerate(self.batches):
+            if index == 0 and self.on_first_batch is not None:
+                self.on_first_batch()
+            yield batch
+
+
+def _pts_batch(*pts: int) -> tuple[torch.Tensor, list[int]]:
+    return torch.tensor([[value] for value in pts]), list(pts)
+
+
+def _mock_exact_reader(frames: torch.Tensor, pts: list[int]):
+    reader = MagicMock()
+    reader.__enter__ = MagicMock(return_value=reader)
+    reader.__exit__ = MagicMock(return_value=False)
+    by_pts = {int(frame_pts): frames[index] for index, frame_pts in enumerate(pts)}
+    reader.read_exact.side_effect = lambda frame_pts: by_pts[int(frame_pts)]
+    return reader
+
+
 class _RecordingWriter:
     def __init__(self):
         self.written: list[tuple[torch.Tensor, int]] = []
         self.after_write_calls: list[int] = []
 
-    def write(self, frame: torch.Tensor, pts: int) -> None:
+    def write(self, frame: torch.Tensor, pts: int, *, apply_lut: bool = True) -> None:
         self.written.append((frame, pts))
 
     def after_write(self, frames_written: int) -> None:
@@ -84,6 +131,120 @@ class TestEstimateStartFrame:
     def test_zero(self):
         meta = _fake_metadata(fps=24.0)
         assert _estimate_start_frame(meta, 0.0) == 0
+
+
+# ---------------------------------------------------------------------------
+# _PtsAlignedFrameReader — exact secondary-reader PTS recovery
+# ---------------------------------------------------------------------------
+
+class TestPtsAlignedFrameReader:
+    def _reader(self, *, cancel_event=None, seek_ts=None):
+        return _PtsAlignedFrameReader(
+            input_video="fake.mkv",
+            batch_size=4,
+            device=torch.device("cpu"),
+            metadata=_fake_metadata(),
+            frame_stride=1,
+            seek_ts=seek_ts,
+            cancel_event=cancel_event,
+        )
+
+    def test_exact_pts_fast_path_uses_initial_reader(self):
+        source = _ScriptedPtsReader([_pts_batch(40)])
+        with patch("jasna.pipeline_threads.NvidiaVideoReader", return_value=source) as factory:
+            with self._reader() as reader:
+                frame = reader.read_exact(40)
+        assert torch.equal(frame, torch.tensor([40]))
+        factory.assert_called_once()
+        assert factory.call_args.kwargs["decode_backend"] is None
+        assert source.seek_calls == [None]
+
+    def test_open_failure_preserves_original_error_before_reader_ownership(self):
+        class _FailingReader:
+            def __init__(self) -> None:
+                self.exit_called = False
+
+            def __enter__(self):
+                raise RuntimeError("decoder open failed")
+
+            def __exit__(self, exc_type, exc_value, traceback) -> None:
+                self.exit_called = True
+                raise AssertionError("unopened reader must not be closed")
+
+        source = _FailingReader()
+        with patch("jasna.pipeline_threads.NvidiaVideoReader", return_value=source):
+            with pytest.raises(RuntimeError, match="decoder open failed"):
+                self._reader().__enter__()
+        assert source.exit_called is False
+
+    def test_discards_stale_frames_before_exact_pts(self):
+        source = _ScriptedPtsReader([_pts_batch(38, 39, 40)])
+        with patch("jasna.pipeline_threads.NvidiaVideoReader", return_value=source):
+            with self._reader() as reader:
+                frame = reader.read_exact(40)
+        assert torch.equal(frame, torch.tensor([40]))
+
+    def test_forward_mismatch_reopens_same_product_route(self):
+        first = _ScriptedPtsReader([_pts_batch(41)])
+        recovered = _ScriptedPtsReader([_pts_batch(40)])
+        with patch(
+            "jasna.pipeline_threads.NvidiaVideoReader",
+            side_effect=[first, recovered],
+        ) as factory:
+            with self._reader() as reader:
+                frame = reader.read_exact(40)
+        assert torch.equal(frame, torch.tensor([40]))
+        assert [call.kwargs["decode_backend"] for call in factory.call_args_list] == [
+            None,
+            "auto",
+        ]
+        assert recovered.seek_calls == [40 / 24]
+
+    def test_retries_selected_route_twice_before_succeeding(self):
+        first = _ScriptedPtsReader([_pts_batch(41)])
+        retry_one = _ScriptedPtsReader([_pts_batch(41)])
+        retry_two = _ScriptedPtsReader([_pts_batch(40)])
+        with patch(
+            "jasna.pipeline_threads.NvidiaVideoReader",
+            side_effect=[first, retry_one, retry_two],
+        ) as factory:
+            with self._reader() as reader:
+                frame = reader.read_exact(40)
+        assert torch.equal(frame, torch.tensor([40]))
+        assert [call.kwargs["decode_backend"] for call in factory.call_args_list] == [
+            None,
+            "auto",
+            "auto",
+        ]
+    def test_unrecoverable_mismatch_is_terminal_without_cpu_fallback(self):
+        first = _ScriptedPtsReader([_pts_batch(41)])
+        retry_one = _ScriptedPtsReader([_pts_batch(41)])
+        retry_two = _ScriptedPtsReader([])
+        with patch(
+            "jasna.pipeline_threads.NvidiaVideoReader",
+            side_effect=[first, retry_one, retry_two],
+        ) as factory:
+            with self._reader() as reader:
+                with pytest.raises(RuntimeError, match="could not recover secondary-reader PTS mismatch"):
+                    reader.read_exact(40)
+        assert [call.kwargs["decode_backend"] for call in factory.call_args_list] == [
+            None,
+            "auto",
+            "auto",
+        ]
+        assert "pyav-sw" not in repr(factory.call_args_list)
+
+    def test_cancellation_aborts_recovery_without_reopening(self):
+        cancel_event = threading.Event()
+        first = _ScriptedPtsReader(
+            [_pts_batch(41)],
+            on_first_batch=cancel_event.set,
+        )
+        with patch("jasna.pipeline_threads.NvidiaVideoReader", return_value=first) as factory:
+            with self._reader(cancel_event=cancel_event) as reader:
+                with pytest.raises(_PtsRecoveryCancelled, match="cancelled"):
+                    reader.read_exact(40)
+        factory.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -442,7 +603,7 @@ class TestBlendEncodeLoop:
                           encode_items=None, metadata_items=None,
                           seek_ts=None):
         frames_t = torch.randint(0, 256, (2, 3, 8, 8), dtype=torch.uint8)
-        reader = _mock_reader([(frames_t, [0, 1])])
+        reader = _mock_exact_reader(frames_t, [0, 1])
 
         blend_buffer = BlendBuffer(device=torch.device("cpu"))
         encode_queue = FrameQueue(max_frames=999)
@@ -461,7 +622,7 @@ class TestBlendEncodeLoop:
             frame_writer = _RecordingWriter()
 
         with (
-            patch("jasna.pipeline_threads.NvidiaVideoReader", return_value=reader),
+            patch("jasna.pipeline_threads._PtsAlignedFrameReader", return_value=reader),
             patch("jasna.pipeline_threads.torch.cuda.set_device"),
         ):
             blend_encode_loop(
@@ -497,15 +658,8 @@ class TestBlendEncodeLoop:
         vram_offloader.pause_stall_check.assert_called_once()
 
     def test_seek_ts_passed_to_reader(self):
-        received_seek = []
         frames_t = torch.randint(0, 256, (1, 3, 8, 8), dtype=torch.uint8)
-        reader = MagicMock()
-        reader.__enter__ = MagicMock(return_value=reader)
-        reader.__exit__ = MagicMock(return_value=False)
-        def _frames(seek_ts=None):
-            received_seek.append(seek_ts)
-            return iter([(frames_t, [0])])
-        reader.frames = _frames
+        reader = _mock_exact_reader(frames_t, [0])
 
         blend_buffer = BlendBuffer(device=torch.device("cpu"))
         blend_buffer.register_frame(0, set())
@@ -515,7 +669,10 @@ class TestBlendEncodeLoop:
         metadata_queue.put(_SENTINEL)
 
         with (
-            patch("jasna.pipeline_threads.NvidiaVideoReader", return_value=reader),
+            patch(
+                "jasna.pipeline_threads._PtsAlignedFrameReader",
+                return_value=reader,
+            ) as factory,
             patch("jasna.pipeline_threads.torch.cuda.set_device"),
         ):
             blend_encode_loop(
@@ -531,14 +688,56 @@ class TestBlendEncodeLoop:
                 seek_ts=5.0,
             )
 
-        assert received_seek == [5.0]
+        assert factory.call_args.kwargs["seek_ts"] == 5.0
+
+    def test_requests_original_frame_by_metadata_pts_not_position(self):
+        requested_pts: list[int] = []
+
+        class _ExactReader:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback) -> None:
+                return None
+
+            def read_exact(self, pts: int) -> torch.Tensor:
+                requested_pts.append(pts)
+                return torch.full((3, 8, 8), pts, dtype=torch.int64)
+
+        metadata_queue = Queue()
+        metadata_queue.put(FrameMeta(frame_idx=0, pts=100, apply_effect=False))
+        metadata_queue.put(FrameMeta(frame_idx=1, pts=300, apply_effect=False))
+        metadata_queue.put(_SENTINEL)
+        writer = _RecordingWriter()
+
+        with (
+            patch(
+                "jasna.pipeline_threads._PtsAlignedFrameReader",
+                return_value=_ExactReader(),
+            ),
+            patch("jasna.pipeline_threads.torch.cuda.set_device"),
+        ):
+            blend_encode_loop(
+                input_video="fake.mkv",
+                batch_size=2,
+                device=torch.device("cpu"),
+                metadata=_fake_metadata(),
+                blend_buffer=BlendBuffer(device=torch.device("cpu")),
+                encode_queue=FrameQueue(max_frames=8),
+                metadata_queue=metadata_queue,
+                error_holder=[],
+                frame_writer=writer,
+            )
+
+        assert requested_pts == [100, 300]
+        assert [pts for _frame, pts in writer.written] == [100, 300]
 
     def test_error_holder_propagates_in_wait_loop(self):
         blend_buffer = BlendBuffer(device=torch.device("cpu"))
         blend_buffer.register_frame(0, {99})
 
         frames_t = torch.randint(0, 256, (1, 3, 8, 8), dtype=torch.uint8)
-        reader = _mock_reader([(frames_t, [0])])
+        reader = _mock_exact_reader(frames_t, [0])
 
         encode_queue = FrameQueue(max_frames=999)
         metadata_queue = Queue(maxsize=999)
@@ -555,7 +754,7 @@ class TestBlendEncodeLoop:
         t.start()
 
         with (
-            patch("jasna.pipeline_threads.NvidiaVideoReader", return_value=reader),
+            patch("jasna.pipeline_threads._PtsAlignedFrameReader", return_value=reader),
             patch("jasna.pipeline_threads.torch.cuda.set_device"),
         ):
             blend_encode_loop(
@@ -578,7 +777,7 @@ class TestBlendEncodeLoop:
         blend_buffer.register_frame(0, {99})
 
         frames_t = torch.randint(0, 256, (1, 3, 8, 8), dtype=torch.uint8)
-        reader = _mock_reader([(frames_t, [0])])
+        reader = _mock_exact_reader(frames_t, [0])
 
         encode_queue = FrameQueue(max_frames=999)
         encode_queue.put(_SENTINEL)
@@ -589,7 +788,7 @@ class TestBlendEncodeLoop:
         writer = _RecordingWriter()
 
         with (
-            patch("jasna.pipeline_threads.NvidiaVideoReader", return_value=reader),
+            patch("jasna.pipeline_threads._PtsAlignedFrameReader", return_value=reader),
             patch("jasna.pipeline_threads.torch.cuda.set_device"),
         ):
             blend_encode_loop(
@@ -611,7 +810,7 @@ class TestBlendEncodeLoop:
         # loop simply hands the untouched source frame to blend_frame.
         original = torch.randint(0, 256, (1, 3, 8, 8), dtype=torch.uint8)
         blended_out = torch.full_like(original[0], 30)
-        reader = _mock_reader([(original, [0])])
+        reader = _mock_exact_reader(original, [0])
         blend_buffer = MagicMock()
         blend_buffer.is_frame_ready.return_value = True
         blend_buffer.blend_frame.return_value = blended_out
@@ -621,7 +820,7 @@ class TestBlendEncodeLoop:
         writer = _RecordingWriter()
 
         with (
-            patch("jasna.pipeline_threads.NvidiaVideoReader", return_value=reader),
+            patch("jasna.pipeline_threads._PtsAlignedFrameReader", return_value=reader),
             patch("jasna.pipeline_threads.torch.cuda.set_device"),
         ):
             blend_encode_loop(
