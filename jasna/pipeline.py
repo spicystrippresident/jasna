@@ -208,6 +208,7 @@ class Pipeline:
         self.restoration_pipeline = None
 
     _ASYNC_POLL_TIMEOUT = 0.05
+    _ASYNC_CANCEL_JOIN_TIMEOUT = 5.0
 
     @staticmethod
     def _earliest_blocking_seqs(pending_prs: dict[int, PrimaryRestoreResult]) -> set[int] | None:
@@ -234,6 +235,9 @@ class Pipeline:
         cancel_event: threading.Event | None = None,
     ) -> SecondaryLoopStats:
         restorer: AsyncSecondaryRestorer = self.restoration_pipeline.secondary_restorer  # type: ignore[assignment]
+        set_cancel_event = getattr(restorer, "set_cancel_event", None)
+        if callable(set_cancel_event):
+            set_cancel_event(cancel_event)
         pending_prs: dict[int, PrimaryRestoreResult] = {}
         push_done = threading.Event()
         pusher_error: list[BaseException] = []
@@ -272,7 +276,11 @@ class Pipeline:
                     if push_elapsed > 0.05:
                         log.debug("[secondary] push_clip seq=%d took %.0fms", seq, push_elapsed * 1000)
             except BaseException as e:
-                pusher_error.append(e)
+                # A push interrupted by user Stop is a cancellation outcome,
+                # not a worker root cause.  Real errors observed before Stop
+                # remain eligible for first-error propagation below.
+                if cancel_event is None or not cancel_event.is_set():
+                    pusher_error.append(e)
             finally:
                 push_done.set()
 
@@ -354,10 +362,28 @@ class Pipeline:
 
         if starvation_start is not None:
             starvation_seconds += time.monotonic() - starvation_start
-        pusher_thread.join()
+        cancelled = cancel_event is not None and cancel_event.is_set()
+        if cancelled:
+            cancel_restorer = getattr(restorer, "cancel", None)
+            if callable(cancel_restorer):
+                try:
+                    stopped = cancel_restorer()
+                except BaseException:
+                    # User Stop remains authoritative.  Keep an incomplete
+                    # third-party shutdown observable in logs without
+                    # reclassifying it as a worker failure.
+                    log.exception("[secondary] async restorer cancellation failed")
+                else:
+                    if stopped is False:
+                        log.warning("[secondary] async restorer cancellation timed out")
+            pusher_thread.join(timeout=self._ASYNC_CANCEL_JOIN_TIMEOUT)
+            if pusher_thread.is_alive():
+                log.warning("[secondary] async pusher remained alive after cancellation timeout")
+        else:
+            pusher_thread.join()
         if pusher_error:
             raise pusher_error[0]
-        if cancel_event is not None and cancel_event.is_set():
+        if cancelled:
             return SecondaryLoopStats(
                 starvation_flushes=starvation_count,
                 starvation_seconds=starvation_seconds,

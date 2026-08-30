@@ -1,5 +1,6 @@
 from fractions import Fraction
 from pathlib import Path
+import threading
 from unittest.mock import MagicMock, patch, call
 
 from jasna.crop_buffer import RawCrop
@@ -606,6 +607,84 @@ class TestPipelineRun:
         assert not encode_queue.empty()
         result = encode_queue.get()
         assert result is sr_result
+
+    def test_run_secondary_loop_user_cancel_releases_async_push_without_root_error(self):
+        p = _make_pipeline()
+        p._ASYNC_POLL_TIMEOUT = 0.005
+        p._ASYNC_CANCEL_JOIN_TIMEOUT = 0.5
+        cancel_event = threading.Event()
+        push_started = threading.Event()
+        cancel_called = threading.Event()
+
+        class BlockingAsyncRestorer:
+            name = "blocking-test"
+            num_workers = 1
+
+            def __init__(self):
+                self.cancel_event = None
+                self.flush_all_called = False
+
+            @property
+            def has_pending(self):
+                return False
+
+            def set_cancel_event(self, event):
+                self.cancel_event = event
+
+            def push_clip(self, frames_256, *, keep_start, keep_end):
+                del frames_256, keep_start, keep_end
+                push_started.set()
+                assert self.cancel_event is not None
+                assert self.cancel_event.wait(timeout=0.5)
+                assert cancel_called.wait(timeout=0.5)
+                return 0
+
+            def pop_completed(self):
+                return []
+
+            def flush_pending(self, target_seqs=None):
+                del target_seqs
+                return False
+
+            def flush_all(self):
+                self.flush_all_called = True
+
+            def cancel(self):
+                cancel_called.set()
+                return True
+
+        restorer = BlockingAsyncRestorer()
+        p.restoration_pipeline.secondary_restorer = restorer
+        primary_result = MagicMock()
+        primary_result.primary_raw = torch.zeros((1, 3, 256, 256))
+        primary_result.keep_start = 0
+        primary_result.keep_end = 1
+        secondary_queue = FrameQueue(max_frames=8)
+        encode_queue = FrameQueue(max_frames=8)
+        secondary_queue.put(primary_result, frame_count=1)
+        outcome: list[BaseException] = []
+
+        def run_loop():
+            try:
+                p._run_secondary_loop(
+                    secondary_queue,
+                    encode_queue,
+                    cancel_event=cancel_event,
+                )
+            except BaseException as error:
+                outcome.append(error)
+
+        thread = threading.Thread(target=run_loop)
+        thread.start()
+        assert push_started.wait(timeout=0.5)
+        cancel_event.set()
+
+        thread.join(timeout=1.0)
+        assert not thread.is_alive()
+        assert outcome == []
+        assert restorer.cancel_event is cancel_event
+        assert cancel_called.is_set()
+        assert not restorer.flush_all_called
 
     def test_run_secondary_loop_no_flush_when_primary_busy(self):
         """No flush_pending when secondary_queue is empty but primary is busy (not idle)."""
