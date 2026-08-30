@@ -363,8 +363,13 @@ class NvidiaVideoReader:
             decoder.height = source_ctx.height
             # PyAV 18 rejects assigning time_base on a decoder ("Cannot access
             # 'time_base' as a decoder"); decoders take timing from packets.
-            decoder.framerate = source_ctx.framerate
-            decoder.sample_aspect_ratio = source_ctx.sample_aspect_ratio
+            # Source contexts in the accepted runtime can legitimately omit
+            # container framerate/SAR. Packets carry timing; assigning None
+            # makes PyAV reject an otherwise valid decoder before it opens.
+            if source_ctx.framerate is not None:
+                decoder.framerate = source_ctx.framerate
+            if source_ctx.sample_aspect_ratio is not None:
+                decoder.sample_aspect_ratio = source_ctx.sample_aspect_ratio
             decoder.open(strict=False)
             self._decoder_ctx = decoder
             self._amd_hardware_decode = True
