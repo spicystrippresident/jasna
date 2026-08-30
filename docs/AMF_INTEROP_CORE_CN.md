@@ -41,15 +41,19 @@ staging、D2H 或其他 decoder fallback。
    external-memory handle。
 2. 查询 AMF context/Vulkan device，并由 reader 固定 AMF frame-context、AMF
    context、Vulkan device 和 HIP device identity。
-3. 导出 Vulkan opaque FD，导入并映射为 HIP external memory，以两个
-   `hipMemcpy2D(..., hipMemcpyDeviceToDevice)` 复制 NV12/P010 的 Y/UV 平面。
+3. 导出 Vulkan opaque FD，导入为 HIP external memory 后立即由调用方关闭该
+   dma-buf FD，再映射并以两个 `hipMemcpy2D(..., hipMemcpyDeviceToDevice)` 复制
+   NV12/P010 的 Y/UV 平面。ROCm 7.2.1 不会替调用方关闭成功导入的 FD，不能把
+   `hipImportExternalMemory` 成功误当作 FD 所有权转移。
 4. 在 PyAV frame 可释放前同步 HIP null stream；随后释放 mapped buffer 和
    external-memory import。任一步失败均保留 native 原因并报错。
 
 bridge 和 reader 都输出 transport counters。reader 会拒绝非 D2D copy、host
 frame transfer、CPU Map、staging、D2H、`av_hwframe_transfer_data`、失败 copy、
-identity 变化，或 import/map/release/destroy 与 copy 数不配平的情况。固定
-context session 也必须 create/close 配平；关闭失败不会被吞掉。
+FD close 失败、identity 变化，或 export/FD close/import/map/release/destroy 与
+copy 数不配平的情况。每次 export 必须恰有一次可审计 close，最后一次 close
+errno 必须为 0。固定 context session 也必须 create/close 配平；关闭失败不会被
+吞掉。
 
 explicit decoder 不覆盖 FFmpeg 的 `surface_pool_size`。固定 runtime 在选项保持默认
 `-1` 时会自行派生 36 个 AMF decode surfaces，并给 AVHWFrames pool 追加 8 个。
@@ -91,7 +95,7 @@ frame、transport counter 拒绝、close 配平和 cache 默认值。现有 deco
 
 主会话用 accepted Linux AMD unified runtime（PyAV 18.1.0，固定 FFmpeg/PyAV/AMF
 source pin）重新在源码树外构建 bridge，产物 SHA-256 为
-`bb63430399c351da92227b9342ecab4d4bd7baac57a383bebccac2456c2d76ff`。随后以
+`b5efc58113e55a64545db647b3fce5723b490cc857e3fc08a52b46347dd2a9dc`。随后以
 `JASNA_DECODE_BACKEND=amf-interop`、batch 4 对三份静态 fixture 做完整只读验收，
 没有生成输出媒体：
 
@@ -109,6 +113,16 @@ GPU junction 为 66°C、memory sensor 为 68°C，低于既定停止门槛。�
 Main fixture 做过 B8 中途关闭：消费首批 8 帧后主动关闭 iterator，8 次
 export/import/map/release/destroy、16 次 D2D plane copy 和 session 1/1 全部配平，
 没有预取未消费的下一组 AMF surfaces，也没有残留测试进程。
+
+最终集合另用 8192×4096、60000/1001 fps 的 HEVC Main10 实际素材完成 B4
+private-deferred decode-only 1400 帧回归，超过修复前约 999 次 export 后失败的
+位置。1400 次 Vulkan export、FD close、HIP import/map/release/destroy 全部配平；
+每 100 帧读取一次 `/proc/self/fd`，从 100 到 1400 帧均为总 FD 9、dma-buf FD 0，
+reader 关闭后回到总 FD 6、dma-buf FD 0。PTS 严格递增，junction 峰值 68°C、
+显存使用峰值 11,259,826,176 bytes，运行窗口无 GPU reset、ring timeout、page
+fault 或 OOM。证据保存在
+`transactions/jasna-upstream-pr-desktop-cutover-20260830/fd-leak-fix/`；测试媒体不
+进入仓库。
 
 `dynamic-fixtures-rebuilt/hevc-dynamic.mkv` 不是静态 HEVC Main fixture：它在第 31
 帧从 640×320 8-bit 切换为 1280×640 10-bit。该输入违反 fixed-context/fixed-format

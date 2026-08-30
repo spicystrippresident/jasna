@@ -26,6 +26,9 @@ def reset_transport_stats():
         "copy_to_hip_successes": 0,
         "copy_to_hip_failures": 0,
         "vulkan_memory_exports": 0,
+        "vulkan_export_fd_close_calls": 0,
+        "vulkan_export_fd_close_failures": 0,
+        "last_vulkan_export_fd_close_errno": 0,
         "hip_external_memory_imports": 0,
         "hip_external_memory_destroys": 0,
         "hip_mapped_buffer_acquires": 0,
@@ -158,6 +161,7 @@ cdef extern from *:
         uint64_t fd_device;
         uint64_t fd_inode;
         int fd_stat_result;
+        int fd_close_calls;
         int fd_close_result;
         int fd_close_errno;
         int cache_hit;
@@ -1383,6 +1387,7 @@ cdef extern from *:
             return -26;
         }
         memset(info, 0, sizeof(*info));
+        info->fd_close_result = -1;
         info->hip_result = -1;
         info->hip_free_result = -1;
         info->hip_destroy_result = -1;
@@ -1543,7 +1548,20 @@ cdef extern from *:
                 status = -19;
                 goto cleanup;
             }
-            /* Opaque-fd ownership transfers to HIP after a successful import. */
+            /*
+             * HIP retains its own reference after a successful import.  ROCm
+             * does not close the Vulkan-exported dma-buf descriptor for the
+             * caller, so close it now instead of leaking one fd per frame.
+             */
+            info->fd_close_calls += 1;
+            info->fd_close_result = close(fd);
+            if (info->fd_close_result != 0) {
+                info->fd_close_errno = errno;
+                fd = -1;
+                *error = "closing the imported Vulkan dma-buf fd failed";
+                status = -34;
+                goto cleanup;
+            }
             fd = -1;
             memset(&buffer_description, 0, sizeof(buffer_description));
             buffer_description.size = (unsigned long long)vk_surface->iSize;
@@ -1759,7 +1777,13 @@ cdef extern from *:
             }
         }
         if (fd >= 0) {
-            close(fd);
+            info->fd_close_calls += 1;
+            info->fd_close_result = close(fd);
+            if (info->fd_close_result != 0) {
+                info->fd_close_errno = errno;
+            }
+            /* Never retry close(): the descriptor number may be reused. */
+            fd = -1;
         }
         if (context1) {
             context1->pVtbl->Release(context1);
@@ -1812,7 +1836,7 @@ cdef extern from *:
         info->wait_result = VK_SUCCESS;
         info->export_result = -1;
         info->fd_stat_result = -1;
-        info->fd_close_result = 0;
+        info->fd_close_result = -1;
         info->fd_close_errno = 0;
         info->hip_result = -1;
         info->hip_free_result = -1;
@@ -2008,6 +2032,7 @@ cdef extern from *:
             session->resource_cache_hits += 1;
             info->cache_hit = 1;
             session->resource_cache_fd_close_calls += 1;
+            info->fd_close_calls += 1;
             info->fd_close_result = close(fd);
             if (info->fd_close_result != 0) {
                 info->fd_close_errno = errno;
@@ -2046,8 +2071,20 @@ cdef extern from *:
                 goto cleanup;
             }
             session->hip_external_memory_imports += 1;
+            session->resource_cache_fd_close_calls += 1;
+            info->fd_close_calls += 1;
+            info->fd_close_result = close(fd);
+            if (info->fd_close_result != 0) {
+                info->fd_close_errno = errno;
+                session->resource_cache_fd_close_failures += 1;
+                session->resource_cache_last_fd_close_errno =
+                    info->fd_close_errno;
+                fd = -1;
+                *error = "closing a cache-miss imported dma-buf fd failed";
+                status = -28;
+                goto cleanup;
+            }
             fd = -1;
-            session->resource_cache_fd_ownership_transfers += 1;
             memset(&buffer_description, 0, sizeof(buffer_description));
             buffer_description.size = (unsigned long long)vk_surface->iSize;
             info->hip_result = jasna_hip_map_buffer(
@@ -2139,6 +2176,7 @@ cdef extern from *:
         }
         if (fd >= 0) {
             session->resource_cache_fd_close_calls += 1;
+            info->fd_close_calls += 1;
             info->fd_close_result = close(fd);
             if (info->fd_close_result != 0) {
                 info->fd_close_errno = errno;
@@ -2190,6 +2228,7 @@ cdef extern from *:
         unsigned long long fd_device
         unsigned long long fd_inode
         int fd_stat_result
+        int fd_close_calls
         int fd_close_result
         int fd_close_errno
         int cache_hit
@@ -2311,6 +2350,9 @@ def _copy_result(JasnaAmfCopyInfo info):
         "source_uv_pitch": int(info.source_uv_pitch),
         "wait_result": info.wait_result,
         "export_result": info.export_result,
+        "vulkan_export_fd_close_calls": info.fd_close_calls,
+        "vulkan_export_fd_close_result": info.fd_close_result,
+        "vulkan_export_fd_close_errno": info.fd_close_errno,
         "hip_result": info.hip_result,
         "hip_free_result": info.hip_free_result,
         "hip_destroy_result": info.hip_destroy_result,
@@ -2362,6 +2404,9 @@ def _deferred_copy_result(JasnaAmfCopyInfo info):
         "source_uv_pitch": int(info.source_uv_pitch),
         "wait_result": info.wait_result,
         "export_result": info.export_result,
+        "vulkan_export_fd_close_calls": info.fd_close_calls,
+        "vulkan_export_fd_close_result": info.fd_close_result,
+        "vulkan_export_fd_close_errno": info.fd_close_errno,
         "hip_result": info.hip_result,
         "hip_free_result": info.hip_free_result,
         "hip_destroy_result": info.hip_destroy_result,
@@ -2421,6 +2466,16 @@ def _deferred_copy_result(JasnaAmfCopyInfo info):
         "copy_synchronization": "private-deferred-device-wait",
         "fixed_context_bound": bool(info.fixed_context_bound),
     }
+
+
+cdef void _record_vulkan_export_fd_close(JasnaAmfCopyInfo info):
+    cdef int calls = info.fd_close_calls
+    _transport_stats["vulkan_export_fd_close_calls"] += int(calls)
+    if calls > 0 and info.fd_close_result != 0:
+        _transport_stats["vulkan_export_fd_close_failures"] += 1
+        _transport_stats["last_vulkan_export_fd_close_errno"] = int(
+            info.fd_close_errno
+        )
 
 
 def verify_private_deferred_stream_dependency(
@@ -2533,6 +2588,7 @@ def copy_amf_surface_to_hip(
         &info,
         &error,
     )
+    _record_vulkan_export_fd_close(info)
     if status != 0:
         _transport_stats["copy_to_hip_failures"] += 1
         message = error.decode("utf-8", "replace") if error != NULL else "unknown error"
@@ -2820,6 +2876,7 @@ cdef class AmfVulkanHipInteropSession:
             &info,
             &error,
         )
+        _record_vulkan_export_fd_close(info)
         if status != 0:
             _transport_stats["copy_to_hip_failures"] += 1
             message = error.decode("utf-8", "replace") if error != NULL else "unknown error"
@@ -2868,6 +2925,7 @@ cdef class AmfVulkanHipInteropSession:
             &info,
             &error,
         )
+        _record_vulkan_export_fd_close(info)
         if status != 0:
             _transport_stats["copy_to_hip_failures"] += 1
             message = error.decode("utf-8", "replace") if error != NULL else "unknown error"
@@ -2940,6 +2998,7 @@ cdef class AmfVulkanHipInteropSession:
             &info,
             &error,
         )
+        _record_vulkan_export_fd_close(info)
         if status != 0:
             _transport_stats["copy_to_hip_failures"] += 1
             message = error.decode("utf-8", "replace") if error != NULL else "unknown error"

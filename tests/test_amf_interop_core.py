@@ -577,10 +577,10 @@ class _CacheIdentitySession(_IdentitySession):
             "cache_fd_export_failures": 0,
             "cache_fd_stat_calls": self.copy_calls,
             "cache_fd_stat_failures": 0,
-            "cache_fd_close_calls": self.copy_calls - misses,
+            "cache_fd_close_calls": self.copy_calls,
             "cache_fd_close_failures": 0,
             "cache_last_fd_close_errno": 0,
-            "cache_fd_ownership_transfers": misses,
+            "cache_fd_ownership_transfers": 0,
             "vulkan_memory_exports": self.copy_calls,
             "hip_external_memory_imports": misses,
             "hip_mapped_buffer_acquires": misses,
@@ -607,6 +607,9 @@ def _safe_copy_result(**overrides) -> dict[str, object]:
         "width": 16,
         "height": 16,
         "bytes_per_sample": 1,
+        "vulkan_export_fd_close_calls": 1,
+        "vulkan_export_fd_close_result": 0,
+        "vulkan_export_fd_close_errno": 0,
         "hip_result": 0,
         "hip_free_result": 0,
         "hip_destroy_result": 0,
@@ -629,6 +632,9 @@ def _safe_deferred_copy_result(
         "width": 16,
         "height": 16,
         "bytes_per_sample": 1,
+        "vulkan_export_fd_close_calls": 1,
+        "vulkan_export_fd_close_result": 0,
+        "vulkan_export_fd_close_errno": 0,
         "hip_result": 0,
         "d2d_plane_copies": 2,
         "decode_source_release_hip_stream_synchronize_calls": 0,
@@ -764,9 +770,9 @@ def test_av1_cache_open_uses_session_cache_and_balances_reader_epoch(monkeypatch
     assert reader.amf_interop_stats["resource_cache_misses"] == 2
     assert reader.amf_interop_stats["hip_external_memory_imports"] == 2
     assert reader.amf_interop_stats["hip_external_memory_destroys"] == 2
-    assert reader.amf_interop_stats["cache_fd_close_calls"] == 2
+    assert reader.amf_interop_stats["cache_fd_close_calls"] == 4
     assert reader.amf_interop_stats["cache_fd_close_failures"] == 0
-    assert reader.amf_interop_stats["cache_fd_ownership_transfers"] == 2
+    assert reader.amf_interop_stats["cache_fd_ownership_transfers"] == 0
 
 
 def test_cache_close_audit_fails_closed_on_native_fd_close_error() -> None:
@@ -900,6 +906,7 @@ def test_deferred_open_runs_one_time_dependency_probe(monkeypatch) -> None:
         "hip_non_d2d_copy_calls",
         "av_hwframe_transfer_data_calls",
         "failed_bridge_copies",
+        "vulkan_export_fd_close_failures",
     ],
 )
 def test_transport_audit_rejects_host_or_non_d2d_counters(counter: str) -> None:
@@ -911,6 +918,25 @@ def test_transport_audit_rejects_host_or_non_d2d_counters(counter: str) -> None:
 
 def test_transport_audit_rejects_bridge_failed_copy() -> None:
     audit = _audit(copy=lambda *_args: _safe_copy_result(hip_result=700))
+    with pytest.raises(module.VideoDecodeError, match="did not prove"):
+        audit.copy_to_hip(object(), 1, 128)
+    assert audit.snapshot()["copy_to_hip_failures"] == 1
+
+
+@pytest.mark.parametrize(
+    "fd_telemetry",
+    [
+        {"vulkan_export_fd_close_calls": 0},
+        {
+            "vulkan_export_fd_close_result": -1,
+            "vulkan_export_fd_close_errno": 5,
+        },
+    ],
+)
+def test_transport_audit_rejects_unbalanced_vulkan_export_fd(
+    fd_telemetry: dict[str, int],
+) -> None:
+    audit = _audit(copy=lambda *_args: _safe_copy_result(**fd_telemetry))
     with pytest.raises(module.VideoDecodeError, match="did not prove"):
         audit.copy_to_hip(object(), 1, 128)
     assert audit.snapshot()["copy_to_hip_failures"] == 1
@@ -959,6 +985,8 @@ def test_transport_audit_balances_create_close_and_per_frame_resources() -> None
     assert stats["fixed_context_session_create_calls"] == 1
     assert stats["fixed_context_session_close_calls"] == 1
     assert stats["vulkan_memory_exports"] == 2
+    assert stats["vulkan_export_fd_close_calls"] == 2
+    assert stats["vulkan_export_fd_close_failures"] == 0
     assert stats["hip_external_memory_destroys"] == 2
     assert stats["hip_d2d_plane_copies"] == 4
 
