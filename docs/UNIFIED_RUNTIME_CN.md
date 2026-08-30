@@ -82,6 +82,11 @@ SHA-256。启动器把 `bridge/` 放在仓库源码之前，并在 preflight 中
 runtime 加载且具有 surface inspection、dependency probe 和 fixed-context session
 入口。Windows runtime 不包含这个 Linux-only extension。
 
+Windows Python 3.8+ 不再只依赖子进程 `PATH` 搜索 extension 的 DLL 依赖。预检子进程和
+正式 Jasna 子进程都会在导入 PyAV 前通过 `os.add_dll_directory()` 显式登记所选 runtime
+经策略指定且已通过哈希校验的 DLL 目录（当前为 `bin/`），并让登记句柄保持到进程结束。
+登记失败会直接终止，不会回退到环境中的 FFmpeg/PyAV。
+
 ## 边界与回滚
 
 - 不自动修改当前 shell 的 `PATH`、`PYTHONPATH` 或 `LD_LIBRARY_PATH`；只构造 Jasna 子进程环境。

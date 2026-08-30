@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import runpy
 import subprocess
 import sys
 from pathlib import Path
@@ -37,6 +38,24 @@ def _preflight_child(runtime_root: Path, repo_root: Path) -> int:
     return 0
 
 
+def _product_child(
+    runtime_root: Path,
+    repo_root: Path,
+    jasna_args: list[str],
+) -> int:
+    """Run Jasna while retaining the selected Windows DLL directory handles."""
+
+    try:
+        validate_loaded_runtime(runtime_root, repo_root)
+    except Exception as exc:
+        print(f"Jasna unified runtime launch failed: {exc}", file=sys.stderr)
+        return 1
+    os.chdir(repo_root)
+    sys.argv = [str(repo_root / "jasna"), *jasna_args]
+    runpy.run_module("jasna", run_name="__main__", alter_sys=True)
+    return 0
+
+
 def _write_preflight_record(stdout: str) -> None:
     state_dir = Path(
         os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))
@@ -58,6 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runtime-root", default=str(default_runtime_root()))
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--_preflight-child", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--_product-child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--repo-root", default=str(REPO_ROOT), help=argparse.SUPPRESS)
     return parser
 
@@ -67,11 +87,12 @@ def main() -> int:
     args, jasna_args = parser.parse_known_args()
     runtime_root = Path(args.runtime_root).expanduser().resolve(strict=False)
     repo_root = Path(args.repo_root).expanduser().resolve(strict=False)
-    if args._preflight_child:
-        return _preflight_child(runtime_root, repo_root)
-
     if jasna_args[:1] == ["--"]:
         jasna_args = jasna_args[1:]
+    if args._preflight_child:
+        return _preflight_child(runtime_root, repo_root)
+    if args._product_child:
+        return _product_child(runtime_root, repo_root, jasna_args)
     try:
         environment = build_runtime_environment(
             runtime_root,
@@ -108,10 +129,24 @@ def main() -> int:
         print(completed.stdout.strip())
         return 0
 
-    os.chdir(repo_root)
+    if sys.platform == "win32":
+        product_command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--_product-child",
+            "--runtime-root",
+            str(runtime_root),
+            "--repo-root",
+            str(repo_root),
+            "--",
+            *jasna_args,
+        ]
+    else:
+        os.chdir(repo_root)
+        product_command = [sys.executable, "-m", "jasna", *jasna_args]
     os.execve(
         sys.executable,
-        [sys.executable, "-m", "jasna", *jasna_args],
+        product_command,
         environment,
     )
     return 1
