@@ -7,7 +7,7 @@
 `scripts/install_unified_runtime.py` 只安装已经构建并被
 `jasna.runtime_contract` 接受的 PyAV/FFmpeg ABI 单元。Linux 构建产物中的 ABI-matched
 AMF Vulkan/HIP bridge 会一并原子安装；安装器不负责构建源码，也不安装 MIGraphX
-artifact、rocDecode 或模型文件。
+artifact、旧 rocDecode artifact 或模型文件。
 
 因此本功能不会改变 GUI、解码/编码路由、B4、VR auto 或普通 `python -m jasna` 启动方式。
 

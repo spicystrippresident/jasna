@@ -167,7 +167,7 @@ def test_segment_sample_indices_ownership():
     assert segment_sample_indices([5.0], 10.0, 20.0, is_last=True) == []
 
 
-def test_scan_and_preview_inherit_shared_auto_decoder_without_rocdecode_branch():
+def test_scan_and_preview_inherit_shared_auto_decoder_without_backend_branch():
     for method in (MosaicScanWorker._scan, MosaicScanWorker._detect_mask):
         tree = ast.parse(textwrap.dedent(inspect.getsource(method)))
         reader_calls = [
@@ -183,12 +183,6 @@ def test_scan_and_preview_inherit_shared_auto_decoder_without_rocdecode_branch()
             for call in reader_calls
             for keyword in call.keywords
         )
-        assert not any(
-            isinstance(node, ast.Name) and node.id.casefold() == "rocdecode"
-            for node in ast.walk(tree)
-        )
-
-
 def test_scan_detector_delegates_product_selection_to_shared_registry(monkeypatch):
     import jasna.engine_compiler as compiler
     import jasna.mosaic.detection_registry as registry

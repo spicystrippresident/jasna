@@ -253,7 +253,7 @@ class TestWorkerFailureShutdown:
 # ---------------------------------------------------------------------------
 
 class TestPtsAlignedFrameReader:
-    def _reader(self, *, cancel_event=None, reusable_rocdecoder=None, seek_ts=None):
+    def _reader(self, *, cancel_event=None, seek_ts=None):
         return _PtsAlignedFrameReader(
             input_video="fake.mkv",
             batch_size=4,
@@ -262,7 +262,6 @@ class TestPtsAlignedFrameReader:
             frame_stride=1,
             seek_ts=seek_ts,
             cancel_event=cancel_event,
-            reusable_rocdecoder=reusable_rocdecoder,
         )
 
     def test_exact_pts_fast_path_uses_initial_reader(self):
@@ -299,7 +298,6 @@ class TestPtsAlignedFrameReader:
         assert recovered.seek_calls == [40 / 24]
 
     def test_retries_selected_route_twice_before_succeeding(self):
-        reusable = object()
         first = _ScriptedPtsReader([_pts_batch(41)])
         retry_one = _ScriptedPtsReader([_pts_batch(41)])
         retry_two = _ScriptedPtsReader([_pts_batch(40)])
@@ -307,7 +305,7 @@ class TestPtsAlignedFrameReader:
             "jasna.pipeline_threads.NvidiaVideoReader",
             side_effect=[first, retry_one, retry_two],
         ) as factory:
-            with self._reader(reusable_rocdecoder=reusable) as reader:
+            with self._reader() as reader:
                 frame = reader.read_exact(40)
         assert torch.equal(frame, torch.tensor([40]))
         assert [call.kwargs["decode_backend"] for call in factory.call_args_list] == [
@@ -315,11 +313,6 @@ class TestPtsAlignedFrameReader:
             "auto",
             "auto",
         ]
-        assert all(
-            call.kwargs["reusable_rocdecoder"] is reusable
-            for call in factory.call_args_list
-        )
-
     def test_unrecoverable_mismatch_is_terminal_without_cpu_fallback(self):
         first = _ScriptedPtsReader([_pts_batch(41)])
         retry_one = _ScriptedPtsReader([_pts_batch(41)])

@@ -245,7 +245,7 @@ def test_explicit_pyav_hw_bypasses_windows_amd_software_policy(
     assert reader._software_only is False
 
 
-def test_auto_windows_amd_software_open_failure_does_not_try_rocdecode(monkeypatch) -> None:
+def test_auto_windows_amd_software_open_failure_is_terminal(monkeypatch) -> None:
     monkeypatch.setattr(module, "DECODE_BACKEND", "auto")
     monkeypatch.setattr(module.sys, "platform", "win32")
     reader = _reader(
@@ -254,15 +254,49 @@ def test_auto_windows_amd_software_open_failure_does_not_try_rocdecode(monkeypat
         _metadata("av1", is_10bit=True),
     )
     open_pyav = MagicMock(side_effect=module.VideoDecodeError("software decode unavailable"))
-    rocdecode = MagicMock()
     monkeypatch.setattr(reader, "_open_pyav", open_pyav)
-    monkeypatch.setattr(reader, "_open_rocdecode_source", rocdecode)
 
     with pytest.raises(module.VideoDecodeError, match="software decode unavailable"):
         reader.__enter__()
 
     open_pyav.assert_called_once_with(software_only=True)
-    rocdecode.assert_not_called()
+
+
+def test_auto_linux_amd_av1_outside_native_gate_pyav_open_failure_is_terminal(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(module, "DECODE_BACKEND", "auto")
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    metadata = _metadata("av1")
+    metadata.profile = "Professional"
+    metadata.pixel_format = "yuv420p"
+    reader = _reader(monkeypatch, AcceleratorVendor.AMD, metadata)
+    open_pyav = MagicMock(side_effect=module.VideoDecodeError("unsupported AV1 stream"))
+    monkeypatch.setattr(reader, "_open_pyav", open_pyav)
+
+    with pytest.raises(module.VideoDecodeError, match="unsupported AV1 stream"):
+        reader.__enter__()
+
+    open_pyav.assert_called_once_with(software_only=False)
+
+
+def test_auto_pyav_decode_failure_is_terminal_without_backend_retry(monkeypatch) -> None:
+    reader = _reader(monkeypatch, AcceleratorVendor.AMD, _metadata("av1"))
+    decode = MagicMock(side_effect=module.VideoDecodeError("decode failed"))
+    monkeypatch.setattr(reader, "_frames_pyav", decode)
+
+    with pytest.raises(module.VideoDecodeError, match="decode failed"):
+        list(reader.frames())
+
+    decode.assert_called_once_with(None)
+
+
+def test_removed_rocdecode_backend_fails_closed_as_unknown(monkeypatch) -> None:
+    monkeypatch.setenv(module.DECODE_BACKEND_ENV, "rocdecode")
+    reader = _reader(monkeypatch, AcceleratorVendor.AMD, _metadata("av1"))
+
+    with pytest.raises(ValueError, match="Unknown decode backend 'rocdecode'"):
+        reader.__enter__()
 
 
 def test_pyav_sw_backend_skips_hwaccel_and_amf(monkeypatch) -> None:

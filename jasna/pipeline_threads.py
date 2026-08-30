@@ -88,7 +88,6 @@ class _PtsAlignedFrameReader:
         frame_stride: int,
         seek_ts: float | None,
         cancel_event: threading.Event | None,
-        reusable_rocdecoder=None,
     ) -> None:
         self.input_video = input_video
         self.batch_size = int(batch_size)
@@ -97,7 +96,6 @@ class _PtsAlignedFrameReader:
         self.frame_stride = int(frame_stride)
         self.seek_ts = seek_ts
         self.cancel_event = cancel_event
-        self.reusable_rocdecoder = reusable_rocdecoder
         self._reader: NvidiaVideoReader | None = None
         self._frames = None
         self._retry_backend: str | None = None
@@ -133,7 +131,6 @@ class _PtsAlignedFrameReader:
             metadata=self.metadata,
             frame_stride=self.frame_stride,
             decode_backend=decode_backend,
-            reusable_rocdecoder=self.reusable_rocdecoder,
         )
         try:
             entered = reader.__enter__()

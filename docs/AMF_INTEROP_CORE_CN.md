@@ -28,9 +28,10 @@ profile/pixel format 均会在打开前报错。本 core 只接受一个 session
 没有 profile，只有在 NV12/8-bit 或 P010/10-bit 的同一范围内才会推断为对应的
 Main/Main10。
 
-`auto`、`pyav-hw`、`pyav-sw`、VALI 和 rocDecode 的选择与 fallback 均未改动，
-不会自动选中 `amf-interop`。该入口失败时也不会转为 CPU、host Map、staging、
-D2H 或其他 decoder fallback。
+本 core 提交当时没有修改 `auto`、`pyav-hw`、`pyav-sw`、VALI 或兼容后端的选择，
+也不会自动选中 `amf-interop`。后续产品接入已经让合格 Linux AMD 输入由 `auto`
+选择本路线，并在独立 PR 中删除旧兼容后端。该入口失败时仍不会转为 CPU、host Map、
+staging、D2H 或其他 decoder fallback。
 
 ## bridge 与生命周期
 

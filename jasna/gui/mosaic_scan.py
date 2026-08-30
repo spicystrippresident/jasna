@@ -509,7 +509,7 @@ class MosaicScanWorker:
 
         from jasna.accelerator import is_amd_device
         # Deliberately use the shared reader with its product ``auto`` policy.
-        # Scan owns sampling only; it must not grow a scan-specific rocDecode or
+        # Scan owns sampling only; it must not grow a scan-specific backend or
         # AMD host-decode branch beside the normal processing route.
         from jasna.media.video_decoder import NvidiaVideoReader
 

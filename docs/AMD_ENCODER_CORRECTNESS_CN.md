@@ -12,7 +12,7 @@ HEVC/H.264 的 `vbaq`。8-bit AV1 和 NVIDIA AV1 不应用此策略。
 
 编码器的有界重排窗口将 frame、PTS、插入顺序和 LUT 标记保存在同一个 heap item 中。AMD native decoder 的
 batch storage 可能在下一批复用，因此入缓冲时 clone 一份 GPU tensor；NVIDIA 保持已有不复制路径。这样乱序
-PTS 不会把另一帧或另一 LUT 标记配错，也不会把已复用的 AMF/rocDecode storage 交给异步 encoder。
+PTS 不会把另一帧或另一 LUT 标记配错，也不会把已复用的 decoder storage 交给异步 encoder。
 
 ## 码率参数范围
 

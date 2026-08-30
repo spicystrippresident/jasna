@@ -75,9 +75,6 @@ dev = [
 [tool.setuptools]
 include-package-data = false
 
-[tool.setuptools.package-data]
-"jasna.media" = ["rocdecode_bridge.cpp"]
-
 [tool.setuptools.packages.find]
 include = ["jasna*"]
 exclude = ["jasna.protection.keytool*", "jasna.protection.tests*"]

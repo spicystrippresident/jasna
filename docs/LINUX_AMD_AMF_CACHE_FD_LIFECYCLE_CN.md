@@ -9,7 +9,7 @@
 
 - Linux AMD AV1 Main NV12/P010 的 `auto` 仍按上一 PR 使用 cache；
 - H.264/HEVC cache 仍不作为产品默认；
-- rocDecode 仍只是 native gate 外兼容能力和显式诊断入口；
+- native gate 外输入仍使用普通 PyAV；不存在第二套 Linux AMD 解码 fallback；
 - Windows、NVIDIA、共享 Pipeline、RF-DETR、BasicVSR++、B4、CQ 和编码器均不变。
 
 本 PR 不包含已经裁决为 `CLOSED_UNSUPPORTED` 的 HIP→AMF/Vulkan encode surface

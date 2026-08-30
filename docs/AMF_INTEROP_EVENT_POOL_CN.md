@@ -1,8 +1,9 @@
 # Linux AMD AMF 私有 deferred event-pool 实验记录
 
 本文只记录 `scripts/amf_surface_probe.pyx` 的 decode-side 私有 HIP stream
-实验。它不是产品默认解码策略，也不改变 `auto`、`pyav-hw`、`pyav-sw`、VALI 或
-Linux AMD AV1 的 rocDecode policy。
+实验。该提交当时不是产品默认解码策略，也不改变 `auto`、`pyav-hw`、`pyav-sw`、
+VALI 或当时的兼容后端 policy；后续产品 PR 已接入合格 H.264/HEVC，独立删除 PR
+又移除了旧兼容后端。
 
 ## 显式入口与回退边界
 
