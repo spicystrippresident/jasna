@@ -6,8 +6,9 @@ PR，也不把未跟踪 checkpoint 审计文件纳入提交。
 ## 2026-08-30 累计结果
 
 - 在 detached clean worktree 对 `93d0584..HEAD` 中全部已修改 Python 测试文件执行
-  一次累计测试：`797 passed, 1 skipped`。验收 HEAD 为 Linux 第 25 条 PR
-  `codex/linux-amd-amf-cache-fd-lifecycle`，父提交为 `f42d7b3`。
+  一次累计测试：`904 passed, 2 skipped`。最终累计链为 33 条单提交 PR；第 26--33
+  条把 Windows 验收修复按构建能力、runtime DLL、MMEngine、AMF timing、TVAI 取消、
+  streaming 计时、run-log 覆盖和 symlink 能力门重新拆分。
 - `test_media_init.py`、`test_video_encoder_unit.py`、`test_session_factory.py` 和
   GUI ordering/Stop 的环境隔离组合：`248 passed`。
 - crash-resilient run log、GUI settings/locales、media scan、close/shutdown 和 HiDPI 组合：
@@ -19,7 +20,7 @@ PR，也不把未跟踪 checkpoint 审计文件纳入提交。
 144 failed`。失败集中在当前 ROCm venv 没有 TensorRT、未从已安装 unified runtime 暴露
 native AMF bridge、缺少真实模型/媒体/NVIDIA 编码硬件，以及原仓库明确依赖这些外部条件
 的 E2E/kernel/benchmark 用例；它们不在本轮已修改测试集合中被伪造为通过。与本功能链
-直接相关的 797 项累计测试全部通过。
+直接相关的 904 项累计测试全部通过。
 
 ## 审计边界
 
@@ -34,9 +35,33 @@ native AMF bridge、缺少真实模型/媒体/NVIDIA 编码硬件，以及原仓
   8/10-bit、4K/8K、10,000 帧生命周期、停止/关闭和 strict/hash 验收，但公平性能门
   用户随后明确接受稳定 cache 的剩余性能差距，因此 AV1 已进入产品 `auto`；rocDecode
   暂时保留为显式诊断及 native gate 外兼容能力。
-- 累计验收使用只包含 25 条已提交 PR 的 detached clean worktree。原开发工作树中故意
+- 累计验收使用只包含 33 条已提交 PR 的 detached clean worktree。原开发工作树中故意
   保留的未跟踪文件 `1`、checkpoint 审计以及已关闭 encode-ring 研究源码/文档均不在
   验收树和 PR 中；生成媒体、模型、缓存和 build 输出不得进入 PR。
+
+## Windows 集中验收结论
+
+Windows 最终实机验收先在 `d4adcee` 上的合并修复树 `4f5a860` 完成；该修复随后被
+无内容变化地拆成第 26--33 条单提交 PR。拆分后产品源码 tree SHA-1 与 Windows 已验收
+tree 完全相同，只有本累计验收文档在 Linux 复核后追加。
+
+- 精确 34 个改动测试文件：`902 passed, 4 skipped`；compileall 和 diff check 通过；
+- pinned Windows runtime 重建、245 文件原子安装、重复安装拒绝、DLL 实际加载路径和
+  preflight 通过，正式 runtime 未被覆盖；
+- H.264/HEVC Main AMF host decode、HEVC Main10/AV1 软件解码→ROCm 五格式矩阵通过；
+- H.264、HEVC Main/Main10、AV1 Main10 AMF 编码矩阵通过 strict decode、FPS、PTS、
+  位深、选项消费和资源关闭门；
+- GUI 默认 B4 与显式 B8、RF-DETR PyTorch/ROCm、H.264/HEVC/Main10 Smart Render、
+  Resume、worker failure、Stop durability 和 persistent run log 均通过；
+- NVIDIA 因无硬件标记 `NOT_RUN_NO_HARDWARE`；温度因无可信 Windows sensor 标记
+  `NOT_AVAILABLE_NO_WINDOWS_SENSOR`，没有伪造通过。
+
+最终证据：
+
+```text
+/media/latiao/D/AI/amf-unified-work/transactions/jasna-windows-stacked-pr-acceptance-20260830/VERIFICATION.txt
+/media/latiao/D/AI/amf-unified-work/transactions/jasna-windows-stacked-pr-acceptance-20260830/MANIFEST.tsv
+```
 
 ## Linux AV1 收口结论
 
