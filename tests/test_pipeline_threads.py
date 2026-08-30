@@ -772,8 +772,9 @@ class TestStreamingFrameWriter:
         mock_server = MagicMock()
         mock_server.frames_per_segment.return_value = 120
 
-        writer = _StreamingFrameWriter(mock_enc, mock_server, start_segment=0)
-        writer.after_write(100)
+        with patch("jasna.streaming_pipeline.time.monotonic", return_value=42.0):
+            writer = _StreamingFrameWriter(mock_enc, mock_server, start_segment=0)
+            writer.after_write(100)
 
         mock_server.update_production.assert_called_once()
 
