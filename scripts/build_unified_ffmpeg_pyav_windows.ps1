@@ -221,20 +221,26 @@ cd '$buildMsys'
   --prefix='$installMsys' \
   --toolchain=msvc --target-os=win64 --arch=x86_64 \
   --enable-shared --disable-static --disable-debug --disable-doc \
-  --disable-autodetect --disable-everything \
+  --disable-autodetect --disable-everything --fatal-warnings \
   --enable-ffmpeg --enable-ffprobe \
   --enable-avcodec --enable-avformat --enable-avfilter --enable-avdevice \
   --enable-swscale --enable-swresample \
   --enable-libdav1d \
   --enable-amf --enable-d3d11va --enable-dxva2 \
-  --enable-protocol=file --enable-demuxer=matroska \
-  --enable-muxer=matroska --enable-muxer=null \
-  --enable-decoder=h264 --enable-decoder=hevc --enable-decoder=libdav1d \
+  --enable-protocol=file --enable-protocol=pipe \
+  --enable-demuxer=concat --enable-demuxer=matroska --enable-demuxer=mov \
+  --enable-demuxer=mpegts --enable-demuxer=nut \
+  --enable-muxer=framemd5 --enable-muxer=matroska --enable-muxer=mov \
+  --enable-muxer=mp4 --enable-muxer=mpegts --enable-muxer=null --enable-muxer=nut \
+  --enable-decoder=aac --enable-decoder=h264 --enable-decoder=hevc \
+  --enable-decoder=libdav1d --enable-decoder=movtext \
   --enable-decoder=h264_amf --enable-decoder=hevc_amf --enable-decoder=av1_amf \
   --enable-parser=h264 --enable-parser=hevc --enable-parser=av1 \
-  --enable-bsf=h264_mp4toannexb --enable-bsf=hevc_mp4toannexb \
+  --enable-bsf=av1_metadata --enable-bsf=dump_extradata \
+  --enable-bsf=h264_mp4toannexb --enable-bsf=hevc_mp4toannexb --enable-bsf=setts \
   --enable-filter=hwdownload --enable-filter=format --enable-filter=scale \
-  --enable-encoder=wrapped_avframe \
+  --enable-encoder=av1_amf --enable-encoder=h264_amf --enable-encoder=hevc_amf \
+  --enable-encoder=rawvideo --enable-encoder=wrapped_avframe \
   --extra-cflags='-I$amfMsys'
 # A localized compiler identity is valid C but invalid Windows RC input.
 sed -i 's/^#define CC_IDENT .*/#define CC_IDENT "Microsoft C\/C++ compiler (MSVC)"/' config.h

@@ -100,6 +100,38 @@ def test_ubuntu_builder_enables_the_limited_amf_decode_surface_and_manifest() ->
     assert "--rocm-include" in script
 
 
+def test_builders_include_the_product_smart_render_cli_surface() -> None:
+    ubuntu = _read(UBUNTU_SCRIPT)
+    windows = _read(WINDOWS_SCRIPT)
+
+    for script in (ubuntu, windows):
+        for configure_flag in (
+            "--fatal-warnings",
+            "--enable-protocol=file",
+            "--enable-protocol=pipe",
+            "--enable-demuxer=concat",
+            "--enable-demuxer=matroska",
+            "--enable-demuxer=mov",
+            "--enable-demuxer=mpegts",
+            "--enable-demuxer=nut",
+            "--enable-muxer=framemd5",
+            "--enable-muxer=matroska",
+            "--enable-muxer=mov",
+            "--enable-muxer=mp4",
+            "--enable-muxer=mpegts",
+            "--enable-muxer=null",
+            "--enable-muxer=nut",
+            "--enable-encoder=av1_amf",
+            "--enable-encoder=h264_amf",
+            "--enable-encoder=hevc_amf",
+            "--enable-encoder=rawvideo",
+            "--enable-bsf=av1_metadata",
+            "--enable-bsf=dump_extradata",
+            "--enable-bsf=h264_mp4toannexb",
+            "--enable-bsf=hevc_mp4toannexb",
+            "--enable-bsf=setts",
+        ):
+            assert configure_flag in script
 def test_windows_builder_pins_and_packages_dav1d() -> None:
     script = _read(WINDOWS_SCRIPT)
 
@@ -146,7 +178,9 @@ def test_windows_builder_keeps_expected_decode_configuration_and_manifest() -> N
 
     for configure_flag in (
         "--enable-libdav1d",
-        "--enable-decoder=h264 --enable-decoder=hevc --enable-decoder=libdav1d",
+        "--enable-decoder=h264",
+        "--enable-decoder=hevc",
+        "--enable-decoder=libdav1d",
         "--enable-decoder=h264_amf --enable-decoder=hevc_amf --enable-decoder=av1_amf",
         "--enable-parser=h264 --enable-parser=hevc --enable-parser=av1",
         "--enable-bsf=h264_mp4toannexb --enable-bsf=hevc_mp4toannexb",

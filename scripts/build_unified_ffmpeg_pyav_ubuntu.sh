@@ -236,6 +236,7 @@ configure_args=(
   --disable-doc
   --disable-autodetect
   --disable-everything
+  --fatal-warnings
   --enable-ffmpeg
   --enable-ffprobe
   --enable-avcodec
@@ -247,17 +248,34 @@ configure_args=(
   --enable-amf
   --enable-vulkan
   --enable-protocol=file
+  --enable-protocol=pipe
+  --enable-demuxer=concat
   --enable-demuxer=matroska
+  --enable-demuxer=mov
+  --enable-demuxer=mpegts
+  --enable-demuxer=nut
+  --enable-muxer=framemd5
   --enable-muxer=matroska
+  --enable-muxer=mov
+  --enable-muxer=mp4
+  --enable-muxer=mpegts
   --enable-muxer=null
+  --enable-muxer=nut
   --enable-decoder=h264_amf
   --enable-decoder=hevc_amf
   --enable-decoder=av1_amf
+  --enable-encoder=h264_amf
+  --enable-encoder=hevc_amf
+  --enable-encoder=av1_amf
+  --enable-encoder=rawvideo
   --enable-parser=h264
   --enable-parser=hevc
   --enable-parser=av1
+  --enable-bsf=av1_metadata
+  --enable-bsf=dump_extradata
   --enable-bsf=h264_mp4toannexb
   --enable-bsf=hevc_mp4toannexb
+  --enable-bsf=setts
   --enable-filter=hwdownload
   --enable-filter=format
   --enable-encoder=wrapped_avframe
