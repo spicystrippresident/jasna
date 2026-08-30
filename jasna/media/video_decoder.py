@@ -37,8 +37,9 @@ _libcuda: ctypes.CDLL | None = None
 #              software, when VALI cannot open or decode the first frame. AMD
 #              keeps its AMF -> software escalation. Windows AMD explicitly
 #              uses software decode plus ROCm upload for HEVC Main10 and AV1.
-#              Linux AMD AV1 retries the optional rocDecode compatibility
-#              backend only after PyAV fails.
+#              Linux AMD uses the fixed-context AMF Vulkan/HIP route for the
+#              documented H.264/HEVC formats and the stable dma-buf identity
+#              cache for documented AV1 Main NV12/P010 formats.
 # - "vali":    VALI only; any failure raises (NVIDIA only).
 # - "rocdecode": diagnostic Linux AMD-only backend; any failure raises.
 # - "pyav-hw": skip VALI, use the PyAV hwaccel path with its software fallback.
@@ -46,7 +47,8 @@ _libcuda: ctypes.CDLL | None = None
 # - "amf-interop": explicit Linux AMD diagnostic backend.  It accepts only the
 #                  documented H.264/HEVC/AV1 AMF Vulkan surface scope and copies
 #                  directly to HIP, or raises. Linux AMD auto selects the proven
-#                  private-deferred route only for eligible H.264/HEVC sources.
+#                  private-deferred route for eligible H.264/HEVC sources and
+#                  the stable dma-buf cache for eligible AV1 sources.
 DECODE_BACKEND = "auto"
 DECODE_BACKEND_ENV = "JASNA_DECODE_BACKEND"
 _DECODE_BACKENDS = (
@@ -136,11 +138,12 @@ def _decode_backend() -> str:
 
 
 def _amf_interop_resource_cache_enabled(*, default: bool = False) -> bool:
-    """Parse the experimental cache switch without enabling it by default.
+    """Parse the Linux AV1 stable dma-buf identity-cache switch.
 
-    The core deliberately implements only per-frame import/map/release.  A
-    present true value is rejected at the explicit backend boundary rather
-    than silently changing lifetime semantics or leaking into another route.
+    The product default is supplied by the backend selection point so this
+    parser stays independently testable.  The cache is accepted only by the
+    Linux AMD AV1 fixed-context route; other codecs fail closed if an operator
+    tries to force it.
     """
 
     raw_value = os.environ.get(AMF_INTEROP_RESOURCE_CACHE_ENV)
@@ -292,7 +295,16 @@ def _should_auto_amf_interop(
     return (
         sys.platform == "linux"
         and vendor is AcceleratorVendor.AMD
-        and str(metadata.codec_name).casefold() in {"h264", "hevc"}
+        and str(metadata.codec_name).casefold() in {"h264", "hevc", "av1"}
+        and _amf_interop_format_supported(metadata)
+    )
+
+
+def _amf_interop_cache_eligible(metadata: VideoMetadata) -> bool:
+    """Keep the promoted cache inside its independently validated AV1 scope."""
+
+    return (
+        str(metadata.codec_name).casefold() == "av1"
         and _amf_interop_format_supported(metadata)
     )
 
@@ -855,6 +867,7 @@ class _AmfInteropTransportAudit:
         identity_session,
         device: torch.device,
         decode_copy_stream: str = "null",
+        resource_cache: bool = False,
     ) -> None:
         if decode_copy_stream not in _AMF_INTEROP_DECODE_COPY_STREAMS:
             raise ValueError(
@@ -866,6 +879,9 @@ class _AmfInteropTransportAudit:
         self._get_transport_stats = get_transport_stats
         self._identity_session = identity_session
         self._decode_copy_stream = decode_copy_stream
+        self._resource_cache = bool(resource_cache)
+        if self._resource_cache and decode_copy_stream != "null":
+            raise ValueError("resource_cache requires the null decode-copy stream")
         self._device = int(device.index or 0)
         self._identity: tuple[int, int, int, int] | None = None
         self._closed = False
@@ -883,7 +899,7 @@ class _AmfInteropTransportAudit:
             "fixed_context_session_create_calls": 1,
             "fixed_context_session_close_calls": 0,
             "fixed_context_session_close_failures": 0,
-            "resource_cache_session_create_calls": 0,
+            "resource_cache_session_create_calls": 1 if self._resource_cache else 0,
             "resource_cache_session_close_calls": 0,
             "resource_cache_session_close_failures": 0,
             "resource_cache_hits": 0,
@@ -894,6 +910,10 @@ class _AmfInteropTransportAudit:
     @property
     def decode_copy_stream(self) -> str:
         return self._decode_copy_stream
+
+    @property
+    def resource_cache(self) -> bool:
+        return self._resource_cache
 
     @classmethod
     def _reject_forbidden_transport(cls, values, *, source: str) -> None:
@@ -991,10 +1011,20 @@ class _AmfInteropTransportAudit:
             and result.get("fixed_context_bound") is True
         )
         if self._decode_copy_stream == "null":
+            synchronization = (
+                "null-stream-cache-retained"
+                if self._resource_cache
+                else "null-stream-source-release"
+            )
             valid = (
                 common
-                and self._integer(result, "hip_free_result") == 0
-                and self._integer(result, "hip_destroy_result") == 0
+                and (
+                    self._resource_cache
+                    or (
+                        self._integer(result, "hip_free_result") == 0
+                        and self._integer(result, "hip_destroy_result") == 0
+                    )
+                )
                 and self._integer(
                     result,
                     "decode_source_release_hip_stream_synchronize_calls",
@@ -1005,7 +1035,12 @@ class _AmfInteropTransportAudit:
                     "decode_source_release_hip_stream_synchronize_result",
                 )
                 == 0
-                and result.get("copy_synchronization") == "null-stream-source-release"
+                and result.get("copy_synchronization") == synchronization
+                and (
+                    not self._resource_cache
+                    or bool(result.get("cache_hit"))
+                    != bool(result.get("cache_miss"))
+                )
             )
         else:
             returned_consumer = self._integer(result, "consumer_stream_handle", default=0)
@@ -1140,10 +1175,18 @@ class _AmfInteropTransportAudit:
         self._stats["hip_d2d_plane_copies"] += 2
         if self._decode_copy_stream == "null":
             self._stats["vulkan_memory_exports"] += 1
-            self._stats["hip_external_memory_imports"] += 1
-            self._stats["hip_mapped_buffer_acquires"] += 1
-            self._stats["hip_mapped_buffer_releases"] += 1
-            self._stats["hip_external_memory_destroys"] += 1
+            if self._resource_cache:
+                if bool(result.get("cache_hit")):
+                    self._stats["resource_cache_hits"] += 1
+                else:
+                    self._stats["resource_cache_misses"] += 1
+                    self._stats["hip_external_memory_imports"] += 1
+                    self._stats["hip_mapped_buffer_acquires"] += 1
+            else:
+                self._stats["hip_external_memory_imports"] += 1
+                self._stats["hip_mapped_buffer_acquires"] += 1
+                self._stats["hip_mapped_buffer_releases"] += 1
+                self._stats["hip_external_memory_destroys"] += 1
             self._stats["decode_source_release_hip_stream_synchronize_calls"] += 1
         else:
             self._accumulate_deferred_result(result)
@@ -1157,8 +1200,13 @@ class _AmfInteropTransportAudit:
         except BaseException:
             self._stats["fixed_context_session_close_calls"] += 1
             self._stats["fixed_context_session_close_failures"] += 1
+            if self._resource_cache:
+                self._stats["resource_cache_session_close_calls"] += 1
+                self._stats["resource_cache_session_close_failures"] += 1
             raise
         self._stats["fixed_context_session_close_calls"] += 1
+        if self._resource_cache:
+            self._stats["resource_cache_session_close_calls"] += 1
         self._closed = True
 
     def _session_stats(self) -> dict[str, object]:
@@ -1168,7 +1216,10 @@ class _AmfInteropTransportAudit:
             raise VideoDecodeError(
                 f"amf-interop fixed-context session telemetry failed: {exc}"
             ) from exc
-        if self._integer(session_stats, "cache_entries", default=0) != 0:
+        if (
+            not self._resource_cache
+            and self._integer(session_stats, "cache_entries", default=0) != 0
+        ):
             raise VideoDecodeError(
                 "amf-interop resource cache was unexpectedly populated: "
                 f"{session_stats}"
@@ -1178,6 +1229,31 @@ class _AmfInteropTransportAudit:
     def snapshot(self) -> dict[str, object]:
         stats = dict(self._stats)
         session_stats = self._session_stats()
+        if self._resource_cache:
+            for name in (
+                "vulkan_memory_exports",
+                "hip_external_memory_imports",
+                "hip_mapped_buffer_acquires",
+                "hip_mapped_buffer_releases",
+                "hip_external_memory_destroys",
+                "cache_hits",
+                "cache_misses",
+                "cache_entries",
+                "cache_active_external_imports",
+                "cache_active_mappings",
+                "cache_raw_handle_identity_changes",
+                "cache_stable_identity_raw_handle_changes",
+                "cache_fd_export_calls",
+                "cache_fd_export_failures",
+                "cache_fd_stat_calls",
+                "cache_fd_stat_failures",
+            ):
+                if name in session_stats:
+                    target = {
+                        "cache_hits": "resource_cache_hits",
+                        "cache_misses": "resource_cache_misses",
+                    }.get(name, name)
+                    stats[target] = self._integer(session_stats, name)
         if self._decode_copy_stream == "private-deferred":
             for name in self._DEFERRED_SESSION_COUNTERS:
                 if name in session_stats:
@@ -1197,16 +1273,25 @@ class _AmfInteropTransportAudit:
                 "transport_reconfigures": 0,
                 "transport_restarts": 0,
                 "resource_strategy": (
-                    "per-frame Vulkan external-memory import/map retained until "
-                    "consumer-event release"
-                    if self._decode_copy_stream == "private-deferred"
-                    else "per-frame Vulkan external-memory import/map with balanced release"
+                    "stable dma-buf identity cache retained for one reader epoch"
+                    if self._resource_cache
+                    else (
+                        "per-frame Vulkan external-memory import/map retained until "
+                        "consumer-event release"
+                        if self._decode_copy_stream == "private-deferred"
+                        else "per-frame Vulkan external-memory import/map with balanced release"
+                    )
                 ),
                 "copy_synchronization": (
-                    "private-deferred-device-wait"
-                    if self._decode_copy_stream == "private-deferred"
-                    else "null-stream-source-release"
+                    "null-stream-cache-retained"
+                    if self._resource_cache
+                    else (
+                        "private-deferred-device-wait"
+                        if self._decode_copy_stream == "private-deferred"
+                        else "null-stream-source-release"
+                    )
                 ),
+                "resource_cache_enabled": self._resource_cache,
                 "fixed_context_identity": self._identity,
                 "fixed_context_session_closed": bool(session_stats.get("closed", False)),
             }
@@ -1216,27 +1301,56 @@ class _AmfInteropTransportAudit:
     def validate_closed(self) -> dict[str, object]:
         stats = self.snapshot()
         calls = int(stats["copy_to_hip_calls"])
-        resource_counts = {
-            calls,
-            int(stats["vulkan_memory_exports"]),
-            int(stats["hip_external_memory_imports"]),
-            int(stats["hip_mapped_buffer_acquires"]),
-            int(stats["hip_mapped_buffer_releases"]),
-            int(stats["hip_external_memory_destroys"]),
-        }
+        if self._resource_cache:
+            misses = int(stats["resource_cache_misses"])
+            resource_valid = (
+                int(stats["vulkan_memory_exports"]) == calls
+                and int(stats["resource_cache_hits"]) + misses == calls
+                and int(stats.get("cache_entries", -1)) == misses
+                and int(stats["hip_external_memory_imports"]) == misses
+                and int(stats["hip_mapped_buffer_acquires"]) == misses
+                and int(stats["hip_mapped_buffer_releases"]) == misses
+                and int(stats["hip_external_memory_destroys"]) == misses
+                and int(stats.get("cache_active_external_imports", -1)) == 0
+                and int(stats.get("cache_active_mappings", -1)) == 0
+                and int(stats.get("cache_raw_handle_identity_changes", -1)) == 0
+                and int(
+                    stats.get("cache_stable_identity_raw_handle_changes", -1)
+                )
+                == 0
+                and int(stats.get("cache_fd_export_calls", -1)) == calls
+                and int(stats.get("cache_fd_export_failures", -1)) == 0
+                and int(stats.get("cache_fd_stat_calls", -1)) == calls
+                and int(stats.get("cache_fd_stat_failures", -1)) == 0
+                and stats["resource_cache_session_create_calls"] == 1
+                and stats["resource_cache_session_close_calls"] == 1
+                and stats["resource_cache_session_close_failures"] == 0
+            )
+        else:
+            resource_counts = {
+                calls,
+                int(stats["vulkan_memory_exports"]),
+                int(stats["hip_external_memory_imports"]),
+                int(stats["hip_mapped_buffer_acquires"]),
+                int(stats["hip_mapped_buffer_releases"]),
+                int(stats["hip_external_memory_destroys"]),
+            }
+            resource_valid = (
+                len(resource_counts) == 1
+                and stats["resource_cache_session_create_calls"] == 0
+                and stats["resource_cache_session_close_calls"] == 0
+                and stats["resource_cache_hits"] == 0
+                and stats["resource_cache_misses"] == 0
+            )
         common = (
             stats["copy_to_hip_successes"] == calls
             and stats["copy_to_hip_failures"] == 0
             and stats["hip_d2d_plane_copies"] == calls * 2
-            and len(resource_counts) == 1
+            and resource_valid
             and stats["fixed_context_session_create_calls"] == 1
             and stats["fixed_context_session_close_calls"] == 1
             and stats["fixed_context_session_close_failures"] == 0
             and stats["fixed_context_session_closed"]
-            and stats["resource_cache_session_create_calls"] == 0
-            and stats["resource_cache_session_close_calls"] == 0
-            and stats["resource_cache_hits"] == 0
-            and stats["resource_cache_misses"] == 0
         )
         if self._decode_copy_stream == "null":
             source_release_valid = (
@@ -1327,6 +1441,84 @@ class _AmfInteropTransportAudit:
         return stats
 
 
+class _BatchedAmdYuvConverter:
+    """Pixel-exact AMD eager YUV math amortized across up to four frames."""
+
+    def __init__(
+        self,
+        reference: YuvToRgbConverter,
+        capacity: int,
+        device: torch.device,
+    ) -> None:
+        self.height = reference.height
+        self.width = reference.width
+        self.is_10bit = reference.is_10bit
+        self.capacity = int(capacity)
+        if self.capacity <= 0:
+            raise ValueError("batched AMD YUV conversion capacity must be positive")
+        self._luma_scale = reference._luma_scale
+        self._chroma_matrix = reference._chroma_matrix
+        self._offset = reference._offset
+        self._dither2 = getattr(reference, "_dither2", None)
+        self._rgb = torch.empty(
+            (self.capacity, 3, self.height, self.width),
+            dtype=torch.float32,
+            device=device,
+        )
+        self._chroma = torch.empty(
+            (self.capacity, 3, self.height // 2, self.width // 2),
+            dtype=torch.float32,
+            device=device,
+        )
+        self._codes = (
+            torch.empty(
+                (self.capacity, 3, self.height, self.width),
+                dtype=torch.int32,
+                device=device,
+            )
+            if self.is_10bit
+            else None
+        )
+
+    def convert_into(self, packed: torch.Tensor, out: torch.Tensor) -> None:
+        count = int(packed.shape[0])
+        if out.shape != (count, 3, self.height, self.width):
+            raise ValueError(
+                f"Unexpected batched RGB destination: {tuple(out.shape)}"
+            )
+        for start in range(0, count, self.capacity):
+            stop = min(start + self.capacity, count)
+            self._convert_chunk(packed[start:stop], out[start:stop])
+
+    def _convert_chunk(self, packed: torch.Tensor, out: torch.Tensor) -> None:
+        count = int(packed.shape[0])
+        H, W = self.height, self.width
+        y = packed[:, :H]
+        uv = packed[:, H:].view(count, H // 2, W // 2, 2)
+        u, v = uv[..., 0], uv[..., 1]
+        chroma = self._chroma[:count]
+        for plane, (cu, cv) in enumerate(self._chroma_matrix):
+            torch.mul(u, cu, out=chroma[:, plane])
+            chroma[:, plane].add_(v, alpha=cv)
+        rgb = self._rgb[:count]
+        rgb.view(count, 3, H // 2, 2, W // 2, 2).copy_(
+            chroma.unsqueeze(3).unsqueeze(5)
+        )
+        for plane, offset in enumerate(self._offset):
+            rgb[:, plane].add_(offset)
+        rgb.add_(y.unsqueeze(1), alpha=self._luma_scale)
+        if self.is_10bit:
+            codes = self._codes[:count]
+            codes.copy_(rgb.round_().clamp_(0, 1023))
+            codes.add_(self._dither2.unsqueeze(0)).bitwise_right_shift_(2).clamp_(
+                0,
+                255,
+            )
+            out.copy_(codes)
+        else:
+            out.copy_(rgb.round_().clamp_(0, 255))
+
+
 class AmfInteropUploader:
     """Convert native AMF Vulkan NV12/P010 surfaces without host staging."""
 
@@ -1357,6 +1549,9 @@ class AmfInteropUploader:
         self.bytes_per_sample = 2 if self.is_10bit else 1
 
     def frames(self, decoded, group: list) -> Iterator[tuple[torch.Tensor, list[int]]]:
+        if getattr(self.audit, "resource_cache", False):
+            yield from self._frames_resource_cache(decoded, group)
+            return
         H, W = self.height, self.width
         converter = YuvToRgbConverter(
             H,
@@ -1457,6 +1652,109 @@ class AmfInteropUploader:
             # In particular, closing the generator after this yield must leave
             # no unconsumed decode group alive while the AMF decoder is torn down.
             group = self._read_group(decoded)
+
+    def _frames_resource_cache(
+        self,
+        decoded,
+        group: list,
+    ) -> Iterator[tuple[torch.Tensor, list[int]]]:
+        """Run the accepted B4 cache + batched-conversion overlap route.
+
+        The cache copy synchronizes and releases every AMF source before the
+        next decode request.  Two packed slots let the independent ROCm
+        conversion stream process one group while decode/copy fills the other;
+        RGB output tensors are never reused after they are yielded.
+        """
+
+        H, W = self.height, self.width
+        dtype = torch.uint16 if self.is_10bit else torch.uint8
+        packed_slots = [
+            torch.empty(
+                (self.batch_size, H + H // 2, W),
+                dtype=dtype,
+                device=self.device,
+            )
+            for _ in range(2)
+        ]
+        conversion_stream = new_stream(self.device)
+        reference = YuvToRgbConverter(
+            H,
+            W,
+            self.metadata.color_space,
+            self.full_range,
+            self.is_10bit,
+            self.device,
+        )
+        converter = _BatchedAmdYuvConverter(
+            reference,
+            min(self.batch_size, 4),
+            self.device,
+        )
+
+        def fill_slot(slot: int, frames: list) -> list[int]:
+            pts: list[int] = []
+            for index, frame in enumerate(frames):
+                frame_format = getattr(getattr(frame, "format", None), "name", None)
+                software_format = getattr(
+                    getattr(frame, "sw_format", None), "name", None
+                )
+                if (
+                    frame_format != "amf"
+                    or software_format != self.software_format
+                    or int(frame.width) != W
+                    or int(frame.height) != H
+                ):
+                    raise VideoDecodeError(
+                        "amf-interop cache requires a native AMF Vulkan "
+                        f"{self.software_format.upper()} frame; got "
+                        f"format={frame_format}, sw_format={software_format}, "
+                        f"size={getattr(frame, 'width', None)}x"
+                        f"{getattr(frame, 'height', None)} for {self.file}. "
+                        "Host fallback is forbidden."
+                    )
+                copied = self.audit.copy_to_hip(
+                    frame,
+                    packed_slots[slot][index].data_ptr(),
+                    packed_slots[slot][index].numel()
+                    * packed_slots[slot][index].element_size(),
+                )
+                if (
+                    int(copied.get("width", -1)) != W
+                    or int(copied.get("height", -1)) != H
+                    or int(copied.get("bytes_per_sample", -1))
+                    != self.bytes_per_sample
+                ):
+                    raise VideoDecodeError(
+                        "amf-interop cache returned an invalid native copy result: "
+                        f"{copied}"
+                    )
+                pts.append(frame.pts)
+            if frames:
+                del frame
+            frames.clear()
+            return pts
+
+        current_slot = 0
+        current_pts = fill_slot(current_slot, group)
+        while current_pts:
+            count = len(current_pts)
+            batch = torch.empty(
+                (count, 3, H, W),
+                dtype=torch.uint8,
+                device=self.device,
+            )
+            with stream_context(conversion_stream):
+                converter.convert_into(
+                    packed_slots[current_slot][:count],
+                    batch,
+                )
+            next_slot = 1 - current_slot
+            next_group = self._read_group(decoded)
+            next_pts = fill_slot(next_slot, next_group)
+            conversion_stream.synchronize()
+            yield batch, current_pts
+            current_slot = next_slot
+            current_pts = next_pts
 
     def _read_group(self, decoded) -> list:
         group = []
@@ -1565,7 +1863,13 @@ class NvidiaVideoReader:
             # This is a narrow Linux AMD backend substitution, not a change to
             # the shared auto ordering. Native failures are terminal so a
             # bridge/lifetime regression cannot silently become CPU transport.
-            self._open_amf_interop_backend(decode_copy_stream="private-deferred")
+            if _amf_interop_cache_eligible(self.metadata):
+                self._open_amf_interop_backend(
+                    decode_copy_stream="null",
+                    resource_cache=True,
+                )
+            else:
+                self._open_amf_interop_backend(decode_copy_stream="private-deferred")
             return self
         windows_amd_software_decode = (
             backend == "auto"
@@ -1658,35 +1962,55 @@ class NvidiaVideoReader:
         self,
         *,
         decode_copy_stream: str | None = None,
+        resource_cache: bool | None = None,
     ) -> None:
         """Open the explicit, fail-closed AMF Vulkan -> HIP reader only."""
 
         self._validate_amf_interop_scope()
-        self._amf_interop_resource_cache = _amf_interop_resource_cache_enabled()
-        if self._amf_interop_resource_cache:
+        cache_eligible = _amf_interop_cache_eligible(self.metadata)
+        if resource_cache is None:
+            resource_cache = _amf_interop_resource_cache_enabled(
+                default=cache_eligible,
+            )
+        self._amf_interop_resource_cache = bool(resource_cache)
+        if self._amf_interop_resource_cache and not cache_eligible:
             raise VideoDecodeError(
-                f"{AMF_INTEROP_RESOURCE_CACHE_ENV}=1 is not implemented by this "
-                "amf-interop core; per-frame balanced external-memory ownership is required"
+                f"{AMF_INTEROP_RESOURCE_CACHE_ENV}=1 is supported only for the "
+                "validated Linux AMD AV1 Main NV12/P010 route"
             )
         if decode_copy_stream is None:
-            decode_copy_stream = _amf_interop_decode_copy_stream()
+            decode_copy_stream = _amf_interop_decode_copy_stream(
+                default="null"
+            )
         elif decode_copy_stream not in _AMF_INTEROP_DECODE_COPY_STREAMS:
             raise VideoDecodeError(
                 f"invalid AMF interop decode-copy mode: {decode_copy_stream!r}"
             )
+        if self._amf_interop_resource_cache and decode_copy_stream != "null":
+            raise VideoDecodeError(
+                "The stable dma-buf identity cache requires the proven null-stream "
+                "source-release synchronization contract"
+            )
         bridge = _load_amf_interop_bridge()
         try:
-            identity_session = bridge.AmfVulkanHipInteropSession("decode")
+            if self._amf_interop_resource_cache:
+                identity_session = bridge.AmfVulkanHipInteropSession(
+                    "decode",
+                    resource_cache=True,
+                )
+            else:
+                identity_session = bridge.AmfVulkanHipInteropSession("decode")
         except BaseException as exc:
             raise VideoDecodeError(
                 "The explicit amf-interop backend could not create its fixed-context "
                 f"bridge session: {exc}"
             ) from exc
-        session_copy_name = (
-            "copy_amf_surface_to_hip_private_deferred_stream"
-            if decode_copy_stream == "private-deferred"
-            else "copy_amf_surface_to_hip"
-        )
+        if self._amf_interop_resource_cache:
+            session_copy_name = "copy_amf_surface_to_hip_resource_cache"
+        elif decode_copy_stream == "private-deferred":
+            session_copy_name = "copy_amf_surface_to_hip_private_deferred_stream"
+        else:
+            session_copy_name = "copy_amf_surface_to_hip"
         session_copy = getattr(identity_session, session_copy_name, None)
         session_close = getattr(identity_session, "close", None)
         session_stats = getattr(identity_session, "stats", None)
@@ -1736,6 +2060,7 @@ class NvidiaVideoReader:
             identity_session=identity_session,
             device=self.device,
             decode_copy_stream=decode_copy_stream,
+            resource_cache=self._amf_interop_resource_cache,
         )
         self._amf_interop_bridge = bridge
         self._amf_interop_audit = audit
@@ -1765,7 +2090,13 @@ class NvidiaVideoReader:
                     + "; ".join(cleanup_errors)
                 ) from error
             raise
-        log.info("Using explicit AMF Vulkan -> HIP D2D decoder for %s", self.file)
+        log.info(
+            "Using explicit AMF Vulkan -> HIP D2D decoder for %s%s",
+            self.file,
+            " with stable dma-buf identity cache"
+            if self._amf_interop_resource_cache
+            else "",
+        )
 
     def _validate_amf_interop_scope(self) -> None:
         failures = []
@@ -1995,6 +2326,17 @@ class NvidiaVideoReader:
                 self._close_rocdecode_source(discard_decoder=False)
             except BaseException as error:
                 cleanup_errors.append(error)
+        # A cache retains HIP imports of decoder-owned Vulkan allocations for
+        # the reader epoch.  Release those imports before closing the decoder;
+        # the non-cache routes retain their established teardown order.
+        if (
+            self._amf_interop_audit is not None
+            and self._amf_interop_resource_cache
+        ):
+            try:
+                self._close_amf_interop_backend(validate=exc_type is None)
+            except BaseException as error:
+                cleanup_errors.append(error)
         try:
             self._close_pyav()
         except BaseException as error:
@@ -2094,6 +2436,7 @@ class NvidiaVideoReader:
             return
         if (
             getattr(self, "_decode_backend", DECODE_BACKEND) == "auto"
+            and not getattr(self, "_amf_interop_enabled", False)
             and getattr(self, "metadata", None) is not None
             and _should_auto_rocdecode(
                 self.metadata,

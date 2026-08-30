@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -177,3 +179,71 @@ def test_launchers_preflight_without_changing_product_batch_defaults() -> None:
     from jasna.gui.models import AppSettings
 
     assert AppSettings().batch_size == 4
+
+
+def test_loaded_runtime_requires_cache_capable_amf_session(monkeypatch, tmp_path) -> None:
+    runtime_root = tmp_path / "runtime"
+    repo_root = tmp_path / "repo"
+    bridge_root = runtime_root / "bridge"
+    av_root = runtime_root / "site-packages/av"
+    jasna_root = repo_root / "jasna"
+    bridge_root.mkdir(parents=True)
+    av_root.mkdir(parents=True)
+    jasna_root.mkdir(parents=True)
+    bridge_file = bridge_root / "_jasna_amf_surface_probe.cpython-test.so"
+    bridge_file.touch()
+
+    class IncompleteSession:
+        def close(self):
+            pass
+
+        def stats(self):
+            return {}
+
+    bridge = SimpleNamespace(
+        __file__=str(bridge_file),
+        inspect_amf_surface=lambda: None,
+        verify_private_deferred_stream_dependency=lambda: None,
+        AmfVulkanHipInteropSession=IncompleteSession,
+    )
+    av = SimpleNamespace(
+        __version__=runtime_contract.EXPECTED_AV_VERSION,
+        __file__=str(av_root / "__init__.py"),
+        library_versions={
+            name: tuple(value)
+            for name, value in runtime_contract.EXPECTED_AV_LIBRARY_VERSIONS.items()
+        },
+    )
+    jasna = SimpleNamespace(__file__=str(jasna_root / "__init__.py"))
+    monkeypatch.setitem(sys.modules, "av", av)
+    monkeypatch.setitem(sys.modules, "jasna", jasna)
+    monkeypatch.setitem(
+        sys.modules,
+        "_jasna_amf_surface_probe",
+        bridge,
+    )
+    monkeypatch.setattr(runtime_contract, "validate_runtime_layout", lambda *_a, **_k: {})
+    path_is_file = Path.is_file
+    monkeypatch.setattr(
+        Path,
+        "is_file",
+        lambda path: False if path == Path("/proc/self/maps") else path_is_file(path),
+    )
+
+    with pytest.raises(
+        runtime_contract.RuntimeContractError,
+        match="copy_amf_surface_to_hip_resource_cache",
+    ):
+        runtime_contract.validate_loaded_runtime(
+            runtime_root,
+            repo_root,
+            platform="linux",
+        )
+
+    IncompleteSession.copy_amf_surface_to_hip_resource_cache = lambda self: None
+    result = runtime_contract.validate_loaded_runtime(
+        runtime_root,
+        repo_root,
+        platform="linux",
+    )
+    assert result["status"] == "PASSED"

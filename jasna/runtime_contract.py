@@ -360,6 +360,17 @@ def validate_loaded_runtime(
                 raise RuntimeContractError(
                     f"AMF interop bridge is missing required entry point: {name}"
                 )
+        session_type = amf_bridge.AmfVulkanHipInteropSession
+        for name in (
+            "copy_amf_surface_to_hip_resource_cache",
+            "close",
+            "stats",
+        ):
+            if not callable(getattr(session_type, name, None)):
+                raise RuntimeContractError(
+                    "AMF interop bridge session is missing required entry point: "
+                    f"{name}"
+                )
 
     loaded_ffmpeg_libraries: list[str] = []
     maps = Path("/proc/self/maps")

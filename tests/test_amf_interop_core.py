@@ -192,6 +192,37 @@ def test_auto_linux_amd_selects_private_deferred_amf_interop(
     "metadata",
     [
         _metadata(codec="av1", profile="main", pixel_format="yuv420p"),
+        _metadata(
+            codec="av1",
+            profile="main",
+            pixel_format="p010le",
+            is_10bit=True,
+        ),
+    ],
+)
+def test_auto_linux_amd_selects_av1_stable_resource_cache(
+    monkeypatch,
+    metadata: VideoMetadata,
+) -> None:
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    monkeypatch.setattr(module, "current_stream", lambda _device: None)
+    monkeypatch.setattr(module, "vendor_for_device", lambda _device: AcceleratorVendor.AMD)
+    reader = module.NvidiaVideoReader("input.mp4", 4, torch.device("cpu"), metadata)
+    native_open = MagicMock()
+    monkeypatch.setattr(reader, "_open_amf_interop_backend", native_open)
+
+    reader.__enter__()
+
+    native_open.assert_called_once_with(
+        decode_copy_stream="null",
+        resource_cache=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        _metadata(codec="av1", profile="professional", pixel_format="yuv420p"),
         _metadata(codec="h264", profile="baseline", pixel_format="yuv420p"),
         _metadata(codec="vp9", profile="profile 0", pixel_format="yuv420p"),
     ],
@@ -306,14 +337,14 @@ def test_explicit_decoder_owns_amf_surfaces_and_tolerates_missing_timing(monkeyp
     decoder.open.assert_called_once_with(strict=False)
 
 
-def test_explicit_cache_enable_fails_closed_before_loading_bridge(monkeypatch) -> None:
+def test_cache_enable_fails_closed_outside_validated_av1_scope(monkeypatch) -> None:
     monkeypatch.setattr(module.sys, "platform", "linux")
     monkeypatch.setenv(module.AMF_INTEROP_RESOURCE_CACHE_ENV, "1")
     loader = MagicMock(side_effect=AssertionError("cache must fail before load"))
     monkeypatch.setattr(module, "_load_amf_interop_bridge", loader)
     reader = _reader(_metadata(), 1)
 
-    with pytest.raises(module.VideoDecodeError, match="not implemented"):
+    with pytest.raises(module.VideoDecodeError, match="supported only"):
         reader._open_amf_interop_backend()
     loader.assert_not_called()
 
@@ -515,6 +546,44 @@ class _DeferredIdentitySession(_IdentitySession):
         }
 
 
+class _CacheIdentitySession(_IdentitySession):
+    def __init__(self, *, misses: int = 2) -> None:
+        super().__init__()
+        self.copy_calls = 0
+        self.misses = misses
+
+    def copy_amf_surface_to_hip_resource_cache(self, *args):
+        self.copy_calls += 1
+        miss = self.copy_calls <= self.misses
+        return _safe_copy_result(
+            cache_hit=not miss,
+            cache_miss=miss,
+            copy_synchronization="null-stream-cache-retained",
+        )
+
+    def stats(self) -> dict[str, object]:
+        misses = min(self.copy_calls, self.misses)
+        return {
+            "cache_entries": misses,
+            "cache_hits": self.copy_calls - misses,
+            "cache_misses": misses,
+            "cache_active_external_imports": 0 if self.closed else misses,
+            "cache_active_mappings": 0 if self.closed else misses,
+            "cache_raw_handle_identity_changes": 0,
+            "cache_stable_identity_raw_handle_changes": 0,
+            "cache_fd_export_calls": self.copy_calls,
+            "cache_fd_export_failures": 0,
+            "cache_fd_stat_calls": self.copy_calls,
+            "cache_fd_stat_failures": 0,
+            "vulkan_memory_exports": self.copy_calls,
+            "hip_external_memory_imports": misses,
+            "hip_mapped_buffer_acquires": misses,
+            "hip_mapped_buffer_releases": misses if self.closed else 0,
+            "hip_external_memory_destroys": misses if self.closed else 0,
+            "closed": self.closed,
+        }
+
+
 def _safe_inspection(*, device: int = 41, frames_context: int = 11) -> dict[str, object]:
     return {
         "memory_type": "vulkan",
@@ -587,6 +656,7 @@ def _audit(
     session=None,
     process_stats=None,
     decode_copy_stream: str = "null",
+    resource_cache: bool = False,
 ):
     return module._AmfInteropTransportAudit(
         inspect_amf_surface=inspect or (lambda _frame: _safe_inspection()),
@@ -595,6 +665,7 @@ def _audit(
         identity_session=session or _IdentitySession(),
         device=torch.device("cpu"),
         decode_copy_stream=decode_copy_stream,
+        resource_cache=resource_cache,
     )
 
 
@@ -654,6 +725,39 @@ def test_explicit_open_uses_session_bound_copy_not_top_level_bridge(monkeypatch)
     assert session.copy_calls == [(frame, 123, 456, 0)]
     top_level_copy.assert_not_called()
     assert session.closed is True
+
+
+def test_av1_cache_open_uses_session_cache_and_balances_reader_epoch(monkeypatch) -> None:
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    session = _CacheIdentitySession(misses=2)
+    constructor = MagicMock(return_value=session)
+    bridge = SimpleNamespace(
+        inspect_amf_surface=lambda _frame: _safe_inspection(),
+        copy_amf_surface_to_hip=lambda *_args: _safe_copy_result(),
+        get_transport_stats=lambda: {},
+        AmfVulkanHipInteropSession=constructor,
+    )
+    reader = _reader(
+        _metadata(codec="av1", profile="main", pixel_format="yuv420p"),
+        4,
+    )
+    monkeypatch.setattr(module, "_load_amf_interop_bridge", lambda: bridge)
+    monkeypatch.setattr(reader, "_open_pyav", MagicMock())
+
+    reader._open_amf_interop_backend(resource_cache=True)
+    audit = reader._amf_interop_audit
+    assert audit is not None
+    for index in range(4):
+        audit.copy_to_hip(object(), index + 1, 128)
+    reader._close_amf_interop_backend(validate=True)
+
+    constructor.assert_called_once_with("decode", resource_cache=True)
+    assert session.closed is True
+    assert reader.amf_interop_stats is not None
+    assert reader.amf_interop_stats["resource_cache_hits"] == 2
+    assert reader.amf_interop_stats["resource_cache_misses"] == 2
+    assert reader.amf_interop_stats["hip_external_memory_imports"] == 2
+    assert reader.amf_interop_stats["hip_external_memory_destroys"] == 2
 
 
 def test_deferred_open_requires_session_entrypoint_and_dependency_probe(monkeypatch) -> None:
@@ -798,6 +902,44 @@ def test_transport_audit_balances_create_close_and_per_frame_resources() -> None
     assert stats["hip_d2d_plane_copies"] == 4
 
 
+@pytest.mark.parametrize("is_10bit", [False, True])
+def test_batched_amd_converter_is_pixel_exact_across_b4_chunks(is_10bit: bool) -> None:
+    height, width, count = 16, 16, 5
+    reference = module.YuvToRgbConverter(
+        height,
+        width,
+        AvColorspace.ITU709,
+        False,
+        is_10bit,
+        torch.device("cpu"),
+    )
+    candidate = module._BatchedAmdYuvConverter(
+        reference,
+        4,
+        torch.device("cpu"),
+    )
+    dtype = torch.uint16 if is_10bit else torch.uint8
+    maximum = 65536 if is_10bit else 256
+    packed = torch.randint(
+        0,
+        maximum,
+        (count, height + height // 2, width),
+        dtype=dtype,
+    )
+    expected = torch.empty((count, 3, height, width), dtype=torch.uint8)
+    actual = torch.empty_like(expected)
+
+    for index in range(count):
+        reference.convert_into(
+            packed[index, :height],
+            packed[index, height:].view(height // 2, width // 2, 2),
+            expected[index],
+        )
+    candidate.convert_into(packed, actual)
+
+    assert torch.equal(actual, expected)
+
+
 def test_deferred_audit_requires_a_non_null_consumer_stream() -> None:
     session = _DeferredIdentitySession()
     audit = _audit(
@@ -913,6 +1055,25 @@ def test_reader_exit_keeps_primary_copy_error_when_deferred_teardown_also_fails(
     # __exit__ returns normally so the original with-body exception propagates.
     assert reader.__exit__(RuntimeError, RuntimeError("copy failed"), None) is None
     reader._amf_interop_audit.close.assert_called_once()
+
+
+def test_reader_exit_closes_cache_before_decoder_owned_allocations() -> None:
+    reader = _reader(
+        _metadata(codec="av1", profile="main", pixel_format="yuv420p"),
+        1,
+    )
+    order = []
+    audit = SimpleNamespace(
+        close=lambda: order.append("cache"),
+        validate_closed=lambda: {},
+    )
+    reader._amf_interop_audit = audit
+    reader._amf_interop_resource_cache = True
+    reader._close_pyav = lambda: order.append("decoder")
+
+    reader.__exit__(None, None, None)
+
+    assert order == ["cache", "decoder"]
 
 
 def test_transport_audit_does_not_swallow_session_close_failure() -> None:

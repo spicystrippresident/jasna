@@ -3,8 +3,9 @@
 ## 目的与作用域
 
 这是 v0.10 的一个可删除兼容后端。它只为 Linux 上的 AMD GPU 的 AV1
-解码保留，在统一 PyAV/AMF AV1 原生路线完成前处理该路线实际解码失败的
-情形。它不是新的产品默认解码器，也不改变 Windows、NVIDIA、VR auto、
+解码保留。当前已验收的 AV1 Main NV12/P010 会由产品 `auto` 直接进入 AMF
+Vulkan/HIP cache；本模块只保留显式诊断和 native 格式门外的兼容能力。
+它不是新的产品默认解码器，也不改变 Windows、NVIDIA、VR auto、
 HEVC Main10 或大分辨率输入的路由。
 
 `JASNA_DECODE_BACKEND=rocdecode` 是 Linux AMD 的显式诊断入口。它可用于
@@ -90,3 +91,11 @@ MP4/MKV/WebM 文件，没有找到 AV1 实拍素材，因此上述结果仍属�
 完成上述正确性、生命周期和性能验收后，删除 `jasna.media.rocdecode`、bridge
 package-data、`rocdecode` backend、相关测试以及本文件。删除前不得把该临时
 路线扩展到 HEVC、30MP 阈值、Windows 或其他产品自动策略。
+
+2026-08-29 的原生 AMF AV1 最终验收已经通过 Main8/Main10、4K/8K 正确性、
+10,000 帧生命周期和停止/关闭门，但没有通过性能门：三轮交错纯解码中 native B4
+中位数为 `412.756 fps`，rocDecode B4 为 `1000.787 fps`，native 慢 `58.76%`。
+原始性能门当时因此未满足。用户随后明确接受安全 cache 与 rocDecode 的剩余差距；
+产品代码已经把已验收的 AV1 Main NV12/P010 `auto` 提升到稳定 dma-buf cache，但本模块
+本次仍不删除。后续删除 PR 必须先确认没有 native gate 外仍需兼容的 AV1 输入、显式诊断
+替代方案和 Windows/Linux 文档残留。完整记录见 `docs/AMF_AV1_NATIVE_CN.md`。

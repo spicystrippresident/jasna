@@ -1,11 +1,10 @@
 """Minimal Linux AMF Vulkan-to-HIP D2D bridge.
 
-This extension is intentionally a diagnostic building block.  It accepts only
-native AMF Vulkan decode surfaces and performs two HIP device-to-device plane
-copies.  It never exposes a host map, staging allocation, or software frame
-transfer path.  Each copy imports and releases Vulkan external memory in the
-same call; the small session object only pins the decoder/context identity and
-is not a resource cache.
+This extension accepts only native AMF Vulkan decode surfaces and performs two
+HIP device-to-device plane copies.  It never exposes a host map, staging
+allocation, or software frame-transfer path.  H.264/HEVC retain their proven
+per-frame/deferred ownership; Linux AMD AV1 can use a session-owned cache keyed
+by the exported dma-buf backing identity rather than reusable Vulkan handles.
 """
 
 from av.video.frame cimport VideoFrame
@@ -62,7 +61,6 @@ def reset_transport_stats():
         "fixed_context_session_create_calls": 0,
         "fixed_context_session_close_calls": 0,
         "fixed_context_session_close_failures": 0,
-        # This core deliberately has no product resource cache.
         "resource_cache_session_create_calls": 0,
         "resource_cache_session_close_calls": 0,
         "resource_cache_session_close_failures": 0,
@@ -90,7 +88,9 @@ def get_transport_stats():
             "transport_reconfigures": 0,
             "transport_restarts": 0,
             "resource_strategy": (
-                "per-frame Vulkan external-memory import/map with balanced release"
+                "stable dma-buf identity cache retained for one reader epoch"
+                if stats["resource_cache_session_create_calls"]
+                else "per-frame Vulkan external-memory import/map with balanced release"
             ),
             "copy_synchronization": (
                 "private-deferred-device-wait"
@@ -111,6 +111,7 @@ cdef extern from *:
     #include <stdlib.h>
     #include <string.h>
     #include <unistd.h>
+    #include <sys/stat.h>
     #include <dlfcn.h>
     #include <libavutil/frame.h>
     #include <libavutil/hwcontext.h>
@@ -151,6 +152,11 @@ cdef extern from *:
         int deferred_source_acquire_calls;
         int deferred_source_release_calls;
         int deferred_forced_drain_calls;
+        uint64_t fd_device;
+        uint64_t fd_inode;
+        int fd_stat_result;
+        int cache_hit;
+        int cache_miss;
     } JasnaAmfCopyInfo;
 
     /* The AMF decoder needs free surfaces while B8 keeps a group alive. */
@@ -163,6 +169,22 @@ cdef extern from *:
         hipEvent_t copy_complete_event;
         hipEvent_t consumer_complete_event;
     } JasnaAmfDeferredDecodeRelease;
+
+    #define JASNA_AMF_DMABUF_CACHE_MAX 128
+
+    typedef struct JasnaAmfDmabufCacheEntry {
+        uint64_t fd_device;
+        uint64_t fd_inode;
+        uintptr_t last_image;
+        uintptr_t last_memory;
+        uint64_t memory_size;
+        uint64_t y_offset;
+        uint64_t uv_offset;
+        uint64_t y_pitch;
+        uint64_t uv_pitch;
+        hipExternalMemory_t hip_external;
+        void *hip_mapped;
+    } JasnaAmfDmabufCacheEntry;
 
     typedef struct JasnaAmfInteropSession {
         uintptr_t hw_frames_context;
@@ -213,6 +235,19 @@ cdef extern from *:
         uint64_t deferred_max_in_flight;
         uint64_t deferred_failures;
         uintptr_t last_deferred_stream_handle;
+        int resource_cache_enabled;
+        JasnaAmfDmabufCacheEntry resource_cache[JASNA_AMF_DMABUF_CACHE_MAX];
+        int resource_cache_count;
+        uint64_t resource_cache_hits;
+        uint64_t resource_cache_misses;
+        uint64_t resource_cache_fd_export_calls;
+        uint64_t resource_cache_fd_export_failures;
+        uint64_t resource_cache_fd_stat_calls;
+        uint64_t resource_cache_fd_stat_failures;
+        uint64_t resource_cache_fd_close_calls;
+        uint64_t resource_cache_fd_ownership_transfers;
+        uint64_t resource_cache_raw_handle_identity_changes;
+        uint64_t resource_cache_stable_identity_raw_handle_changes;
         int closed;
     } JasnaAmfInteropSession;
 
@@ -252,6 +287,21 @@ cdef extern from *:
         uint64_t deferred_failures;
         uintptr_t last_deferred_stream_handle;
         int deferred_in_flight;
+        int resource_cache_enabled;
+        int resource_cache_entries;
+        int resource_cache_capacity;
+        uint64_t resource_cache_hits;
+        uint64_t resource_cache_misses;
+        uint64_t resource_cache_fd_export_calls;
+        uint64_t resource_cache_fd_export_failures;
+        uint64_t resource_cache_fd_stat_calls;
+        uint64_t resource_cache_fd_stat_failures;
+        uint64_t resource_cache_fd_close_calls;
+        uint64_t resource_cache_fd_ownership_transfers;
+        uint64_t resource_cache_raw_handle_identity_changes;
+        uint64_t resource_cache_stable_identity_raw_handle_changes;
+        uint64_t resource_cache_active_external_imports;
+        uint64_t resource_cache_active_mappings;
         int closed;
     } JasnaAmfInteropSessionStats;
 
@@ -445,11 +495,12 @@ cdef extern from *:
         return 0;
     }
 
-    static JasnaAmfInteropSession *jasna_session_create(void) {
+    static JasnaAmfInteropSession *jasna_session_create(int resource_cache_enabled) {
         JasnaAmfInteropSession *session =
             (JasnaAmfInteropSession *)calloc(1, sizeof(JasnaAmfInteropSession));
         if (session) {
             session->hip_device = -1;
+            session->resource_cache_enabled = resource_cache_enabled ? 1 : 0;
         }
         return session;
     }
@@ -828,6 +879,46 @@ cdef extern from *:
         return jasna_session_release_deferred_resources(session, release, info, error);
     }
 
+    static int jasna_session_close_resource_cache(
+        JasnaAmfInteropSession *session, const char **error
+    ) {
+        int index;
+        if (!session || !session->resource_cache_enabled) {
+            return 0;
+        }
+        for (index = session->resource_cache_count - 1; index >= 0; --index) {
+            JasnaAmfDmabufCacheEntry *entry = &session->resource_cache[index];
+            hipError_t result;
+            if (entry->hip_mapped) {
+                if (!jasna_hip_free) {
+                    *error = "hipFree is unavailable while closing the dma-buf cache";
+                    return -1;
+                }
+                result = jasna_hip_free(entry->hip_mapped);
+                if (result != hipSuccess) {
+                    *error = "releasing a dma-buf cache HIP mapping failed";
+                    return -2;
+                }
+                entry->hip_mapped = NULL;
+                session->hip_mapped_buffer_releases += 1;
+            }
+            if (entry->hip_external) {
+                if (!jasna_hip_destroy_memory) {
+                    *error = "hipDestroyExternalMemory is unavailable while closing the dma-buf cache";
+                    return -3;
+                }
+                result = jasna_hip_destroy_memory(entry->hip_external);
+                if (result != hipSuccess) {
+                    *error = "destroying a dma-buf cache HIP import failed";
+                    return -4;
+                }
+                entry->hip_external = NULL;
+                session->hip_external_memory_destroys += 1;
+            }
+        }
+        return 0;
+    }
+
     static int jasna_session_close(
         JasnaAmfInteropSession *session, const char **error
     ) {
@@ -855,6 +946,11 @@ cdef extern from *:
                 session->close_failures += 1;
                 return -3;
             }
+        }
+        status = jasna_session_close_resource_cache(session, error);
+        if (status != 0) {
+            session->close_failures += 1;
+            return -8;
         }
         for (index = 0; index < JASNA_AMF_DEFERRED_DECODE_MAX_IN_FLIGHT; ++index) {
             JasnaAmfDeferredDecodeRelease *release = &session->deferred_releases[index];
@@ -930,6 +1026,15 @@ cdef extern from *:
             /* Do not free AMF/HIP ownership after an unsafe drain failure. */
             return;
         }
+        {
+            int index;
+            for (index = 0; index < session->resource_cache_count; ++index) {
+                if (session->resource_cache[index].hip_external ||
+                    session->resource_cache[index].hip_mapped) {
+                    return;
+                }
+            }
+        }
         free(session);
     }
 
@@ -981,6 +1086,38 @@ cdef extern from *:
         stats->deferred_failures = session->deferred_failures;
         stats->last_deferred_stream_handle = session->last_deferred_stream_handle;
         stats->deferred_in_flight = (int)session->deferred_count;
+        stats->resource_cache_enabled = session->resource_cache_enabled;
+        stats->resource_cache_entries = session->resource_cache_count;
+        stats->resource_cache_capacity = JASNA_AMF_DMABUF_CACHE_MAX;
+        stats->resource_cache_hits = session->resource_cache_hits;
+        stats->resource_cache_misses = session->resource_cache_misses;
+        stats->resource_cache_fd_export_calls =
+            session->resource_cache_fd_export_calls;
+        stats->resource_cache_fd_export_failures =
+            session->resource_cache_fd_export_failures;
+        stats->resource_cache_fd_stat_calls =
+            session->resource_cache_fd_stat_calls;
+        stats->resource_cache_fd_stat_failures =
+            session->resource_cache_fd_stat_failures;
+        stats->resource_cache_fd_close_calls =
+            session->resource_cache_fd_close_calls;
+        stats->resource_cache_fd_ownership_transfers =
+            session->resource_cache_fd_ownership_transfers;
+        stats->resource_cache_raw_handle_identity_changes =
+            session->resource_cache_raw_handle_identity_changes;
+        stats->resource_cache_stable_identity_raw_handle_changes =
+            session->resource_cache_stable_identity_raw_handle_changes;
+        {
+            int index;
+            for (index = 0; index < session->resource_cache_count; ++index) {
+                if (session->resource_cache[index].hip_external) {
+                    stats->resource_cache_active_external_imports += 1;
+                }
+                if (session->resource_cache[index].hip_mapped) {
+                    stats->resource_cache_active_mappings += 1;
+                }
+            }
+        }
         stats->closed = session->closed;
     }
 
@@ -1616,6 +1753,379 @@ cdef extern from *:
         }
         return status;
     }
+
+    static int jasna_copy_cached_to_hip(
+        AVFrame *frame,
+        uintptr_t destination,
+        uint64_t destination_size,
+        int hip_device,
+        JasnaAmfInteropSession *session,
+        JasnaAmfCopyInfo *info,
+        const char **error
+    ) {
+        AMFSurface *surface = NULL;
+        AMFPlane *plane = NULL;
+        AMFVulkanView *view = NULL;
+        AMFVulkanSurface *vk_surface = NULL;
+        AVHWFramesContext *frames_ctx = NULL;
+        AVHWDeviceContext *device_ctx = NULL;
+        AVAMFDeviceContext *amf_ctx = NULL;
+        AMFContext1 *context1 = NULL;
+        AMFVulkanDevice *vk_device = NULL;
+        PFN_vkWaitForFences wait_for_fences = NULL;
+        PFN_vkGetMemoryFdKHR get_memory_fd = NULL;
+        PFN_vkGetImageSubresourceLayout get_subresource_layout = NULL;
+        VkSubresourceLayout layouts[2];
+        VkImageSubresource subresource;
+        VkMemoryGetFdInfoKHR fd_info;
+        struct stat fd_stat;
+        uint64_t row_bytes;
+        uint64_t y_size;
+        uint64_t packed_size;
+        int bytes_per_sample;
+        int visible_width;
+        int visible_height;
+        int fd = -1;
+        int index;
+        int matched_index = -1;
+        int status = -1;
+        JasnaAmfDmabufCacheEntry *pending_entry = NULL;
+
+        if (!frame || !destination || !destination_size || !session ||
+            !info || !error) {
+            return -1;
+        }
+        memset(info, 0, sizeof(*info));
+        info->wait_result = VK_SUCCESS;
+        info->export_result = -1;
+        info->fd_stat_result = -1;
+        info->hip_result = -1;
+        info->hip_free_result = -1;
+        info->hip_destroy_result = -1;
+        info->hip_stream_synchronize_result = -1;
+        *error = NULL;
+        if (!session->resource_cache_enabled || session->closed) {
+            *error = "the fixed-context dma-buf identity cache is unavailable";
+            return -2;
+        }
+        if (frame->format != AV_PIX_FMT_AMF_SURFACE || !frame->hw_frames_ctx) {
+            *error = "frame is not an AMF hardware surface";
+            return -3;
+        }
+        surface = (AMFSurface *)frame->data[0];
+        if (!surface || !surface->pVtbl ||
+            surface->pVtbl->GetMemoryType(surface) != AMF_MEMORY_VULKAN) {
+            *error = "source is not a Vulkan AMF surface";
+            return -4;
+        }
+        if (surface->pVtbl->GetFormat(surface) != AMF_SURFACE_NV12 &&
+            surface->pVtbl->GetFormat(surface) != AMF_SURFACE_P010) {
+            *error = "source format is not NV12 or P010";
+            return -5;
+        }
+        frames_ctx = (AVHWFramesContext *)frame->hw_frames_ctx->data;
+        device_ctx = frames_ctx ? frames_ctx->device_ctx : NULL;
+        amf_ctx = device_ctx ? (AVAMFDeviceContext *)device_ctx->hwctx : NULL;
+        if (!amf_ctx || !amf_ctx->context) {
+            *error = "AMF context is unavailable";
+            return -6;
+        }
+        {
+            AMFGuid guid = IID_AMFContext1();
+            AMF_RESULT query = amf_ctx->context->pVtbl->QueryInterface(
+                amf_ctx->context, &guid, (void **)&context1
+            );
+            if (query != AMF_OK || !context1) {
+                *error = "AMFContext1 is unavailable";
+                return -7;
+            }
+        }
+        vk_device = (AMFVulkanDevice *)context1->pVtbl->GetVulkanDevice(context1);
+        if (!vk_device || !vk_device->hDevice) {
+            *error = "AMF Vulkan device is unavailable";
+            status = -8;
+            goto cleanup;
+        }
+        visible_width = frame->width;
+        visible_height = frame->height;
+        status = jasna_session_bind(
+            session, frames_ctx, amf_ctx->context, vk_device->hDevice,
+            hip_device, surface->pVtbl->GetFormat(surface), visible_width,
+            visible_height, error
+        );
+        if (status != 0) {
+            status = -9;
+            goto cleanup;
+        }
+        info->fixed_context_bound = 1;
+        plane = surface->pVtbl->GetPlaneAt(surface, 0);
+        view = plane ? (AMFVulkanView *)plane->pVtbl->GetNative(plane) : NULL;
+        vk_surface = view ? view->pSurface : NULL;
+        if (!vk_surface || !vk_surface->hImage || !vk_surface->hMemory ||
+            vk_surface->iSize <= 0) {
+            *error = "AMF Vulkan allocation is unavailable";
+            status = -10;
+            goto cleanup;
+        }
+        if (visible_width <= 0 || visible_height <= 0 ||
+            visible_width > vk_surface->iWidth ||
+            visible_height > vk_surface->iHeight ||
+            (visible_width & 1) || (visible_height & 1)) {
+            *error = "visible frame dimensions are invalid for the AMF surface";
+            status = -11;
+            goto cleanup;
+        }
+        if (jasna_load_vulkan(error) != 0 || jasna_load_hip(error) != 0) {
+            status = -12;
+            goto cleanup;
+        }
+        wait_for_fences = (PFN_vkWaitForFences)jasna_vk_get_device_proc(
+            vk_device->hDevice, "vkWaitForFences"
+        );
+        get_memory_fd = (PFN_vkGetMemoryFdKHR)jasna_vk_get_device_proc(
+            vk_device->hDevice, "vkGetMemoryFdKHR"
+        );
+        get_subresource_layout = (PFN_vkGetImageSubresourceLayout)
+            jasna_vk_get_device_proc(
+                vk_device->hDevice, "vkGetImageSubresourceLayout"
+            );
+        if (!wait_for_fences || !get_memory_fd || !get_subresource_layout) {
+            *error = "required Vulkan wait, export, or layout entry point is unavailable";
+            status = -13;
+            goto cleanup;
+        }
+        if (vk_surface->Sync.hFence) {
+            info->wait_result = wait_for_fences(
+                vk_device->hDevice, 1, &vk_surface->Sync.hFence, VK_TRUE,
+                5000000000ULL
+            );
+            if (info->wait_result != VK_SUCCESS) {
+                *error = "waiting for the decoder surface fence failed";
+                status = -14;
+                goto cleanup;
+            }
+            vk_surface->Sync.hFence = VK_NULL_HANDLE;
+        }
+        bytes_per_sample = surface->pVtbl->GetFormat(surface) ==
+            AMF_SURFACE_P010 ? 2 : 1;
+        row_bytes = (uint64_t)visible_width * (uint64_t)bytes_per_sample;
+        y_size = row_bytes * (uint64_t)visible_height;
+        packed_size = y_size + row_bytes * (uint64_t)(visible_height / 2);
+        if (destination_size < packed_size) {
+            *error = "HIP destination is smaller than the packed decoder surface";
+            status = -15;
+            goto cleanup;
+        }
+        memset(layouts, 0, sizeof(layouts));
+        memset(&subresource, 0, sizeof(subresource));
+        subresource.aspectMask = VK_IMAGE_ASPECT_PLANE_0_BIT;
+        get_subresource_layout(
+            vk_device->hDevice, vk_surface->hImage, &subresource, &layouts[0]
+        );
+        subresource.aspectMask = VK_IMAGE_ASPECT_PLANE_1_BIT;
+        get_subresource_layout(
+            vk_device->hDevice, vk_surface->hImage, &subresource, &layouts[1]
+        );
+        if (layouts[0].rowPitch < row_bytes || layouts[1].rowPitch < row_bytes) {
+            *error = "decoder Vulkan plane pitch is smaller than visible width";
+            status = -16;
+            goto cleanup;
+        }
+        memset(&fd_info, 0, sizeof(fd_info));
+        fd_info.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
+        fd_info.memory = vk_surface->hMemory;
+        fd_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+        session->resource_cache_fd_export_calls += 1;
+        info->export_result = get_memory_fd(vk_device->hDevice, &fd_info, &fd);
+        if (info->export_result != VK_SUCCESS || fd < 0) {
+            session->resource_cache_fd_export_failures += 1;
+            *error = "exporting decoder Vulkan memory as an opaque fd failed";
+            status = -17;
+            goto cleanup;
+        }
+        session->vulkan_memory_exports += 1;
+        memset(&fd_stat, 0, sizeof(fd_stat));
+        session->resource_cache_fd_stat_calls += 1;
+        info->fd_stat_result = fstat(fd, &fd_stat);
+        if (info->fd_stat_result != 0 || fd_stat.st_ino == 0) {
+            session->resource_cache_fd_stat_failures += 1;
+            *error = "identifying the exported dma-buf fd failed";
+            status = -18;
+            goto cleanup;
+        }
+        info->fd_device = (uint64_t)fd_stat.st_dev;
+        info->fd_inode = (uint64_t)fd_stat.st_ino;
+        for (index = 0; index < session->resource_cache_count; ++index) {
+            JasnaAmfDmabufCacheEntry *entry = &session->resource_cache[index];
+            if (entry->last_memory == (uintptr_t)vk_surface->hMemory &&
+                (entry->fd_device != info->fd_device ||
+                 entry->fd_inode != info->fd_inode)) {
+                session->resource_cache_raw_handle_identity_changes += 1;
+            }
+            if (entry->fd_device == info->fd_device &&
+                entry->fd_inode == info->fd_inode) {
+                if (entry->memory_size != (uint64_t)vk_surface->iSize ||
+                    entry->y_offset != (uint64_t)layouts[0].offset ||
+                    entry->uv_offset != (uint64_t)layouts[1].offset ||
+                    entry->y_pitch != (uint64_t)layouts[0].rowPitch ||
+                    entry->uv_pitch != (uint64_t)layouts[1].rowPitch) {
+                    *error = "stable dma-buf identity changed size or plane layout";
+                    status = -19;
+                    goto cleanup;
+                }
+                if (entry->last_image != (uintptr_t)vk_surface->hImage ||
+                    entry->last_memory != (uintptr_t)vk_surface->hMemory) {
+                    session->resource_cache_stable_identity_raw_handle_changes += 1;
+                    entry->last_image = (uintptr_t)vk_surface->hImage;
+                    entry->last_memory = (uintptr_t)vk_surface->hMemory;
+                }
+                matched_index = index;
+                break;
+            }
+        }
+        info->hip_result = jasna_hip_set_device(hip_device);
+        if (info->hip_result != hipSuccess) {
+            *error = "selecting the HIP device failed";
+            status = -20;
+            goto cleanup;
+        }
+        if (matched_index >= 0) {
+            session->resource_cache_hits += 1;
+            info->cache_hit = 1;
+            if (close(fd) != 0) {
+                fd = -1;
+                *error = "closing a cache-hit exported dma-buf fd failed";
+                status = -21;
+                goto cleanup;
+            }
+            fd = -1;
+            session->resource_cache_fd_close_calls += 1;
+        } else {
+            JasnaAmfDmabufCacheEntry *entry;
+            hipExternalMemoryHandleDesc memory_description;
+            hipExternalMemoryBufferDesc buffer_description;
+            if (session->resource_cache_count >= JASNA_AMF_DMABUF_CACHE_MAX) {
+                *error = "dma-buf identity cache capacity exceeded";
+                status = -22;
+                goto cleanup;
+            }
+            entry = &session->resource_cache[session->resource_cache_count];
+            pending_entry = entry;
+            memset(entry, 0, sizeof(*entry));
+            memset(&memory_description, 0, sizeof(memory_description));
+            memory_description.type = hipExternalMemoryHandleTypeOpaqueFd;
+            memory_description.handle.fd = fd;
+            memory_description.size = (unsigned long long)vk_surface->iSize;
+            memory_description.flags = hipExternalMemoryDedicated;
+            info->hip_result = jasna_hip_import_memory(
+                &entry->hip_external, &memory_description
+            );
+            if (info->hip_result != hipSuccess || !entry->hip_external) {
+                *error = "importing the decoder dma-buf into HIP failed";
+                status = -23;
+                goto cleanup;
+            }
+            session->hip_external_memory_imports += 1;
+            fd = -1;
+            session->resource_cache_fd_ownership_transfers += 1;
+            memset(&buffer_description, 0, sizeof(buffer_description));
+            buffer_description.size = (unsigned long long)vk_surface->iSize;
+            info->hip_result = jasna_hip_map_buffer(
+                &entry->hip_mapped, entry->hip_external, &buffer_description
+            );
+            if (info->hip_result != hipSuccess || !entry->hip_mapped) {
+                *error = "mapping the decoder dma-buf import failed";
+                status = -24;
+                goto cleanup;
+            }
+            session->hip_mapped_buffer_acquires += 1;
+            entry->fd_device = info->fd_device;
+            entry->fd_inode = info->fd_inode;
+            entry->last_image = (uintptr_t)vk_surface->hImage;
+            entry->last_memory = (uintptr_t)vk_surface->hMemory;
+            entry->memory_size = (uint64_t)vk_surface->iSize;
+            entry->y_offset = (uint64_t)layouts[0].offset;
+            entry->uv_offset = (uint64_t)layouts[1].offset;
+            entry->y_pitch = (uint64_t)layouts[0].rowPitch;
+            entry->uv_pitch = (uint64_t)layouts[1].rowPitch;
+            matched_index = session->resource_cache_count++;
+            pending_entry = NULL;
+            session->resource_cache_misses += 1;
+            info->cache_miss = 1;
+        }
+        {
+            JasnaAmfDmabufCacheEntry *entry =
+                &session->resource_cache[matched_index];
+            info->hip_result = jasna_hip_memcpy_2d(
+                (void *)destination, (size_t)row_bytes,
+                (const uint8_t *)entry->hip_mapped + entry->y_offset,
+                (size_t)entry->y_pitch, (size_t)row_bytes,
+                (size_t)visible_height, hipMemcpyDeviceToDevice
+            );
+            if (info->hip_result != hipSuccess) {
+                *error = "copying cached decoder luma into HIP failed";
+                status = -25;
+                goto cleanup;
+            }
+            info->d2d_plane_copies += 1;
+            info->hip_result = jasna_hip_memcpy_2d(
+                (uint8_t *)destination + y_size, (size_t)row_bytes,
+                (const uint8_t *)entry->hip_mapped + entry->uv_offset,
+                (size_t)entry->uv_pitch, (size_t)row_bytes,
+                (size_t)(visible_height / 2), hipMemcpyDeviceToDevice
+            );
+            if (info->hip_result != hipSuccess) {
+                *error = "copying cached decoder chroma into HIP failed";
+                status = -26;
+                goto cleanup;
+            }
+            info->d2d_plane_copies += 1;
+        }
+        info->hip_stream_synchronize_calls = 1;
+        info->hip_stream_synchronize_result = jasna_hip_stream_synchronize(NULL);
+        info->hip_result = info->hip_stream_synchronize_result;
+        if (info->hip_result != hipSuccess) {
+            *error = "synchronizing the dma-buf cache HIP copy failed";
+            status = -27;
+            goto cleanup;
+        }
+        info->width = visible_width;
+        info->height = visible_height;
+        info->bytes_per_sample = bytes_per_sample;
+        info->packed_size = packed_size;
+        info->source_y_pitch = layouts[0].rowPitch;
+        info->source_uv_pitch = layouts[1].rowPitch;
+        session->copy_calls += 1;
+        status = 0;
+
+    cleanup:
+        if (pending_entry) {
+            if (pending_entry->hip_mapped && jasna_hip_free) {
+                info->hip_free_result = jasna_hip_free(pending_entry->hip_mapped);
+                if (info->hip_free_result == hipSuccess) {
+                    pending_entry->hip_mapped = NULL;
+                    session->hip_mapped_buffer_releases += 1;
+                }
+            }
+            if (!pending_entry->hip_mapped && pending_entry->hip_external &&
+                jasna_hip_destroy_memory) {
+                info->hip_destroy_result =
+                    jasna_hip_destroy_memory(pending_entry->hip_external);
+                if (info->hip_destroy_result == hipSuccess) {
+                    pending_entry->hip_external = NULL;
+                    session->hip_external_memory_destroys += 1;
+                }
+            }
+        }
+        if (fd >= 0) {
+            close(fd);
+            session->resource_cache_fd_close_calls += 1;
+        }
+        if (context1) {
+            context1->pVtbl->Release(context1);
+        }
+        return status;
+    }
     """
     ctypedef struct JasnaAmfCopyInfo:
         int width
@@ -1648,6 +2158,11 @@ cdef extern from *:
         int deferred_source_acquire_calls
         int deferred_source_release_calls
         int deferred_forced_drain_calls
+        unsigned long long fd_device
+        unsigned long long fd_inode
+        int fd_stat_result
+        int cache_hit
+        int cache_miss
 
     ctypedef struct JasnaAmfInteropSession:
         pass
@@ -1688,9 +2203,24 @@ cdef extern from *:
         unsigned long long deferred_failures
         uintptr_t last_deferred_stream_handle
         int deferred_in_flight
+        int resource_cache_enabled
+        int resource_cache_entries
+        int resource_cache_capacity
+        unsigned long long resource_cache_hits
+        unsigned long long resource_cache_misses
+        unsigned long long resource_cache_fd_export_calls
+        unsigned long long resource_cache_fd_export_failures
+        unsigned long long resource_cache_fd_stat_calls
+        unsigned long long resource_cache_fd_stat_failures
+        unsigned long long resource_cache_fd_close_calls
+        unsigned long long resource_cache_fd_ownership_transfers
+        unsigned long long resource_cache_raw_handle_identity_changes
+        unsigned long long resource_cache_stable_identity_raw_handle_changes
+        unsigned long long resource_cache_active_external_imports
+        unsigned long long resource_cache_active_mappings
         int closed
 
-    JasnaAmfInteropSession *jasna_session_create()
+    JasnaAmfInteropSession *jasna_session_create(int resource_cache_enabled)
     int jasna_session_close(JasnaAmfInteropSession *session, const char **error)
     void jasna_session_destroy(JasnaAmfInteropSession *session)
     void jasna_session_get_stats(
@@ -1724,6 +2254,15 @@ cdef extern from *:
         JasnaAmfInteropSession *session,
         int private_deferred,
         uintptr_t consumer_stream_handle,
+        JasnaAmfCopyInfo *info,
+        const char **error,
+    )
+    int jasna_copy_cached_to_hip(
+        void *frame,
+        uintptr_t destination,
+        unsigned long long destination_size,
+        int hip_device,
+        JasnaAmfInteropSession *session,
         JasnaAmfCopyInfo *info,
         const char **error,
     )
@@ -1761,6 +2300,21 @@ def _copy_result(JasnaAmfCopyInfo info):
         "copy_synchronization": "null-stream-source-release",
         "fixed_context_bound": bool(info.fixed_context_bound),
     }
+
+
+def _cached_copy_result(JasnaAmfCopyInfo info):
+    result = _copy_result(info)
+    result.update(
+        {
+            "fd_device": int(info.fd_device),
+            "fd_inode": int(info.fd_inode),
+            "fd_stat_result": info.fd_stat_result,
+            "cache_hit": bool(info.cache_hit),
+            "cache_miss": bool(info.cache_miss),
+            "copy_synchronization": "null-stream-cache-retained",
+        }
+    )
+    return result
 
 
 def _deferred_copy_result(JasnaAmfCopyInfo info):
@@ -1968,19 +2522,23 @@ def copy_amf_surface_to_hip(
 
 
 cdef class AmfVulkanHipInteropSession:
-    """One decode reader's fixed AMF/Vulkan/HIP identity, without a cache."""
+    """One decode reader's fixed AMF/Vulkan/HIP identity and optional cache."""
 
     cdef JasnaAmfInteropSession *_session
     cdef bint _closed
+    cdef bint _resource_cache
 
-    def __cinit__(self, purpose):
+    def __cinit__(self, purpose, resource_cache=False):
         if purpose != "decode":
             raise ValueError("this core only supports a 'decode' interop session")
-        self._session = jasna_session_create()
+        self._resource_cache = bool(resource_cache)
+        self._session = jasna_session_create(1 if self._resource_cache else 0)
         if self._session == NULL:
             raise MemoryError("creating the fixed-context AMF interop session failed")
         self._closed = False
         _transport_stats["fixed_context_session_create_calls"] += 1
+        if self._resource_cache:
+            _transport_stats["resource_cache_session_create_calls"] += 1
 
     def __dealloc__(self):
         if self._session != NULL:
@@ -2049,8 +2607,12 @@ cdef class AmfVulkanHipInteropSession:
             after.deferred_in_flight
         )
         _transport_stats["fixed_context_session_close_calls"] += 1
+        if self._resource_cache:
+            _transport_stats["resource_cache_session_close_calls"] += 1
         if status != 0:
             _transport_stats["fixed_context_session_close_failures"] += 1
+            if self._resource_cache:
+                _transport_stats["resource_cache_session_close_failures"] += 1
             message = error.decode("utf-8", "replace") if error != NULL else "unknown error"
             raise RuntimeError(
                 f"closing the fixed-context AMF interop session failed ({status}): {message}"
@@ -2065,14 +2627,39 @@ cdef class AmfVulkanHipInteropSession:
         return {
             "purpose": "decode",
             "resource_strategy": (
-                "per-frame Vulkan external-memory import/map retained until "
-                "consumer-event release"
-                if stats.deferred_stream_create_calls
-                else "per-frame Vulkan external-memory import/map with balanced release"
+                "stable dma-buf identity cache retained for one reader epoch"
+                if stats.resource_cache_enabled
+                else (
+                    "per-frame Vulkan external-memory import/map retained until "
+                    "consumer-event release"
+                    if stats.deferred_stream_create_calls
+                    else "per-frame Vulkan external-memory import/map with balanced release"
+                )
             ),
-            "cache_entries": 0,
-            "cache_hits": 0,
-            "cache_misses": 0,
+            "cache_entries": int(stats.resource_cache_entries),
+            "cache_capacity": int(stats.resource_cache_capacity),
+            "cache_hits": int(stats.resource_cache_hits),
+            "cache_misses": int(stats.resource_cache_misses),
+            "cache_active_external_imports": int(
+                stats.resource_cache_active_external_imports
+            ),
+            "cache_active_mappings": int(stats.resource_cache_active_mappings),
+            "cache_fd_export_calls": int(stats.resource_cache_fd_export_calls),
+            "cache_fd_export_failures": int(
+                stats.resource_cache_fd_export_failures
+            ),
+            "cache_fd_stat_calls": int(stats.resource_cache_fd_stat_calls),
+            "cache_fd_stat_failures": int(stats.resource_cache_fd_stat_failures),
+            "cache_fd_close_calls": int(stats.resource_cache_fd_close_calls),
+            "cache_fd_ownership_transfers": int(
+                stats.resource_cache_fd_ownership_transfers
+            ),
+            "cache_raw_handle_identity_changes": int(
+                stats.resource_cache_raw_handle_identity_changes
+            ),
+            "cache_stable_identity_raw_handle_changes": int(
+                stats.resource_cache_stable_identity_raw_handle_changes
+            ),
             "copy_calls": int(stats.copy_calls),
             "close_calls": int(stats.close_calls),
             "close_failures": int(stats.close_failures),
@@ -2174,6 +2761,10 @@ cdef class AmfVulkanHipInteropSession:
     ):
         if self._session == NULL or self._closed:
             raise RuntimeError("fixed-context AMF interop session is already closed")
+        if self._resource_cache:
+            raise RuntimeError(
+                "a resource-cache session must use copy_amf_surface_to_hip_resource_cache"
+            )
         _transport_stats["copy_to_hip_calls"] += 1
         cdef JasnaAmfCopyInfo info
         cdef const char *error = NULL
@@ -2211,6 +2802,56 @@ cdef class AmfVulkanHipInteropSession:
         ] += int(info.hip_stream_synchronize_calls)
         return _copy_result(info)
 
+    def copy_amf_surface_to_hip_resource_cache(
+        self,
+        VideoFrame frame,
+        uintptr_t destination,
+        unsigned long long destination_size,
+        int device=0,
+    ):
+        """Copy through the reader-owned stable dma-buf identity cache."""
+
+        if self._session == NULL or self._closed:
+            raise RuntimeError("fixed-context AMF interop session is already closed")
+        if not self._resource_cache:
+            raise RuntimeError("this fixed-context session has no resource cache")
+        _transport_stats["copy_to_hip_calls"] += 1
+        cdef JasnaAmfCopyInfo info
+        cdef const char *error = NULL
+        cdef int status = jasna_copy_cached_to_hip(
+            <void *>frame.ptr,
+            destination,
+            destination_size,
+            device,
+            self._session,
+            &info,
+            &error,
+        )
+        if status != 0:
+            _transport_stats["copy_to_hip_failures"] += 1
+            message = error.decode("utf-8", "replace") if error != NULL else "unknown error"
+            raise RuntimeError(
+                f"cached fixed-context AMF-to-HIP D2D copy failed ({status}, "
+                f"Vulkan wait {info.wait_result}, Vulkan export {info.export_result}, "
+                f"fstat {info.fd_stat_result}, HIP {info.hip_result}): {message}"
+            )
+        _transport_stats["copy_to_hip_successes"] += 1
+        _transport_stats["vulkan_memory_exports"] += 1
+        if info.cache_hit:
+            _transport_stats["resource_cache_hits"] += 1
+        else:
+            _transport_stats["resource_cache_misses"] += 1
+            _transport_stats["hip_external_memory_imports"] += 1
+            _transport_stats["hip_mapped_buffer_acquires"] += 1
+        _transport_stats["hip_d2d_plane_copies"] += int(info.d2d_plane_copies)
+        _transport_stats["decode_source_release_hip_stream_synchronize_calls"] += int(
+            info.hip_stream_synchronize_calls
+        )
+        _transport_stats[
+            "decode_null_stream_source_release_hip_stream_synchronize_calls"
+        ] += int(info.hip_stream_synchronize_calls)
+        return _cached_copy_result(info)
+
     def copy_amf_surface_to_hip_private_deferred_stream(
         self,
         VideoFrame frame,
@@ -2228,6 +2869,10 @@ cdef class AmfVulkanHipInteropSession:
 
         if self._session == NULL or self._closed:
             raise RuntimeError("fixed-context AMF interop session is already closed")
+        if self._resource_cache:
+            raise RuntimeError(
+                "a resource-cache session cannot use private-deferred ownership"
+            )
         if consumer_stream_handle == 0:
             raise RuntimeError(
                 "private-deferred AMF-to-HIP copies require a non-null Torch "
