@@ -10,9 +10,15 @@
 - Windows：`scripts/build_unified_ffmpeg_pyav_windows.ps1`
 
 它们只从固定源码构建一组共享 FFmpeg 库、`ffmpeg`/`ffprobe` 和 PyAV wheel，并写出
-`build-manifest.txt`。Linux 构建器还会针对同一 PyAV/FFmpeg ABI 构建 AMF Vulkan/HIP
+`build-manifest.txt`。受限 FFmpeg 配置显式包含产品 Smart Render 使用的
+MP4/Matroska/NUT/MPEG-TS、concat/framemd5/pipe、AMF encoder 以及对应 bitstream filter；
+这些能力是产品运行合同的一部分，不能只依赖开发机系统 FFmpeg。Linux 构建器还会针对同一 PyAV/FFmpeg ABI 构建 AMF Vulkan/HIP
 bridge；它不会安装 runtime、不会改变默认解码/编码路由，也不会接入 MIGraphX、
 Smart Render 或 GUI。
+
+FFmpeg configure 中 extradata bitstream filter 的组件名是 `dump_extradata`；构建后的
+CLI 名称是产品命令使用的 `dump_extra`。构建器启用 `--fatal-warnings`，configure 出现
+未匹配组件等警告时必须直接失败，不能产出可误装的半完整 runtime。
 
 已有的 `jasna.runtime_contract` 和 `scripts/install_unified_runtime.py` 是单独的责任：前者
 定义可接受 runtime，后者只安装已经通过其 pin 与哈希检查的构建产物。本流水线与安装器
