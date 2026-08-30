@@ -22,6 +22,18 @@ H.264 10-bit、其他 codec/profile，以及非 Windows AMD 平台不匹配这�
 当前分支原有的路径。Linux AMD AV1 的 rocDecode 兼容 fallback 仍限定为 Linux；本候选
 不会把它扩展到 Windows。
 
+## Windows ROCm 的 MMEngine 导入边界
+
+Windows ROCm 的 Torch wheel 不提供 distributed c10d，
+`torch.distributed.is_available()` 因此为 false。MMEngine 0.10.x 即使只用于
+BasicVSR++ 单进程推理，也会在导入阶段访问 `ReduceOp` 和 FSDP 模块。Jasna 只在
+`win32 + torch.version.hip + distributed unavailable` 的精确交集内补齐这两个导入
+表面；FSDP 构造仍会显式报错，且 `torch.distributed.is_available()` 保持 false。
+
+Linux ROCm、Windows/Linux CUDA，以及真正具备 distributed 的 Torch 环境完全不进入
+该兼容层。该修复只解除 MMEngine 的模块导入阻断，不启用分布式训练、不改变 BasicVSR++
+模型、checkpoint、推理路线或产品默认值。
+
 ## 选择与失败语义
 
 - 仅 `auto` 自动应用 HEVC Main10/AV1 的 Windows AMD 软件解码策略。它会记录一条
