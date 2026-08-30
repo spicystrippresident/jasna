@@ -38,6 +38,7 @@ EXPECTED_AV_LIBRARY_VERSIONS: Mapping[str, tuple[int, int, int]] = {
     "libswresample": (6, 4, 100),
 }
 AMF_INTEROP_BRIDGE_PREFIX = "_jasna_amf_surface_probe."
+_RUNTIME_DLL_DIRECTORY_HANDLES: dict[str, object] = {}
 
 
 @dataclass(frozen=True)
@@ -87,40 +88,40 @@ RUNTIME_POLICIES: dict[str, RuntimePolicy] = {
     ),
     "windows-amd": RuntimePolicy(
         wheel_sha256=(
-            "a42b43e96d4087ea1df7c1effd141bc5368cfd95e121a655562af3d4027ae311"
+            "dfc3aa2446fb767848b900afa658c4738caf3ad8f4938888b68c882b30b14b2e"
         ),
         executables={
             "ffmpeg.exe": (
-                "0145ec696983e59cb6ca0c2eed722d97b8cc5cedf0e71af5890e072bca4bdab1"
+                "ae9d066bf197978c2ba453e23c514d75f0f8071ed03ee0ddb6b9d901ed7a0b4b"
             ),
             "ffprobe.exe": (
-                "e348f4d90510101da03267dd4d271b56e5b3b06cd50044952073bd4b05b570b4"
+                "b6f97bb5b1a249265b630f4edb7ce720f651c2bf65e4cb99ebe3efaff1c1c5fd"
             ),
             "dav1d.dll": (
-                "979293ada0eb0da21e92fec66882ba9a62b36637338c76ac2236319ac2d586ca"
+                "1e687e8033e4eb9bae789894f7c1552d10a15f8bdb996e222da079c8eaabff7e"
             ),
         },
         libraries={
             "avcodec-62.dll": (
-                "0e11fea2cea5d20dc68ba483188ed468b86aa4844420c519cc69144205810646"
+                "e38869ff2bc394bc6cef9dbbc7a1c0b393b53e50f7e128cdd8f2fcdfe4c4cfa1"
             ),
             "avdevice-62.dll": (
-                "285b3ee8ef3f9830a79ffca50bf7dc51b5209f5b133dd4c2cced554b390f056d"
+                "52a171413bedef6ca1bbb50741b1366551af4adb4128c9c58b36e6c3cae1060e"
             ),
             "avfilter-11.dll": (
-                "e0f878e600f5f82320b6f2a745d8615314b61a015539b976383fe98cd58dbb56"
+                "b3e75a899c893c7802ae7f88f5a60209698a3ed3dd34198767adedaeffc0d76a"
             ),
             "avformat-62.dll": (
-                "134a43d2aeafbd61a7773f32ea4252f68fa9746800ad29344790da2685f8433b"
+                "0cd134f7e6a4db306a95e8e440448d5f0ad8d5c938b6b2e62940cc11805c7ad8"
             ),
             "avutil-60.dll": (
-                "2e1bc7fefacf921539398a7bb8ff7ef7a5367da7dc5b6de6a2bfe3b1055d57de"
+                "c25bb031e5c510b1e9b2aa75064796b7eee507dc0976f96cd158953b231e9d0e"
             ),
             "swresample-6.dll": (
-                "9d73ac10de44f6eb2b2ca55595f9b1ebe51554b738bb54c18f6c0e8b79049ff1"
+                "6cf3e8ae6135b9f48748c1974568bc22b919c31ab82131184bc7bd5d9125706e"
             ),
             "swscale-9.dll": (
-                "691a813e451d4177e55bb8ebb140f25b001e2a225673a3f54e6bbbf9879dbb9a"
+                "0a8fc09244802c61473198a8eee190ae0d65b1177d2caf6c1de6923a57edea85"
             ),
         },
         library_directory="bin",
@@ -313,6 +314,45 @@ def build_runtime_environment(
     return environment
 
 
+def activate_runtime_dll_directories(
+    runtime_root: str | Path,
+    *,
+    platform: str | None = None,
+) -> tuple[Path, ...]:
+    """Register the validated native DLL root for a Windows child process.
+
+    Python 3.8 and newer no longer use ``PATH`` alone when resolving extension
+    module dependencies on Windows. Keep the ``os.add_dll_directory`` handle
+    alive so every PyAV extension continues to resolve the selected FFmpeg DLLs.
+    """
+
+    key = runtime_platform_key(platform)
+    if key != "windows-amd":
+        return ()
+
+    root = Path(runtime_root).expanduser().resolve()
+    directory = (root / RUNTIME_POLICIES[key].library_directory).resolve()
+    handle_key = os.path.normcase(str(directory))
+    if handle_key in _RUNTIME_DLL_DIRECTORY_HANDLES:
+        return (directory,)
+
+    add_dll_directory = getattr(os, "add_dll_directory", None)
+    if not callable(add_dll_directory):
+        raise RuntimeContractError(
+            "os.add_dll_directory is unavailable for the Windows unified runtime"
+        )
+
+    try:
+        handle = add_dll_directory(str(directory))
+    except OSError as exc:
+        raise RuntimeContractError(
+            f"cannot register unified runtime DLL directory {directory}: {exc}"
+        ) from exc
+
+    _RUNTIME_DLL_DIRECTORY_HANDLES[handle_key] = handle
+    return (directory,)
+
+
 def validate_loaded_runtime(
     runtime_root: str | Path,
     repo_root: str | Path,
@@ -325,6 +365,7 @@ def validate_loaded_runtime(
     repo = Path(repo_root).expanduser().resolve()
     key = runtime_platform_key(platform)
     validate_runtime_layout(root, platform=platform)
+    activate_runtime_dll_directories(root, platform=platform)
 
     import av
     import jasna
