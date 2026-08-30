@@ -453,6 +453,50 @@ def test_amf_decoder_survives_pyav18_time_base_regression(monkeypatch) -> None:
     assert reader._amd_hardware_decode is True
 
 
+def test_amf_decoder_ignores_missing_optional_timing_metadata(monkeypatch) -> None:
+    import jasna.media.video_decoder as module
+
+    class FakeDecoder:
+        def __init__(self):
+            object.__setattr__(self, "opened", False)
+
+        def __setattr__(self, name, value):
+            if name in {"framerate", "sample_aspect_ratio"}:
+                raise AssertionError(f"optional metadata was assigned: {name}={value!r}")
+            object.__setattr__(self, name, value)
+
+        def open(self, strict=False):
+            assert strict is False
+            object.__setattr__(self, "opened", True)
+
+    decoder = FakeDecoder()
+    monkeypatch.setattr(
+        module.av,
+        "CodecContext",
+        SimpleNamespace(create=MagicMock(return_value=decoder)),
+    )
+    reader = module.NvidiaVideoReader(
+        "input.mp4",
+        4,
+        torch.device("cuda:0"),
+        _metadata(),
+    )
+    source = SimpleNamespace(
+        name="h264",
+        extradata=b"header",
+        width=16,
+        height=16,
+        time_base=Fraction(1, 30),
+        framerate=None,
+        sample_aspect_ratio=None,
+        thread_type=None,
+    )
+    reader._setup_amf_decoder(source)
+    assert decoder.opened is True
+    assert reader._decoder_ctx is decoder
+    assert reader._amd_hardware_decode is True
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def test_yuv_eager_converter_runs_on_gpu_planes(monkeypatch) -> None:
     import jasna.media.yuv_to_rgb as module
