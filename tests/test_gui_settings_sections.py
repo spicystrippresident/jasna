@@ -12,7 +12,7 @@ from jasna import os_utils
 from jasna.accelerator import AcceleratorVendor
 from jasna.gui.models import AppSettings
 from jasna.gui.settings_sections.advanced import AdvancedSection
-from jasna.gui.settings_sections.basic import BasicSection
+from jasna.gui.settings_sections.basic import BasicSection, PRE_SCAN_COARSE_INTERVALS
 from jasna.gui.settings_sections.encoding import EncodingSection
 from jasna.gui.settings_sections.image_restoration import ImageRestorationSection
 from jasna.gui.settings_sections.post_export import PostExportSection
@@ -67,6 +67,37 @@ def _fake_section_widgets() -> dict:
         "fp16_mode": _FakeWidget(1),
         "detection_model": _FakeWidget("rfdetr-v6"),
         "detection_score_threshold": _FakeWidget(0.35),
+        "pre_scan_policy": _FakeValueMenu(
+            {"auto": "Automatic", "scan": "Always scan", "off": "No scan"},
+            "auto",
+        ),
+        "pre_scan_full_threshold": _FakeWidget(0.85),
+        "pre_scan_coarse_interval": _FakeValueMenu(
+            {
+                "0.5": "0.5 s",
+                "1.0": "1.0 s",
+                "2.0": "2.0 s",
+                "3.0": "3.0 s",
+                "4.0": "4.0 s",
+                "5.0": "5.0 s",
+            },
+            "4.0",
+        ),
+        "pre_scan_fine_interval": _FakeValueMenu(
+            {"0.25": "0.25 s", "0.5": "0.5 s", "1.0": "1.0 s"},
+            "0.5",
+        ),
+        "pre_scan_pad_seconds": _FakeValueMenu(
+            {
+                "auto": "Auto",
+                "0.0": "None",
+                "0.5": "0.5 s",
+                "1.0": "1.0 s",
+                "2.0": "2.0 s",
+                "5.0": "5.0 s",
+            },
+            "auto",
+        ),
         "compile_basicvsrpp": _FakeWidget(1),
         "file_conflict": _FakeValueMenu({"auto_rename": "A", "overwrite": "B", "skip": "C"}, "skip"),
         "temporal_overlap": _FakeWidget(8),
@@ -126,6 +157,11 @@ def test_sections_collect_internal_values_without_translation_lookups() -> None:
     values = _collect_all(_fake_section_widgets())
 
     assert values["file_conflict"] == "skip"
+    assert values["pre_scan_policy"] == "auto"
+    assert values["pre_scan_full_threshold"] == pytest.approx(0.85)
+    assert values["pre_scan_coarse_interval"] == pytest.approx(4.0)
+    assert values["pre_scan_fine_interval"] == pytest.approx(0.5)
+    assert values["pre_scan_pad_seconds"] == "auto"
     assert values["vr_mode"] == "off"
     assert values["denoise_strength"] == "high"
     assert values["denoise_step"] == "after_secondary"
@@ -144,6 +180,12 @@ def test_sections_collect_internal_values_without_translation_lookups() -> None:
     assert values["retarget_high_fps"] is True
     assert values["fmp4"] is True
     assert values["sharpen_strength"] == 0.35
+
+
+def test_auto_coarse_scan_defaults_to_four_seconds() -> None:
+    assert AppSettings().pre_scan_coarse_interval == pytest.approx(4.0)
+    assert AppSettings().pre_scan_pad_seconds == "auto"
+    assert 4.0 in PRE_SCAN_COARSE_INTERVALS
 
 
 def test_sections_collect_covers_all_widget_backed_appsettings_fields() -> None:
