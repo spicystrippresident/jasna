@@ -230,7 +230,12 @@ def test_external_runtime_symlink_is_rejected(
     executable.unlink()
     external = tmp_path / "external-ffmpeg"
     external.write_bytes(b"accepted-ffmpeg")
-    executable.symlink_to(external)
+    try:
+        executable.symlink_to(external)
+    except OSError as exc:
+        if sys.platform == "win32" and exc.winerror == 1314:
+            pytest.skip("Windows file-symlink privilege is unavailable")
+        raise
 
     with pytest.raises(runtime_contract.RuntimeContractError, match="symlink escapes"):
         installer.install_runtime(args)
