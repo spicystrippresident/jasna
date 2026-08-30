@@ -507,6 +507,7 @@ class _AmfInteropTransportAudit:
         "d2h_copy_calls",
         "av_hwframe_transfer_data_calls",
         "failed_bridge_copies",
+        "vulkan_export_fd_close_failures",
     )
     _DEFERRED_SESSION_COUNTERS = (
         "vulkan_memory_exports",
@@ -575,6 +576,9 @@ class _AmfInteropTransportAudit:
             "copy_to_hip_successes": 0,
             "copy_to_hip_failures": 0,
             "vulkan_memory_exports": 0,
+            "vulkan_export_fd_close_calls": 0,
+            "vulkan_export_fd_close_failures": 0,
+            "last_vulkan_export_fd_close_errno": 0,
             "hip_external_memory_imports": 0,
             "hip_mapped_buffer_acquires": 0,
             "hip_mapped_buffer_releases": 0,
@@ -690,10 +694,20 @@ class _AmfInteropTransportAudit:
         self._reject_forbidden_transport(result, source="copy result")
         process_stats = self._get_transport_stats()
         self._reject_forbidden_transport(process_stats, source="bridge counters")
+        fd_close_calls = self._integer(result, "vulkan_export_fd_close_calls")
+        fd_close_result = self._integer(result, "vulkan_export_fd_close_result")
+        fd_close_errno = self._integer(result, "vulkan_export_fd_close_errno")
+        self._stats["vulkan_export_fd_close_calls"] += fd_close_calls
+        if fd_close_result != 0:
+            self._stats["vulkan_export_fd_close_failures"] += 1
+            self._stats["last_vulkan_export_fd_close_errno"] = fd_close_errno
         common = (
             self._integer(result, "hip_result") == 0
             and self._integer(result, "d2d_plane_copies", default=2) == 2
             and result.get("fixed_context_bound") is True
+            and fd_close_calls == 1
+            and fd_close_result == 0
+            and fd_close_errno == 0
         )
         if self._decode_copy_stream == "null":
             synchronization = (
@@ -1012,10 +1026,10 @@ class _AmfInteropTransportAudit:
                 and int(stats.get("cache_fd_stat_calls", -1)) == calls
                 and int(stats.get("cache_fd_stat_failures", -1)) == 0
                 and int(stats.get("cache_fd_close_calls", -1))
-                == int(stats["resource_cache_hits"])
+                == calls
                 and int(stats.get("cache_fd_close_failures", -1)) == 0
                 and int(stats.get("cache_last_fd_close_errno", -1)) == 0
-                and int(stats.get("cache_fd_ownership_transfers", -1)) == misses
+                and int(stats.get("cache_fd_ownership_transfers", -1)) == 0
                 and stats["resource_cache_session_create_calls"] == 1
                 and stats["resource_cache_session_close_calls"] == 1
                 and stats["resource_cache_session_close_failures"] == 0
@@ -1024,6 +1038,7 @@ class _AmfInteropTransportAudit:
             resource_counts = {
                 calls,
                 int(stats["vulkan_memory_exports"]),
+                int(stats["vulkan_export_fd_close_calls"]),
                 int(stats["hip_external_memory_imports"]),
                 int(stats["hip_mapped_buffer_acquires"]),
                 int(stats["hip_mapped_buffer_releases"]),
@@ -1039,6 +1054,8 @@ class _AmfInteropTransportAudit:
         common = (
             stats["copy_to_hip_successes"] == calls
             and stats["copy_to_hip_failures"] == 0
+            and stats["vulkan_export_fd_close_failures"] == 0
+            and stats["last_vulkan_export_fd_close_errno"] == 0
             and stats["hip_d2d_plane_copies"] == calls * 2
             and resource_valid
             and stats["fixed_context_session_create_calls"] == 1
