@@ -882,7 +882,13 @@ class JobListItem(ctk.CTkFrame):
             except Exception:
                 logger.debug("Failed to set progress value %r", value, exc_info=True)
 
-    def set_fps_eta(self, fps: float = 0.0, eta_seconds: float = 0.0):
+    def set_fps_eta(
+        self,
+        fps: float = 0.0,
+        eta_seconds: float = 0.0,
+        *,
+        stage_eta: bool = False,
+    ):
         """Update small FPS and ETA labels shown on the tile."""
         if fps and fps > 0:
             self._fps_label.configure(text=f"{fps:.1f}fps")
@@ -898,7 +904,9 @@ class JobListItem(ctk.CTkFrame):
                 eta_str = f"{mins}m {secs}s"
             else:
                 eta_str = f"{secs}s"
-            self._eta_label.configure(text=f"ETA: {eta_str}")
+            self._eta_label.configure(
+                text=t("stage_eta", eta=eta_str) if stage_eta else f"ETA: {eta_str}"
+            )
         else:
             self._eta_label.configure(text="")
 

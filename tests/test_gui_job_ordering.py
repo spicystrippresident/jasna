@@ -22,6 +22,12 @@ def _make_jobs(*names: str) -> list[JobItem]:
     return [JobItem(path=Path(n)) for n in names]
 
 
+def _settings(**kwargs) -> AppSettings:
+    """Settings for fake video paths that cannot be probed by pre-scan."""
+
+    return AppSettings(pre_scan_policy="off", **kwargs)
+
+
 class TestNextPendingJob:
     def test_returns_first_pending(self):
         p = Processor()
@@ -72,7 +78,7 @@ class TestProcessorPullLoop:
         with patch.object(p, "_run_pipeline", side_effect=fake_pipeline):
             p.start(
                 jobs,
-                AppSettings(),
+                _settings(),
                 output_folder="",
                 output_pattern="{original}_restored.mp4",
                 disable_basicvsrpp_tensorrt=False,
@@ -100,7 +106,7 @@ class TestProcessorPullLoop:
         with patch.object(p, "_run_pipeline", side_effect=fake_pipeline):
             p.start(
                 jobs,
-                AppSettings(),
+                _settings(),
                 output_folder="",
                 output_pattern="{original}_restored.mp4",
                 disable_basicvsrpp_tensorrt=False,
@@ -120,7 +126,7 @@ class TestProcessorPullLoop:
         with patch.object(p, "_run_pipeline"):
             p.start(
                 jobs,
-                AppSettings(),
+                _settings(),
                 output_folder="",
                 output_pattern="{original}_restored.mp4",
                 disable_basicvsrpp_tensorrt=False,
@@ -153,7 +159,7 @@ class TestProcessorPullLoop:
         with patch.object(p, "_run_pipeline", side_effect=fake_pipeline):
             p.start(
                 jobs,
-                AppSettings(),
+                _settings(),
                 output_folder="",
                 output_pattern="{original}_restored.mp4",
                 disable_basicvsrpp_tensorrt=False,
@@ -174,7 +180,7 @@ class TestProcessorPullLoop:
         ):
             p.start(
                 jobs,
-                AppSettings(post_export_action="command", post_export_command="echo done"),
+                _settings(post_export_action="command", post_export_command="echo done"),
                 output_folder="",
                 output_pattern="{original}_restored.mp4",
                 disable_basicvsrpp_tensorrt=False,
@@ -186,7 +192,7 @@ class TestProcessorPullLoop:
     def test_skips_post_export_action_when_stopped(self):
         calls: list[tuple[str, str]] = []
         p = Processor()
-        p._settings = AppSettings(post_export_action="shutdown")
+        p._settings = _settings(post_export_action="shutdown")
         p._stop_event.set()
 
         with patch("jasna.post_export_action.run_post_export_action", lambda action, command: calls.append((action, command))):
@@ -211,7 +217,7 @@ class TestProcessorPullLoop:
         ):
             p.start(
                 jobs,
-                AppSettings(post_export_video_command="remux {output}"),
+                _settings(post_export_video_command="remux {output}"),
                 output_folder=str(tmp_path),
                 output_pattern="{original}_restored.mp4",
                 disable_basicvsrpp_tensorrt=False,
@@ -250,7 +256,7 @@ class TestProcessorPullLoop:
         ):
             p.start(
                 jobs,
-                AppSettings(post_export_video_command="remux {output}"),
+                _settings(post_export_video_command="remux {output}"),
                 output_folder=str(tmp_path),
                 output_pattern="{original}_restored.mp4",
                 disable_basicvsrpp_tensorrt=False,
@@ -271,7 +277,7 @@ class TestProcessorPullLoop:
         ):
             p.start(
                 jobs,
-                AppSettings(post_export_video_command="remux {output}"),
+                _settings(post_export_video_command="remux {output}"),
                 output_folder=str(tmp_path),
                 output_pattern="{original}_restored.mp4",
                 disable_basicvsrpp_tensorrt=False,
@@ -293,7 +299,7 @@ class TestProcessorPullLoop:
         ):
             p.start(
                 jobs,
-                AppSettings(
+                _settings(
                     post_export_video_command="remux {output}",
                     file_conflict="auto_rename",
                 ),
@@ -324,7 +330,7 @@ class TestProcessorPullLoop:
         ):
             p.start(
                 jobs,
-                AppSettings(
+                _settings(
                     post_export_video_command="remux {output}",
                     post_export_action="command",
                     post_export_command="notify",

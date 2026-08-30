@@ -15,6 +15,7 @@ from jasna.gui import queue_panel as queue_panel_module
 from jasna.gui.queue_panel import QueuePanel
 from jasna.segments import SegmentRange
 from jasna.gui.theme import Colors, Sizing
+from jasna.gui.locales import t
 
 
 def test_reset_jobs_for_run_prepares_every_status_and_preserves_job_options(
@@ -146,6 +147,36 @@ def test_segment_button_only_appears_for_pending_video_jobs() -> None:
         panel.update_job_status(job.id, JobStatus.PENDING)
         root.update()
         assert widget._segments_btn.winfo_ismapped()
+    finally:
+        root.destroy()
+
+
+def test_processing_row_shows_phase_and_labels_eta_as_stage_eta() -> None:
+    try:
+        root = ctk.CTk()
+    except TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+
+    try:
+        panel = QueuePanel(root)
+        panel.pack(fill="both", expand=True)
+        panel.add_job(Path("/tmp/video.mp4"))
+        job = panel._jobs[0]
+        widget = panel._job_widgets[0]
+
+        panel.update_job_status(
+            job.id,
+            JobStatus.PROCESSING,
+            progress=0.5,
+            fps=19.5,
+            eta_seconds=38.0,
+            phase="fine_scan",
+        )
+        root.update()
+
+        assert widget._status_label.cget("text") == t("job_phase_fine_scan")
+        assert widget._fps_label.cget("text") == "19.5fps"
+        assert widget._eta_label.cget("text") == t("stage_eta", eta="38s")
     finally:
         root.destroy()
 

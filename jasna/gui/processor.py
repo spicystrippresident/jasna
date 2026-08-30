@@ -1,6 +1,8 @@
 """Background processor for video processing jobs."""
 
 import logging
+import os
+import subprocess
 import threading
 import traceback
 import queue
@@ -10,7 +12,7 @@ from dataclasses import dataclass, replace
 from typing import Callable
 from uuid import uuid4
 
-from jasna.gui.models import JobItem, JobStatus, AppSettings
+from jasna.gui.models import AppSettings, JobItem, JobStatus, SegmentSelectionMode
 from jasna.gui.video_session import build_video_session, release_session_memory, video_session_config
 from jasna.media import UnsupportedColorspaceError
 from jasna.session_config import SessionConfig
@@ -31,6 +33,7 @@ class ProgressUpdate:
     frames_processed: int = 0
     total_frames: int = 0
     message: str = ""
+    phase: str = ""
 
 
 class ProcessingStopped(Exception):
@@ -82,6 +85,9 @@ class Processor:
         self._img_session: tuple | None = None      # (detector, restorer, device)
         self._video_session: RestorationSession | None = None
         self._current_pipeline = None
+        self._pre_scan_coordinator = None
+        self._current_aux_process: subprocess.Popen | None = None
+        self._completed_processing_paths: dict[int, str] = {}
         
     def start(
         self,
@@ -100,6 +106,7 @@ class Processor:
         self._output_folder = output_folder
         self._output_pattern = output_pattern
         self._disable_basicvsrpp_tensorrt_for_run = bool(disable_basicvsrpp_tensorrt)
+        self._completed_processing_paths.clear()
         
         with self._completion_lock:
             self._stop_event.clear()
@@ -127,6 +134,18 @@ class Processor:
         pipeline = self._current_pipeline
         if pipeline is not None:
             pipeline.cancel()
+        coordinator = self._pre_scan_coordinator
+        if coordinator is not None:
+            coordinator.stop()
+        auxiliary = self._current_aux_process
+        if auxiliary is not None and auxiliary.poll() is None:
+            try:
+                auxiliary.terminate()
+            except OSError:
+                logger.debug("Could not terminate auxiliary media process", exc_info=True)
+
+    def completed_processing_path(self, job_id: int) -> str | None:
+        return self._completed_processing_paths.get(int(job_id))
 
     def join(self, timeout: float = 5.0):
         if self._thread and self._thread.is_alive():
@@ -162,7 +181,7 @@ class Processor:
         input_path: Path,
         output_path: Path,
         *,
-        codec: str,
+        codec: str | None,
         smart_render: bool,
         previous_fingerprint: _OutputFingerprint | None,
     ) -> None:
@@ -215,12 +234,19 @@ class Processor:
                 f"completed output was not created or changed by this job: {output_path}"
             )
 
-    def _commit_completed_job(self, job: JobItem, output_path: Path) -> None:
+    def _commit_completed_job(
+        self,
+        job: JobItem,
+        output_path: Path,
+        *,
+        processing_path: str,
+    ) -> None:
         """Commit terminal job fields atomically with respect to ``stop()``."""
 
         with self._completion_lock:
             if self._stop_event.is_set():
                 raise ProcessingStopped("Processing stopped")
+            self._completed_processing_paths[job.id] = processing_path
             job.output_path = output_path
             job.status = JobStatus.COMPLETED
 
@@ -320,6 +346,7 @@ class Processor:
             job_id=job.id,
             status=JobStatus.PROCESSING,
             message=f"Starting {job.filename}",
+            phase="preparing",
         ))
         
         input_path = job.path
@@ -372,33 +399,135 @@ class Processor:
             previous_output_fingerprint = (
                 self._output_fingerprint(output_path) if not is_image else None
             )
+            processing_path = "smart" if segments else "full"
+            automatic_segments = False
             if is_image:
                 self._close_video_session()
             else:
                 self._close_image_session()
-            pipeline_options = {}
-            if segments:
-                pipeline_options["segments"] = segments
-            if job_settings is not self._settings:
-                pipeline_options["settings"] = job_settings
-            self._run_pipeline(
-                job.id,
-                input_path,
-                output_path,
-                **pipeline_options,
-            )
+                explicit_segments = bool(segments)
+                explicit_full = (
+                    snapshot.segment_selection_mode is SegmentSelectionMode.FULL
+                )
+                should_pre_scan = (
+                    not explicit_segments
+                    and not explicit_full
+                    and str(job_settings.pre_scan_policy).strip().lower() != "off"
+                )
+                if should_pre_scan:
+                    from jasna.gui.pre_scan_routing import (
+                        PreScanCoordinator,
+                        PreScanFailed,
+                        PreScanStopped,
+                    )
+                    from jasna.media import get_video_meta_data
+
+                    self._close_video_session()
+                    coordinator = None
+                    try:
+                        coordinator = PreScanCoordinator(
+                            input_path,
+                            output_path,
+                            get_video_meta_data(str(input_path)),
+                            job_settings,
+                            stopped=self._stop_event.is_set,
+                            log=self._log,
+                            progress=lambda stage, fraction, fps, eta: self._progress(
+                                ProgressUpdate(
+                                    job_id=job.id,
+                                    status=JobStatus.PROCESSING,
+                                    progress=min(15.0, max(0.0, fraction * 15.0)),
+                                    fps=fps,
+                                    eta_seconds=eta,
+                                    message="Scanning for mosaic ranges",
+                                    phase=f"{stage}_scan",
+                                )
+                            ),
+                        )
+                        self._pre_scan_coordinator = coordinator
+                        outcome = coordinator.run()
+                    except PreScanStopped as exc:
+                        raise ProcessingStopped("Processing stopped") from exc
+                    except PreScanFailed as exc:
+                        if str(job_settings.pre_scan_policy).strip().lower() != "auto":
+                            raise
+                        self._log(
+                            "WARNING",
+                            f"Automatic scan failed; falling back to full processing: {exc}",
+                        )
+                        outcome = None
+                    finally:
+                        self._pre_scan_coordinator = None
+                        if coordinator is not None:
+                            coordinator.close()
+                    if outcome is not None:
+                        processing_path = outcome.processing_path
+                        segments = outcome.segments
+                        automatic_segments = processing_path == "smart"
+
+            if processing_path == "copy":
+                self._progress(ProgressUpdate(
+                    job_id=job.id,
+                    status=JobStatus.PROCESSING,
+                    progress=15.0,
+                    phase="source_copy",
+                ))
+                try:
+                    self._copy_source_video(input_path, output_path)
+                except ProcessingStopped:
+                    raise
+                except Exception as exc:
+                    if str(job_settings.pre_scan_policy).strip().lower() != "auto":
+                        raise
+                    self._log(
+                        "WARNING",
+                        f"Source copy failed; falling back to full processing: {exc}",
+                    )
+                    processing_path = "full"
+                    segments = ()
+            if processing_path != "copy":
+                self._progress(ProgressUpdate(
+                    job_id=job.id,
+                    status=JobStatus.PROCESSING,
+                    phase="restoring",
+                ))
+                pipeline_options = {}
+                if automatic_segments:
+                    pipeline_options["automatic_segments"] = True
+                if segments:
+                    pipeline_options["segments"] = segments
+                if job_settings is not self._settings:
+                    pipeline_options["settings"] = job_settings
+                actual_path = self._run_pipeline(
+                    job.id,
+                    input_path,
+                    output_path,
+                    **pipeline_options,
+                )
+                if actual_path in {"full", "smart"}:
+                    processing_path = actual_path
+            self._progress(ProgressUpdate(
+                job_id=job.id,
+                status=JobStatus.PROCESSING,
+                progress=99.9,
+                phase="finalizing",
+            ))
             if not is_image:
                 self._validate_completed_video_output(
                     input_path,
                     output_path,
-                    codec=job_settings.codec,
-                    smart_render=bool(segments),
+                    codec=(None if processing_path == "copy" else job_settings.codec),
+                    smart_render=(processing_path == "smart"),
                     previous_fingerprint=previous_output_fingerprint,
                 )
 
             if not is_image:
                 self._run_post_export_video_command(input_path, output_path)
-            self._commit_completed_job(job, output_path)
+            self._commit_completed_job(
+                job,
+                output_path,
+                processing_path=processing_path,
+            )
             self._progress(ProgressUpdate(
                 job_id=job.id,
                 status=JobStatus.COMPLETED,
@@ -469,6 +598,73 @@ class Processor:
         ))
         self._log("INFO", f"Stopped processing {job.filename}")
 
+    def _copy_source_video(self, input_path: Path, output_path: Path) -> None:
+        """Atomically remux an all-clear scan result without decoding frames."""
+
+        from jasna.os_utils import resolve_executable, subprocess_no_window_kwargs
+
+        temporary = output_path.with_name(
+            f".{output_path.stem}.source-copy-{os.getpid()}{output_path.suffix}"
+        )
+        temporary.unlink(missing_ok=True)
+        args = [
+            resolve_executable("ffmpeg"),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(input_path),
+            "-map",
+            "0",
+            "-map_metadata",
+            "0",
+            "-map_chapters",
+            "0",
+            "-c",
+            "copy",
+        ]
+        if output_path.suffix.lower() in {".mp4", ".mov"}:
+            args += ["-movflags", "+faststart"]
+        args += [str(temporary), "-y"]
+        self._log("INFO", "No mosaic ranges detected; copying the source video")
+        process = subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **subprocess_no_window_kwargs(),
+        )
+        self._current_aux_process = process
+        try:
+            while process.poll() is None:
+                if self._stop_event.wait(0.1):
+                    try:
+                        process.terminate()
+                    except OSError:
+                        pass
+                    try:
+                        process.wait(timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                    raise ProcessingStopped("Processing stopped")
+            detail = process.stderr.read().strip() if process.stderr is not None else ""
+            if process.returncode != 0:
+                raise RuntimeError(
+                    f"source copy failed with code {process.returncode}: "
+                    f"{detail or 'unknown ffmpeg error'}"
+                )
+            if not temporary.is_file() or temporary.stat().st_size <= 0:
+                raise RuntimeError("source copy did not produce a non-empty output")
+            os.replace(temporary, output_path)
+        finally:
+            self._current_aux_process = None
+            if process.stderr is not None:
+                process.stderr.close()
+            temporary.unlink(missing_ok=True)
+
     def _run_pipeline(
         self,
         job_id: int,
@@ -477,19 +673,21 @@ class Processor:
         *,
         segments=(),
         settings: AppSettings | None = None,
+        automatic_segments: bool = False,
     ):
         """Run one job; raises ProcessingStopped when the user stopped it."""
         from jasna.media.image_io import IMAGE_EXTENSIONS
 
         if input_path.suffix.lower() in IMAGE_EXTENSIONS:
             self._run_image_job(job_id, input_path, output_path)
-            return
-        self._run_video_job(
+            return "full"
+        return self._run_video_job(
             job_id,
             input_path,
             output_path,
             segments=segments,
             settings=settings or self._settings,
+            automatic_segments=automatic_segments,
         )
 
 
@@ -551,6 +749,7 @@ class Processor:
         *,
         segments=(),
         settings: AppSettings | None = None,
+        automatic_segments: bool = False,
     ):
         settings = settings or self._settings
         if self._stop_event.is_set():
@@ -559,24 +758,41 @@ class Processor:
         splice_plan = None
         if segments:
             from jasna.media import get_video_meta_data
-            from jasna.media.splice import build_splice_plan, probe_keyframes, validate_smart_render
+            from jasna.media.splice import (
+                SmartRenderCompatibilityError,
+                build_splice_plan,
+                probe_keyframes,
+                validate_smart_render,
+            )
             metadata = get_video_meta_data(str(input_path))
             codec = {
                 "avc": "h264",
                 "h265": "hevc",
                 "av01": "av1",
             }.get(metadata.codec_name.lower(), metadata.codec_name.lower())
-            validate_smart_render(
-                metadata,
-                output_path=output_path,
-                codec=codec,
-                retarget_high_fps=settings.retarget_high_fps,
-            )
-            splice_plan = build_splice_plan(
-                tuple(segments),
-                probe_keyframes(input_path, metadata),
-                duration=metadata.duration,
-            )
+            try:
+                validate_smart_render(
+                    metadata,
+                    output_path=output_path,
+                    codec=codec,
+                    retarget_high_fps=settings.retarget_high_fps,
+                )
+                splice_plan = build_splice_plan(
+                    tuple(segments),
+                    probe_keyframes(input_path, metadata),
+                    duration=metadata.duration,
+                )
+            except SmartRenderCompatibilityError as exc:
+                if not automatic_segments:
+                    raise
+                self._log(
+                    "WARNING",
+                    f"Automatic scan ranges are not Smart Render compatible; "
+                    f"falling back to full processing: {exc}",
+                )
+                segments = ()
+                splice_plan = None
+                codec = settings.codec
         encoder_settings = self._build_encoder_settings(codec)
         config = video_session_config(settings, codec=codec, encoder_settings=encoder_settings)
         self._ensure_video_session(settings)
@@ -604,6 +820,7 @@ class Processor:
                 eta_seconds=eta_seconds,
                 frames_processed=frames_done,
                 total_frames=total,
+                phase="restoring",
             ))
 
         pipeline = None
@@ -741,7 +958,13 @@ class Processor:
         self._pause_event.wait()
         if self._stop_event.is_set():
             raise ProcessingStopped("Processing stopped")
-        self._progress(ProgressUpdate(job_id=job_id, status=JobStatus.PROCESSING, progress=20.0, message="Detecting mosaics"))
+        self._progress(ProgressUpdate(
+            job_id=job_id,
+            status=JobStatus.PROCESSING,
+            progress=20.0,
+            message="Detecting mosaics",
+            phase="restoring",
+        ))
 
         num_variants = max(1, int(settings.image_restore_variants))
         freeu = dict(DEFAULT_FREEU) if bool(settings.image_restore_freeu) else None
@@ -758,7 +981,12 @@ class Processor:
         for path, out in zip(variant_output_paths(output_path, num_variants), outputs):
             image_io.write_image_rgb_chw(path, out)
             self._log("INFO", f"Wrote {path.name}")
-        self._progress(ProgressUpdate(job_id=job_id, status=JobStatus.PROCESSING, progress=100.0))
+        self._progress(ProgressUpdate(
+            job_id=job_id,
+            status=JobStatus.PROCESSING,
+            progress=100.0,
+            phase="finalizing",
+        ))
 
     def _close_image_session(self):
         if self._img_session is None:
