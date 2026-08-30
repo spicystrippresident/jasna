@@ -3,7 +3,7 @@
 ## 目的与边界
 
 本候选只重建 Windows AMD 的既有正确性解码策略，不引入 Linux 原生
-AMF/rocDecode 路由、NVIDIA 改动、GUI 改动或新的产品默认值。它保留
+AMF 路由、NVIDIA 改动、GUI 改动或新的产品默认值。它保留
 `JASNA_DECODE_BACKEND=auto` 的既有选择顺序，只在 Windows、AMD 和下表指定的
 输入交集上作出明确选择。
 
@@ -19,8 +19,8 @@ AMF/rocDecode 路由、NVIDIA 改动、GUI 改动或新的产品默认值。它�
 返回 CPU tensor 的降级路线。
 
 H.264 10-bit、其他 codec/profile，以及非 Windows AMD 平台不匹配这项策略，继续走
-当前分支原有的路径。Linux AMD AV1 的 rocDecode 兼容 fallback 仍限定为 Linux；本候选
-不会把它扩展到 Windows。
+当前分支原有的路径。本候选当时没有把 Linux-only 兼容后端扩展到 Windows；后续独立
+PR 已彻底删除该后端，Windows 路由本身不变。
 
 ## Windows ROCm 的 MMEngine 导入边界
 
@@ -43,7 +43,7 @@ Linux ROCm、Windows/Linux CUDA，以及真正具备 distributed 的 Torch 环�
 - 显式 `pyav-sw` 仍会强制软件解码；其中 Windows AMD HEVC Main10 同样使用单线程
   slice 限制，避免绕过已知的线程稳定性约束。
 - 受控软件路线无法打开或读取时，错误直接作为 `VideoDecodeError` 交给调用者。Windows
-  不会借此尝试 Linux-only rocDecode fallback，也不会悄悄继续为 CPU-only 输出。
+  不会尝试已删除的 Linux-only 兼容后端，也不会悄悄继续为 CPU-only 输出。
 - H.264/HEVC 8-bit 的既有 AMF 打开失败会沿既有逻辑记录硬件失败 warning，并进入已有的
   软件解码加 GPU 上传路径；本候选没有把这种失败吞掉或替换为未记录的 fallback。
 
@@ -59,13 +59,13 @@ cherry-pick 整个提交：
 当前实现入口在 `jasna/media/video_decoder.py` 的
 `_requires_windows_amd_software_decode()` 和
 `_requires_single_slice_pyav_threads()`。二者均先检查 `sys.platform == "win32"`
-及 AMD vendor，因此不会改变 Linux 原生/rocDecode、NVIDIA 或其他平台的选择。
+及 AMD vendor，因此不会改变 Linux 原生、NVIDIA 或其他平台的选择。
 
 ## 当前验证范围与 Windows 验收清单
 
 本 Linux 工作区只能运行 mock/structural 测试：它验证平台/vendor/codec 选择、AMF
-是否被跳过、线程设置、显式 `pyav-hw` 隔离，以及 Windows 软件打开失败时不尝试
-rocDecode。它不能证明 Windows DLL、驱动、AMF host frame、ROCm 上传或真实视频的正确性。
+是否被跳过、线程设置、显式 `pyav-hw` 隔离，以及 Windows 软件打开失败时错误直返。
+它不能证明 Windows DLL、驱动、AMF host frame、ROCm 上传或真实视频的正确性。
 
 本次重建在 Linux 上执行：
 

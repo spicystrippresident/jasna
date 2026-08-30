@@ -3,9 +3,10 @@
 更新时间：2026-08-29
 
 GUI 段落编辑器的整片粗扫和单帧 mask preview 都直接构造共享
-`NvidiaVideoReader`，不传 scan-specific backend，也没有独立 rocDecode 分支。因此在合格
+`NvidiaVideoReader`，不传 scan-specific backend，也没有独立解码分支。因此在合格
 Linux AMD H.264/HEVC 上，它们会随产品 `auto` 使用 AMF Vulkan → HIP
-private-deferred D2D；AV1 仍遵守共享 reader 的临时 compatibility policy。
+private-deferred D2D；AV1 同样遵守共享 reader 的 stable-cache/native gate 与普通 PyAV
+边界。
 
 检测模型同样只通过共享 `build_detection_model` 构造。Linux AMD gfx1100、FP16、
 `rfdetr-v6` 且同目录存在已安装 manifest 时，registry 自动选择 RF-DETR MIGraphX；否则
@@ -14,7 +15,7 @@ VR SBS adapter 或 Pipeline，也不会为迁移路线引入兼容层。
 
 contract test 固定以下边界：
 
-- whole-video scan 和 preview 都不出现 `decode_backend`/rocDecode 特例；
+- whole-video scan 和 preview 都不出现 `decode_backend` 特例；
 - scan 把 B4/B8、FP16、模型名、权重与既有 `SCAN_SCORE_FLOOR` 原样交给共享 registry；
 - MIGraphX manifest 的发现与 fail-closed 仍由已验收的 registry/runner 唯一负责。
 

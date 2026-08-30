@@ -1,9 +1,9 @@
 # Linux AMD 显式 AMF AV1 原生解码
 
-> 当前产品状态（2026-08-29）：用户在确认安全 cache 与 rocDecode 的长稳态差距后，
+> 当前产品状态（2026-08-30）：用户在确认安全 cache 与旧 rocDecode 基准的长稳态差距后，
 > 接受该性能差距。Linux AMD AV1 Main NV12/P010 已由研究入口提升为产品 `auto`
-> 默认路线；下面“不进 auto/cache off”的描述保留为各历史阶段当时的裁决，最终状态以
-> 本文最后一节为准。
+> 默认路线；旧 rocDecode 后端已在后续独立 PR 中删除。下面“不进 auto/cache off”及
+> rocDecode 对照描述保留为各历史阶段的证据，最终状态以本文最后一节为准。
 
 ## 范围
 
@@ -186,11 +186,12 @@ results/output-allocator-lifecycle-amf-raw-120f.json
 
 ## 2026-08-29 用户放宽性能门后的产品接入
 
-用户明确裁决：在没有新的安全优化空间时，可以接受 cache 与 rocDecode 的剩余差距并
+用户明确裁决：在没有新的安全优化空间时，可以接受 cache 与旧 rocDecode 基准的剩余差距并
 启用 cache。产品实现因此只在 Linux AMD、AV1 Main、NV12/P010、B1/B2/B4/B8 的既定
 格式门内，把 `auto` 固定到 AMF Vulkan → HIP 稳定 dma-buf identity cache；H.264/HEVC
 继续原有 `private-deferred`，Windows、NVIDIA、共享检测/Tracker/BasicVSR++ 和默认 B4
-均未改变。rocDecode 暂时保留为显式诊断及 native gate 外的兼容后端，不在本提交删除。
+均未改变。后续独立 PR 已删除 rocDecode；native gate 外输入继续使用普通 PyAV，失败
+直接上报，不扩大本 native gate，也不新增 CPU fallback。
 
 cache 以单个 reader session 为 epoch，用每次导出 FD 的 `(st_dev, st_ino)` 识别真实
 dma-buf backing，不信任会复用的 `VkImage`/`VkDeviceMemory` 数值。cache hit 关闭本次
@@ -216,7 +217,7 @@ Main10 reader 又分别从开头、1 秒和 2 秒执行 `auto` seek/reopen。三
 严格递增，各自 cache session create/close `1/1`；因 overlap 每次实际 copy 16 帧，
 16/16 import/destroy 在 decoder 关闭前配平，forbidden transport 为 0。Cython/C 编译
 通过；AMF interop/YUV 聚焦回归为 `101 passed`，最终 decoder/AMD/rocDecode/runtime、
-installer/build/YUV 较宽回归为 `215 passed, 1 skipped`。另 6 个旧 seek 用例在本机
+installer/build/YUV 较宽回归当时为 `215 passed, 1 skipped`。另 6 个旧 seek 用例在本机
 AMD `auto` 环境仍暴露既有 B24/未加载 unified bridge 假设；只读对照确认提交前代码同样
 失败，本提交不借机修改共享 seek 或批大小策略。
 
