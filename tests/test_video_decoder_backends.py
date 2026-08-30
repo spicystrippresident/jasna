@@ -22,7 +22,7 @@ def _clear_decode_backend_env(monkeypatch) -> None:
     monkeypatch.delenv(module.DECODE_BACKEND_ENV, raising=False)
 
 
-def _metadata() -> VideoMetadata:
+def _metadata(codec_name: str = "h264", is_10bit: bool = False) -> VideoMetadata:
     return VideoMetadata(
         video_file="input.mp4",
         video_height=16,
@@ -30,31 +30,41 @@ def _metadata() -> VideoMetadata:
         video_fps=30.0,
         average_fps=30.0,
         video_fps_exact=Fraction(30, 1),
-        codec_name="h264",
+        codec_name=codec_name,
         duration=1.0,
         time_base=Fraction(1, 30),
         start_pts=0,
         color_range=AvColorRange.MPEG,
         color_space=AvColorspace.ITU709,
         num_frames=30,
-        is_10bit=False,
+        is_10bit=is_10bit,
     )
 
 
-def _reader(monkeypatch, vendor: AcceleratorVendor) -> module.NvidiaVideoReader:
+def _reader(
+    monkeypatch,
+    vendor: AcceleratorVendor,
+    metadata: VideoMetadata | None = None,
+) -> module.NvidiaVideoReader:
     monkeypatch.setattr(module, "vendor_for_device", lambda _device: vendor)
     monkeypatch.setattr(module, "current_stream", lambda _device: None)
-    return module.NvidiaVideoReader("input.mp4", 4, torch.device("cuda:0"), _metadata())
+    return module.NvidiaVideoReader(
+        "input.mp4",
+        4,
+        torch.device("cuda:0"),
+        metadata or _metadata(),
+    )
 
 
-def _fake_container(is_hwaccel: bool) -> MagicMock:
+def _fake_container(is_hwaccel: bool, codec_name: str = "h264") -> MagicMock:
     ctx = SimpleNamespace(
         is_hwaccel=is_hwaccel,
         width=16,
         height=16,
         color_range=0,
+        thread_count=0,
         thread_type=None,
-        name="h264",
+        name=codec_name,
     )
     container = MagicMock()
     container.streams.video = [SimpleNamespace(codec_context=ctx)]
@@ -121,6 +131,120 @@ def test_auto_backend_skips_vali_on_amd(monkeypatch) -> None:
     amf_setup.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    ("codec_name", "is_10bit", "log_marker", "thread_count", "thread_type"),
+    [
+        ("hevc", True, "HEVC Main10/P010", 1, "SLICE"),
+        ("av1", False, "AV1 PyAV AMF", 0, "AUTO"),
+        ("av1", True, "AV1 PyAV AMF", 0, "AUTO"),
+    ],
+)
+def test_auto_windows_amd_problem_formats_use_controlled_software_decode(
+    monkeypatch,
+    caplog,
+    codec_name: str,
+    is_10bit: bool,
+    log_marker: str,
+    thread_count: int,
+    thread_type: str,
+) -> None:
+    monkeypatch.setattr(module, "DECODE_BACKEND", "auto")
+    monkeypatch.setattr(module.sys, "platform", "win32")
+    container = _fake_container(False, codec_name)
+    monkeypatch.setattr(module.av, "open", MagicMock(return_value=container))
+    reader = _reader(
+        monkeypatch,
+        AcceleratorVendor.AMD,
+        _metadata(codec_name, is_10bit),
+    )
+    amf_setup = MagicMock()
+    monkeypatch.setattr(reader, "_setup_amf_decoder", amf_setup)
+
+    with caplog.at_level("WARNING"):
+        reader.__enter__()
+
+    amf_setup.assert_not_called()
+    assert reader._software_only is True
+    assert module.av.open.call_args.kwargs == {}
+    context = container.streams.video[0].codec_context
+    assert context.thread_count == thread_count
+    assert context.thread_type == thread_type
+    assert log_marker in caplog.text
+    assert "ROCm" in caplog.text
+
+
+@pytest.mark.parametrize("codec_name", ("h264", "hevc"))
+def test_auto_windows_amd_8bit_formats_keep_amf_host_route(
+    monkeypatch,
+    codec_name: str,
+) -> None:
+    monkeypatch.setattr(module, "DECODE_BACKEND", "auto")
+    monkeypatch.setattr(module.sys, "platform", "win32")
+    container = _fake_container(False, codec_name)
+    monkeypatch.setattr(module.av, "open", MagicMock(return_value=container))
+    reader = _reader(
+        monkeypatch,
+        AcceleratorVendor.AMD,
+        _metadata(codec_name, is_10bit=False),
+    )
+    amf_setup = MagicMock()
+    monkeypatch.setattr(reader, "_setup_amf_decoder", amf_setup)
+
+    reader.__enter__()
+
+    amf_setup.assert_called_once_with(container.streams.video[0].codec_context)
+    assert reader._software_only is False
+
+
+@pytest.mark.parametrize(
+    ("platform", "vendor", "codec_name", "is_10bit"),
+    [
+        ("linux", AcceleratorVendor.AMD, "hevc", True),
+        ("darwin", AcceleratorVendor.AMD, "av1", True),
+        ("win32", AcceleratorVendor.NVIDIA, "hevc", True),
+    ],
+)
+def test_windows_amd_software_policy_does_not_match_other_routes(
+    monkeypatch,
+    platform: str,
+    vendor: AcceleratorVendor,
+    codec_name: str,
+    is_10bit: bool,
+) -> None:
+    monkeypatch.setattr(module.sys, "platform", platform)
+    assert not module._requires_windows_amd_software_decode(
+        _metadata(codec_name, is_10bit),
+        vendor,
+    )
+
+
+@pytest.mark.parametrize(
+    ("codec_name", "is_10bit"),
+    (("hevc", True), ("av1", False), ("av1", True)),
+)
+def test_explicit_pyav_hw_bypasses_windows_amd_software_policy(
+    monkeypatch,
+    codec_name: str,
+    is_10bit: bool,
+) -> None:
+    monkeypatch.setattr(module, "DECODE_BACKEND", "pyav-hw")
+    monkeypatch.setattr(module.sys, "platform", "win32")
+    container = _fake_container(False, codec_name)
+    monkeypatch.setattr(module.av, "open", MagicMock(return_value=container))
+    reader = _reader(
+        monkeypatch,
+        AcceleratorVendor.AMD,
+        _metadata(codec_name, is_10bit),
+    )
+    amf_setup = MagicMock()
+    monkeypatch.setattr(reader, "_setup_amf_decoder", amf_setup)
+
+    reader.__enter__()
+
+    amf_setup.assert_called_once_with(container.streams.video[0].codec_context)
+    assert reader._software_only is False
+
+
 def test_pyav_sw_backend_skips_hwaccel_and_amf(monkeypatch) -> None:
     monkeypatch.setattr(module, "DECODE_BACKEND", "pyav-sw")
     vali_factory = MagicMock()
@@ -139,6 +263,42 @@ def test_pyav_sw_backend_skips_hwaccel_and_amf(monkeypatch) -> None:
         nvdec_setup.assert_not_called()
         assert module.av.open.call_args.kwargs == {}
         assert container.streams.video[0].codec_context.thread_type == "AUTO"
+
+
+@pytest.mark.parametrize(
+    ("platform", "vendor", "codec_name", "is_10bit", "thread_count", "thread_type"),
+    [
+        ("win32", AcceleratorVendor.AMD, "hevc", True, 1, "SLICE"),
+        ("win32", AcceleratorVendor.AMD, "hevc", False, 0, "AUTO"),
+        ("win32", AcceleratorVendor.AMD, "av1", True, 0, "AUTO"),
+        ("win32", AcceleratorVendor.NVIDIA, "hevc", True, 0, "AUTO"),
+        ("linux", AcceleratorVendor.AMD, "hevc", True, 0, "AUTO"),
+    ],
+)
+def test_pyav_sw_limits_only_windows_amd_hevc_main10_threads(
+    monkeypatch,
+    platform: str,
+    vendor: AcceleratorVendor,
+    codec_name: str,
+    is_10bit: bool,
+    thread_count: int,
+    thread_type: str,
+) -> None:
+    monkeypatch.setattr(module, "DECODE_BACKEND", "pyav-sw")
+    monkeypatch.setattr(module.sys, "platform", platform)
+    container = _fake_container(False, codec_name)
+    monkeypatch.setattr(module.av, "open", MagicMock(return_value=container))
+    reader = _reader(
+        monkeypatch,
+        vendor,
+        _metadata(codec_name, is_10bit),
+    )
+
+    reader.__enter__()
+
+    context = container.streams.video[0].codec_context
+    assert context.thread_count == thread_count
+    assert context.thread_type == thread_type
 
 
 def test_unknown_backend_raises(monkeypatch) -> None:

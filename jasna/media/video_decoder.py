@@ -27,7 +27,8 @@ _libcuda: ctypes.CDLL | None = None
 # Decode backend selection (`JASNA_DECODE_BACKEND` overrides the default):
 # - "auto":    NVIDIA tries VALI first and falls back to PyAV hwaccel, then PyAV
 #              software, when VALI cannot open or decode the first frame. AMD
-#              keeps its AMF -> software escalation.
+#              keeps its AMF -> software escalation. Windows AMD explicitly
+#              uses software decode plus ROCm upload for HEVC Main10 and AV1.
 # - "vali":    VALI only; any failure raises (NVIDIA only).
 # - "pyav-hw": skip VALI, use the PyAV hwaccel path with its software fallback.
 # - "pyav-sw": force FFmpeg software decoding with GPU upload on every vendor.
@@ -45,6 +46,42 @@ _NVDEC_MIN_CODED_SIZE = {"av1": (128, 128)}
 
 class VideoDecodeError(RuntimeError):
     pass
+
+
+def _requires_windows_amd_software_decode(
+    metadata: VideoMetadata,
+    vendor: AcceleratorVendor,
+) -> bool:
+    """Return whether Windows AMD auto mode must bypass PyAV AMF.
+
+    AMF host frames are the established route for H.264 and 8-bit HEVC.  On
+    Windows, PyAV cannot reliably transfer HEVC Main10/P010 AMF frames, and
+    AV1 AMF is unreliable across frame transfer and shutdown.  The selected
+    software path still normalizes and uploads YUV frames to ROCm; it is not a
+    CPU-only output fallback.  Explicit ``pyav-hw`` remains a diagnostic AMF
+    entry point and intentionally bypasses this auto-only policy.
+    """
+
+    if sys.platform != "win32" or vendor is not AcceleratorVendor.AMD:
+        return False
+    codec_name = str(metadata.codec_name).casefold()
+    return codec_name == "av1" or (
+        codec_name == "hevc" and bool(metadata.is_10bit)
+    )
+
+
+def _requires_single_slice_pyav_threads(
+    metadata: VideoMetadata,
+    vendor: AcceleratorVendor,
+) -> bool:
+    """Limit the known Windows AMD HEVC Main10 software decoder to one slice."""
+
+    return (
+        sys.platform == "win32"
+        and vendor is AcceleratorVendor.AMD
+        and str(metadata.codec_name).casefold() == "hevc"
+        and bool(metadata.is_10bit)
+    )
 
 
 def _decode_backend() -> str:
@@ -286,7 +323,30 @@ class NvidiaVideoReader:
                     return self
             elif backend == "vali":
                 raise VideoDecodeError("The VALI decode backend requires an NVIDIA device")
-        software_only = backend == "pyav-sw"
+        windows_amd_software_decode = (
+            backend == "auto"
+            and _requires_windows_amd_software_decode(
+                self.metadata,
+                self.vendor,
+            )
+        )
+        software_only = backend == "pyav-sw" or windows_amd_software_decode
+        if windows_amd_software_decode:
+            codec_name = str(self.metadata.codec_name).casefold()
+            if codec_name == "av1":
+                log.warning(
+                    "Windows AMD AV1 PyAV AMF decoding is unreliable across frame "
+                    "transfer and shutdown; using FFmpeg software decoding and "
+                    "uploading frames to ROCm for %s",
+                    self.file,
+                )
+            else:
+                log.warning(
+                    "Windows AMD HEVC Main10/P010 cannot transfer PyAV AMF hardware "
+                    "frames; using FFmpeg software decoding and uploading frames to "
+                    "ROCm for %s",
+                    self.file,
+                )
         self._software_only = software_only
         try:
             if not software_only and self.vendor is AcceleratorVendor.NVIDIA:
@@ -309,7 +369,11 @@ class NvidiaVideoReader:
 
         ctx = self.video_stream.codec_context
         if software_only:
-            ctx.thread_type = "AUTO"
+            if _requires_single_slice_pyav_threads(self.metadata, self.vendor):
+                ctx.thread_count = 1
+                ctx.thread_type = "SLICE"
+            else:
+                ctx.thread_type = "AUTO"
         elif self.vendor is AcceleratorVendor.AMD:
             self._setup_amf_decoder(ctx)
         elif not ctx.is_hwaccel:
